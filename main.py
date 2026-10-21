@@ -142,6 +142,6 @@ class MediaAnalysisPlugin(Star):
             LOG.error(
                 "media_analyze internal error: %s\n%s",
                 redact_sensitive_text(str(exc))[:200],
-                traceback.format_exc(),
+                redact_sensitive_text(traceback.format_exc())[:4000],
             )
             return envelope.dumps(envelope.fail_envelope(envelope.ERR_INTERNAL_ERROR))
