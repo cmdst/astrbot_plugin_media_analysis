@@ -1,0 +1,42 @@
+{
+  "provider_settings": {
+    "description": "模型提供商",
+    "hint": "留空＝回落 AstrBot 当前的 provider（语音识别 / 对话模型）。不在此处填 API key。",
+    "type": "object",
+    "items": {
+      "stt_provider_id": {
+        "description": "语音识别模型",
+        "hint": "把语音转成文字的 provider（类型必须是 speech_to_text）。留空＝用 AstrBot 当前的 STT provider。",
+        "type": "string",
+        "_special": "select_provider_stt",
+        "default": ""
+      },
+      "vision_provider_id": {
+        "description": "视觉模型",
+        "hint": "读抽帧图片的对话模型（模型能力里必须勾了「图像」）。留空＝用 AstrBot 当前的对话 provider。",
+        "type": "string",
+        "_special": "select_provider",
+        "default": ""
+      }
+    }
+  },
+  "limits": {
+    "description": "上限",
+    "hint": "成本闸门。超限一律返回明确错误码，不做静默截断。",
+    "type": "object",
+    "items": {
+      "max_media_seconds": {
+        "description": "单条媒体最长秒数",
+        "hint": "超过即返回 MEDIA_TOO_LONG。默认 60（见 SPEC §4.2）。允许 5–300。",
+        "type": "int",
+        "default": 60
+      },
+      "max_frames": {
+        "description": "最多抽帧数",
+        "hint": "include_frames=true 时最多抽几帧、调几次视觉模型。默认 6。允许 1–12。",
+        "type": "int",
+        "default": 6
+      }
+    }
+  }
+}
