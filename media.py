@@ -10,6 +10,8 @@
 
 本模块唯一的 core 内部导入是 `get_media_duration`（SPEC §2.5）：它不在
 `astrbot.api.*` 的再导出面里，但 4.29.x 内稳定，失败会走我们自己的 `PROBE_FAILED`。
+**该导入已加固**（t16）：核心把它改名/搬走时退化为本地 ffprobe 兜底，插件照常加载 ——
+裸 import 会在导入期抛 `ModuleNotFoundError` ⇒ **静默拒载**（目录在、工具不注册）。
 """
 
 from __future__ import annotations
@@ -17,14 +19,62 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import json
 import os
 from dataclasses import dataclass
 
 from astrbot.api import logger as LOG
 from astrbot.api.message_components import Record, Reply, Video
-from astrbot.core.utils.media_utils import get_media_duration
 
 from . import envelope
+
+# --------------------------------------------------------------------------- #
+# 核心**内部面**加固：`get_media_duration` 不在 `astrbot.api.*` 的公开导出里，
+# 一旦核心升级把它改名/搬走，裸 `from … import` 会在**导入期**炸 ⇒ 插件**静默拒载**
+# （目录在、工具不注册、界面上像"没装"）。加固后最坏情况退化为
+# 「本地 ffprobe 兜底 + 插件照常加载」，错误码仍是 `PROBE_FAILED`。
+# 正常路径**逐字等价**：核心可导入时 `get_media_duration` 就是核心那个函数。
+# --------------------------------------------------------------------------- #
+async def _fallback_duration_ms(path: str) -> int | None:
+    """本地兜底时长探测：自己起 `ffprobe` 取 `format.duration`（秒）× 1000 → 毫秒 int。
+
+    与核心 `get_media_duration` 同契约：**返回毫秒**，任何异常/解析失败/超时一律 `None`
+    （上层 `probe_duration_s` 据此抛 `PROBE_FAILED`）。必须 async —— 调用点是 `await`。
+    复用本模块既有的子进程封装 `_run`，不写第二套 subprocess 样板。
+    """
+    argv = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "json",
+        path,
+    ]
+    try:
+        returncode, stdout, _stderr = await _run(
+            argv, timeout=PROBE_TIMEOUT_S, error_code=envelope.ERR_PROBE_FAILED
+        )
+        if returncode != 0:
+            return None
+        payload = json.loads(stdout.decode("utf-8", "replace") or "{}")
+        seconds = (payload.get("format") or {}).get("duration")
+        if seconds is None:
+            return None
+        return int(round(float(seconds) * 1000))
+    except Exception:  # noqa: BLE001 —— 兜底路径只认"拿到或拿不到"，绝不外抛
+        return None
+
+
+try:
+    from astrbot.core.utils.media_utils import get_media_duration
+except Exception:  # noqa: BLE001 —— 拿不到就退化为本地兜底，绝不因此拒载
+    LOG.warning(
+        "media_analysis: 核心内部面 astrbot.core.utils.media_utils.get_media_duration "
+        "不可用，已切换到本地 ffprobe 兜底（插件仍加载）"
+    )
+    get_media_duration = _fallback_duration_ms
 
 # 预算（SPEC §7.1）：正常路径实测都在 0.1 s 内，这些上限只防病态文件与平台慢下载。
 RESOLVE_TIMEOUT_S = 20.0  # convert_to_file_path 兜底可能触发下载
