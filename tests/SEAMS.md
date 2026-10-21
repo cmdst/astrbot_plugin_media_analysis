@@ -56,7 +56,8 @@ SPEC 已经把 `analyze.analyze` 的 4 个协作者（`context` / `event` / `set
 - 覆盖的用例：`test_media.py` 的三种 `find_media` 结果 + `resolve_media_path` 两条路。
 
 ### S4 核心 `get_media_duration` 的**模块级导入点**
-- 事实：它是 `async def get_media_duration(file_path: str) -> int | None`，**返回毫秒**、失败 `None`；**不在** `astrbot.api.*` 再导出面里 ⇒ 只能 `from astrbot.core.utils.media_utils import get_media_duration`（`SPEC.md:245-247`，全插件唯一的 core 内部导入）
+- 事实：它是 `async def get_media_duration(file_path: str) -> int | None`，**返回毫秒**、失败 `None`；**不在** `astrbot.api.*` 再导出面里 ⇒ 只能 `from astrbot.core.utils.media_utils import get_media_duration`（`SPEC.md:245-247`）。
+- **core 内部面一共两处**（`astrbot/core/utils/error_redaction.py` 的 `redact_sensitive_text` 与这里的 `media_utils.get_media_duration`），**都必须带 `try/except` 兜底**：核心哪天搬家，插件要"降级但仍加载"，不能静默拒载（`tests/test_core_imports.py` 的 AST 守卫把这条钉住：任何 `astrbot.core.*` 的 import 必须落在带 `except` 的 `try` 里）。
 - 用法：`monkeypatch.setattr(media, "get_media_duration", fake)`，fake 返回 `5000` / `None` 两种
 - ⚠️ 形态要求：这个 import 写在 `media.py` **模块级**（SPEC 已如此），测试 patch 的是 `media.get_media_duration`。若为了"少耦合"改成函数内 import，也必须保留同名模块级符号，否则这条接缝没了。
 - 覆盖的用例：`probe_duration_s` 的 2 位小数取整、`PROBE_FAILED`（返回 `None`）。

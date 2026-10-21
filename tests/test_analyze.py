@@ -914,16 +914,18 @@ async def test_extracted_wav_is_tracked_on_event(
         RuntimeError("analyze exploded"),
         ValueError("weird"),
         KeyError("missing"),
-        asyncio.CancelledError(),
         KeyboardInterrupt(),
     ],
-    ids=["RuntimeError", "ValueError", "KeyError", "CancelledError", "KeyboardInterrupt"],
+    ids=["RuntimeError", "ValueError", "KeyError", "KeyboardInterrupt"],
 )
 @pytest.mark.asyncio
-async def test_tool_facade_never_raises(
+async def test_tool_facade_turns_unexpected_errors_into_envelope(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, boom: BaseException
 ) -> None:
-    """§3.3 的 `except BaseException` 收口：连 `CancelledError` 都走信封（框架硬超时会先取消我们）。"""
+    """§3.3：除「取消」之外的任何异常都收成 3 键 `INTERNAL_ERROR` 信封（含 `KeyboardInterrupt`）。
+
+    `BaseException` 也在网里：框架的硬超时/信号最终都表现为异常，收成信封比抛裸异常好读。
+    """
     rig = build_rig(monkeypatch, tmp_path)
 
     async def _boom(**_kwargs):
@@ -937,6 +939,25 @@ async def test_tool_facade_never_raises(
         "error": envelope.ERR_INTERNAL_ERROR,
         "hint": envelope.HINTS[envelope.ERR_INTERNAL_ERROR],
     }
+
+
+@pytest.mark.asyncio
+async def test_tool_facade_propagates_cancelled_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """评审 F5：`asyncio.CancelledError` **必须向上传播**，不许被收成信封。
+
+    取消语义来自插件卸载 / 进程停止 / 框架取消任务：把它吞成 `INTERNAL_ERROR` 信封会让
+    取消变成"一次失败的模型调用"，上层就再也没法正确收尾（t18 之前那条断言恰好写反了）。
+    """
+    rig = build_rig(monkeypatch, tmp_path)
+
+    async def _boom(**_kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(analyze_mod, "analyze", _boom)
+    with pytest.raises(asyncio.CancelledError):
+        await rig.tool()
 
 
 @pytest.mark.asyncio
@@ -1379,3 +1400,182 @@ async def test_unserializable_envelope_never_reaches_the_model(
     monkeypatch.setattr(envelope, "ok_envelope", lambda **_kwargs: {"ok": object()})
     payload = await rig.tool()
     assert payload["error"] == envelope.ERR_INTERNAL_ERROR
+
+
+# --------------------------------------------------------------------------- #
+# 评审 F2 / F4：预算截断的计数不变式与端到端降级（t18 落地的口径）
+# --------------------------------------------------------------------------- #
+class _ScriptedClock:
+    """按脚本返回 `time.monotonic()` 的假时钟：预算类用例靠它，不 sleep。"""
+
+    def __init__(self, *values: float) -> None:
+        self._values = list(values)
+        self.calls = 0
+
+    def monotonic(self) -> float:
+        self.calls += 1
+        if len(self._values) > 1:
+            return self._values.pop(0)
+        return self._values[0]
+
+
+class _FailOnNthCall(FakeChatProvider):
+    """第 `fail_at` 次 `text_chat` 抛错，其余正常返回（造"单帧失败"用）。"""
+
+    def __init__(self, *, text: str, fail_at: int) -> None:
+        super().__init__(text=text)
+        self._fail_at = fail_at
+        self._seen = 0
+
+    async def text_chat(self, *args, **kwargs):  # type: ignore[override]
+        self._seen += 1
+        if self._seen == self._fail_at:
+            self.calls.record("text_chat", **kwargs)
+            raise RuntimeError(f"frame #{self._fail_at} failed")
+        return await super().text_chat(*args, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_frames_truncated_kept_matches_frames_length(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """评审 F2 不变式：`frames_truncated:<kept>/<want>` 的 **kept 必须等于 `len(frames)`**。
+
+    3 帧场景：第 1 帧成功、第 2 帧描述失败、第 3 帧前预算到期 ⇒ `frames_truncated:1/3` 且
+    `len(frames)==1`。t18 之前这里按"循环下标"记成 `2/3`，与信封里的帧数对不上 ——
+    这条用例就是防它回潮（同一帧在两个地方必须同一个数）。
+    """
+    provider = _FailOnNthCall(text="第一帧描述", fail_at=2)
+    notes: list[str] = []
+    clock = _ScriptedClock(10.0, 10.0, 200.0)  # 第 3 帧前越过 deadline=100
+    monkeypatch.setattr(analyze_mod, "time", SimpleNamespace(monotonic=clock.monotonic))
+
+    described = await analyze_mod.describe_frames(
+        provider,
+        [(1.0, str(tmp_path / "a.jpg")), (2.0, str(tmp_path / "b.jpg")), (3.0, str(tmp_path / "c.jpg"))],
+        focus="",
+        deadline=100.0,
+        notes=notes,
+    )
+
+    assert len(described) == 1
+    assert [frame["at_s"] for frame in described] == [1.0]
+    truncated = [note for note in notes if note.startswith("frames_truncated:")]
+    assert truncated == ["frames_truncated:1/3"], notes
+    kept = int(truncated[0].split(":")[1].split("/")[0])
+    assert kept == len(described), "kept 必须与 frames 长度一致（t18 的不变式）"
+    assert "frame_desc_failed:2.00" in notes
+
+
+@pytest.mark.asyncio
+async def test_budget_exhausted_before_first_frame_keeps_transcript(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """评审 F4：**首帧前**预算就到期 ⇒ `ok:true`、转写仍在、`frames=[]`、有 `frames_truncated`。
+
+    与 t13 那条（慢 STT 吃掉预算、抽帧层就截断）互补：这条走的是**描述层**截断
+    （抽帧已完成、第一帧描述前预算就没了）。两者都不许把整次调用判死。
+    """
+    rig = build_rig(
+        monkeypatch,
+        tmp_path,
+        kind="video",
+        frames=[(2.5, "unused")],
+        stt=FakeSTTProvider(text="描述层截断也要保住转写"),
+        chat=FakeChatProvider(text="这段描述不该被调用"),
+    )
+    clock = _ScriptedClock(0.0, 0.0, 100.0)  # started；抽帧预算判定；首帧描述时已到 deadline(100)
+    monkeypatch.setattr(analyze_mod, "time", SimpleNamespace(monotonic=clock.monotonic))
+
+    payload = await rig.run(include_frames=True)
+
+    assert payload["ok"] is True
+    assert list(payload) == list(envelope.OK_KEYS)
+    assert payload["transcript"][0]["text"] == "描述层截断也要保住转写"
+    assert payload["frames"] == []
+    assert "frames_truncated:0/1" in payload["notes"]
+    assert rig.prov_calls["vision"] == 1, "抽帧成功时视觉 provider 会被解析（截断发生在描述阶段）"
+    assert not rig.chat.images_seen(), "首帧前就没预算了，不该发起任何描述调用"
+
+
+@pytest.mark.asyncio
+async def test_six_failed_descriptions_with_full_budget_still_vision_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """评审 F4 的反向面：预算充足但 6 次描述调用**全失败** ⇒ 仍 `VISION_FAILED`。
+
+    预算降级只放过"没时间"，不放过"模型挂了"——否则用户会拿到一个 `ok:true` 的空帧信封。
+    """
+    rig = build_rig(
+        monkeypatch,
+        tmp_path,
+        kind="video",
+        frames=[(float(index * 5 + 5), "unused") for index in range(6)],
+        stt=FakeSTTProvider(text="转写仍在，但画面一帧没拿到"),
+        chat=FakeChatProvider(fail_with=RuntimeError("upstream 500")),
+    )
+    payload = await rig.tool(include_frames=True)
+
+    assert list(payload) == list(envelope.FAIL_KEYS)
+    assert payload["error"] == envelope.ERR_VISION_FAILED
+    assert rig.chat.calls.named("text_chat"), "必须真发起过调用，才谈得上「全失败」"
+
+
+# --------------------------------------------------------------------------- #
+# 评审 F6：`include_frames` 的模型入参归一（字符串/数字都要能理解）
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("value", ["false", "no", "0", "  FALSE  ", 0, False])
+@pytest.mark.asyncio
+async def test_include_frames_false_like_values_skip_vision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: object
+) -> None:
+    """评审 F6：模型给 `"false"` / `"no"` / `0` ⇒ 按 False 理解，**零视觉调用**。
+
+    模型经常把布尔参数写成字符串；`bool("false") is True` 是 Python 的经典坑，
+    不归一就会把"只要转写"变成"抽 6 帧 + 6 次视觉调用"（成本与延迟都翻倍）。
+    """
+    rig = build_rig(monkeypatch, tmp_path, kind="video", frames=[(2.5, "unused")])
+    payload = await rig.tool(include_frames=value)  # type: ignore[arg-type]
+
+    assert payload["ok"] is True
+    assert payload["frames"] == []
+    assert rig.prov_calls["vision"] == 0
+    assert not rig.chat.images_seen()
+    assert rig.media_calls["extract_frames"] == 0
+
+
+@pytest.mark.parametrize("value", ["true", "yes", "1", "  True  ", 1, True])
+@pytest.mark.asyncio
+async def test_include_frames_true_like_values_trigger_vision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: object
+) -> None:
+    """评审 F6 的对称面：`"true"` / `"yes"` / `1` ⇒ 按 True 理解，抽帧 + 描述各一次。"""
+    rig = build_rig(monkeypatch, tmp_path, kind="video", frames=[(2.5, "unused")])
+    payload = await rig.tool(include_frames=value)  # type: ignore[arg-type]
+
+    assert payload["ok"] is True
+    assert len(payload["frames"]) == 1
+    assert rig.prov_calls["vision"] == 1
+    assert len(rig.chat.images_seen()) == 1
+
+
+@pytest.mark.asyncio
+async def test_include_frames_invalid_value_falls_back_to_false_with_one_warning(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """评审 F6：`"maybe"` 这种既非真值也非假值的串 ⇒ 按默认 False 处理 + **恰好一条**告警。
+
+    不抛异常（工具的入参来自模型，不该因为一个词把整次调用判死），但要让管理员在日志里
+    看得见"模型给了个怪值"，否则成本异常时无从解释。
+    """
+    log = RecordingLogger()
+    monkeypatch.setattr(main, "LOG", log)
+    rig = build_rig(monkeypatch, tmp_path, kind="video", frames=[(2.5, "unused")])
+
+    payload = await rig.tool(include_frames="maybe")  # type: ignore[arg-type]
+
+    assert payload["ok"] is True
+    assert payload["frames"] == []
+    assert rig.prov_calls["vision"] == 0
+    warnings = [message for level, message in log.records if level == "WARNING" and "include_frames" in message]
+    assert len(warnings) == 1, warnings

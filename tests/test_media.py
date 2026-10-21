@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -139,13 +140,23 @@ def test_find_media_without_get_messages_is_media_not_found() -> None:
     assert _code(exc_info) == envelope.ERR_MEDIA_NOT_FOUND
 
 
-def test_find_media_survives_broken_message_chain() -> None:
+def test_broken_message_chain_is_media_unresolvable() -> None:
+    """评审 F8：读消息链**本身**失败 ⇒ `MEDIA_UNRESOLVABLE`，不是 `MEDIA_NOT_FOUND`。
+
+    两者对用户的指向完全不同：`MEDIA_NOT_FOUND` 说"这条消息里没有语音/视频"（用户会重发），
+    而真相是平台/适配器坏了（管理员要去看日志）。t18 之前这里归因错了。
+    """
     class _BrokenEvent:
         def get_messages(self):
             raise RuntimeError("platform exploded")
 
     with pytest.raises(envelope.ToolError) as exc_info:
         media.find_media(_BrokenEvent(), "current")
+    assert _code(exc_info) == envelope.ERR_MEDIA_UNRESOLVABLE
+
+    # 对照：getter **不存在** 仍然是空链 ⇒ MEDIA_NOT_FOUND（两件事必须分开）
+    with pytest.raises(envelope.ToolError) as exc_info:
+        media.find_media(SimpleNamespace(), "current")
     assert _code(exc_info) == envelope.ERR_MEDIA_NOT_FOUND
 
 
@@ -459,12 +470,17 @@ def test_media_handle_kind_comes_from_component_type(media_fixtures: dict[str, P
     assert isinstance(record, Record) and isinstance(video, Video)
 
 
-def test_ffmpeg_binaries_reach_the_expected_absolute_paths() -> None:
-    """SPEC §1 #2：`/usr/bin/ffmpeg` → `/opt/ffmpeg/bin/ffmpeg`（走 PATH，不写绝对路径）。"""
+def test_ffmpeg_binaries_are_resolvable_on_this_machine() -> None:
+    """SPEC §1 #2：`ffmpeg` / `ffprobe` 在 PATH 上（插件按裸名调用，不写绝对路径）。
+
+    可移植性（评审 F10）：换一台没有 ffmpeg 的机器应当 **skip**（与夹具类用例的口径一致：
+    "本机没装工具链"是环境问题，不是代码回归）。
+    """
+    missing = [name for name in ("ffmpeg", "ffprobe") if shutil.which(name) is None]
+    if missing:
+        pytest.skip(f"ffmpeg/ffprobe 不在 PATH 上：{missing}（夹具与转码类用例也会跳过）")
     for name in ("ffmpeg", "ffprobe"):
-        resolved = subprocess.run(["which", name], capture_output=True, text=True, check=False)
-        assert resolved.returncode == 0, f"{name} 不在 PATH 上（抽帧/转码会失败）"
-        assert os.path.isabs(resolved.stdout.strip())
+        assert os.path.isabs(shutil.which(name))
 
 
 # --------------------------------------------------------------------------- #
@@ -499,3 +515,48 @@ def test_frame_grid_and_format_at_s_are_pure_functions() -> None:
     assert media.frame_grid(5.0, 6) == media.frame_grid(5.0, 6) == [0.42, 1.25, 2.08, 2.92, 3.75, 4.58]
     assert media.format_at_s(2.5) == media.format_at_s(2.5) == '2.50'
     assert set(vars(media)) == before, '纯函数不该往模块里塞状态'
+
+
+# --------------------------------------------------------------------------- #
+# 评审 F7：ffprobe 自己失败（rc != 0）必须归因成 PROBE_FAILED
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_probe_streams_nonzero_rc_is_probe_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """rc != 0 ⇒ `PROBE_FAILED`：探测失败时"有没有这条流"是**未知**，不能读成"没有"。
+
+    t18 之前只看 stdout ⇒ 失败被读成"无音轨" ⇒ 上层会给用户 `NO_AUDIO_TRACK`
+    （"换一条视频试试"），而真相是 ffprobe 坏了（管理员该看日志）。
+    同时保留另一条实测口径：`rc == 0 + 空 stdout ⇒ False`（见 `test_probe_streams_all_shapes`）。
+    """
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    fake = bin_dir / "ffprobe"
+    fake.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+
+    with pytest.raises(envelope.ToolError) as exc_info:
+        await media.probe_streams(str(tmp_path / "clip.mp4"))
+    assert _code(exc_info) == envelope.ERR_PROBE_FAILED
+    assert "rc=1" in exc_info.value.log_detail
+
+
+@pytest.mark.asyncio
+async def test_probe_streams_zero_rc_with_empty_stdout_is_false_not_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """F7 的另一半（**必须保留**）：`rc == 0` + 空 stdout ⇒ `False`（"文件正常、就是没这条流"）。
+
+    与上一条合起来才是完整判据：**rc 说"探测成不成"，stdout 说"有没有这条流"**。
+    把两者搅在一起，就会让"ffprobe 坏了"漂成"用户该换片源"。
+    """
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    fake = bin_dir / "ffprobe"
+    fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+
+    assert await media.probe_streams(str(tmp_path / "clip.mp4")) == (False, False)
