@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 import traceback
@@ -48,6 +49,35 @@ except Exception:  # noqa: BLE001 —— 拿不到就退化为本地兜底，绝
         "已切换到本地兜底脱敏（插件仍加载）"
     )
     redact_sensitive_text = _fallback_redact
+
+
+# --------------------------------------------------------------------------- #
+# 参数类型防御（评审 F6）：核心**不校验**工具参数类型，模型完全可能发
+# `"include_frames": "false"`（字符串）。字符串 `"false"` 是**真值** ⇒ 会静默多抽
+# `max_frames` 帧 + 同样次数的视觉调用（真金白银，且用户看不出为什么）。
+# 这里只把"真/假"归一，非法类型告警一次并按 schema 默认 `False`。
+# --------------------------------------------------------------------------- #
+_TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
+_FALSE_LITERALS = frozenset({"", "0", "false", "no", "off"})
+
+
+def _as_bool(value: object) -> bool:
+    """把模型给的 `include_frames` 归一成 `bool`（纯函数，无副作用，只可能告警）。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TRUE_LITERALS:
+            return True
+        if text in _FALSE_LITERALS:
+            return False
+    LOG.warning(
+        "media_analyze: 参数 include_frames 收到非法值（类型 %s），按默认 False 处理",
+        type(value).__name__,
+    )
+    return False
 
 
 class MediaAnalysisPlugin(Star):
@@ -121,6 +151,7 @@ class MediaAnalysisPlugin(Star):
         """
         started = time.monotonic()
         try:
+            include_frames = _as_bool(include_frames)
             payload = await analyze.analyze(
                 context=self.context,
                 event=event,
@@ -131,6 +162,9 @@ class MediaAnalysisPlugin(Star):
                 cache=self._cache,
             )
             return envelope.dumps(payload)
+        except asyncio.CancelledError:
+            # 插件卸载 / 进程停止：**取消语义必须传下去**，不许被收成信封（评审 F5）
+            raise
         except envelope.ToolError as exc:
             LOG.info(
                 "media_analyze rejected: code=%s detail=%s",

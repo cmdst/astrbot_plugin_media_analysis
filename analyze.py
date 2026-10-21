@@ -270,19 +270,25 @@ async def describe_frames(
 ) -> list[dict[str, object]]:
     """逐帧 `text_chat`（每帧 15 s）；单帧失败记 note 继续，**全**失败抛 `VISION_FAILED`。
 
-    两种"一帧都没描述成"要分清（SPEC §7.1「预算截断是降级、不是失败」）：
-    - 循环因 `remaining <= 0` 在**第 0 帧前**就 break ⇒ 返回 `[]` **不抛**（预算截断，已记
-      `frames_truncated:0/<want>`）；
-    - **发起过**调用但全部失败/超时 ⇒ 保持 `VISION_FAILED`（模型侧真失败，语义不变）。
+    三种"没拿到全部帧"要分清（SPEC §6.4 / §7.1）：
+    - 单帧失败/超时 ⇒ 只降级这一帧（`frame_desc_failed:<at_s>`），其余继续；
+    - 循环因 `remaining <= 0` 提前 break ⇒ **预算截断**：记
+      `frames_truncated:<实际保留数>/<want>`（与 `frames` 长度一致）并返回，**不抛**；
+    - **发起过**调用、全部失败/超时、且**没有**发生预算截断 ⇒ `VISION_FAILED`（模型侧真失败）。
+
+    预算截断不判死的理由：此时手上往往已经有转写，把它随错误信封丢掉比降级更糟
+    （评审 F4；与 `analyze` 的抽帧层降级同一口径）。
     """
     want = len(frames)
     described: list[dict[str, object]] = []
     attempted = 0
+    truncated = False
     prompt = _frame_prompt(focus)
-    for index, (at_s, jpg_path) in enumerate(frames):
+    for at_s, jpg_path in frames:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            notes.append(f"frames_truncated:{index}/{want}")
+            notes.append(f"frames_truncated:{len(described)}/{want}")
+            truncated = True
             break
         timeout = min(FRAME_CALL_TIMEOUT_S, remaining)
         attempted += 1
@@ -305,7 +311,7 @@ async def describe_frames(
             notes.append(f"frame_desc_failed:{media.format_at_s(at_s)}")
             continue
         described.append({"at_s": at_s, "desc": desc})
-    if attempted and not described:
+    if attempted and not described and not truncated:
         raise envelope.ToolError(
             envelope.ERR_VISION_FAILED, log_detail=f"0/{want} frames described"
         )

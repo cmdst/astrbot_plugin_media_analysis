@@ -100,15 +100,22 @@ class MediaHandle:
 
 
 def _components(event) -> list:
-    """`event.get_messages()`（`astr_message_event.py:180-182`）；拿不到就当空链。"""
+    """`event.get_messages()`（`astr_message_event.py:180-182`）；getter 不存在 ⇒ 空链。
+
+    **读消息链本身失败**（平台给了坏对象、适配器抛错）不降级成空链：那会把真因伪装成
+    「消息里没有语音/视频」（`MEDIA_NOT_FOUND`），让用户/管理员朝错方向查（评审 F8）。
+    归一成 `MEDIA_UNRESOLVABLE`（"媒体取不到"），仍不把异常抛给模型。
+    """
     getter = getattr(event, "get_messages", None)
     if not callable(getter):
         return []
     try:
         components = getter()
-    except Exception as exc:  # noqa: BLE001 —— 平台给了坏消息链也不许抛给模型
-        LOG.warning("media_analysis: event.get_messages() 失败（%s）", type(exc).__name__)
-        return []
+    except Exception as exc:  # noqa: BLE001 —— 归一成错误码，不外抛
+        raise envelope.ToolError(
+            envelope.ERR_MEDIA_UNRESOLVABLE,
+            log_detail=f"event.get_messages() {type(exc).__name__}",
+        ) from None
     return list(components or [])
 
 
@@ -197,10 +204,14 @@ async def probe_duration_s(path: str) -> float:
 
 
 async def probe_streams(path: str) -> tuple[bool, bool]:
-    """`(has_audio, has_video)`；ffprobe 不可用/超时 ⇒ `PROBE_FAILED`。
+    """`(has_audio, has_video)`；ffprobe 不可用/超时/非零退出 ⇒ `PROBE_FAILED`。
 
-    **判据是 stdout 是否为空，不是 rc**（实测：无音轨时 `ffprobe -select_streams a`
-    返回 rc=0 但 stdout 为空，SPEC §1 #9）。
+    两条判据（评审 F7 修正后）：
+    - **rc != 0 ⇒ `PROBE_FAILED`**：ffprobe 自己失败了，它有没有流是未知的；
+      只看 stdout 会把"探测失败"读成"没有这条流"，错误码漂成
+      `NO_AUDIO_TRACK`/`NO_VIDEO_TRACK`（让用户去换片源，而其实是探测坏了）。
+    - **rc == 0 且 stdout 为空 ⇒ `False`**：这是"文件正常、就是没有这条流"的**正常返回**
+      （实测：无音轨时 `ffprobe -select_streams a` 返回 rc=0 但 stdout 为空，SPEC §1 #9）。
     """
     async def has(kind: str) -> bool:
         argv = [
@@ -215,11 +226,16 @@ async def probe_streams(path: str) -> tuple[bool, bool]:
             "csv=p=0",
             path,
         ]
-        _rc, out, _err = await _run(
+        returncode, out, _err = await _run(
             argv,
             timeout=PROBE_TIMEOUT_S,
             error_code=envelope.ERR_PROBE_FAILED,
         )
+        if returncode != 0:
+            raise envelope.ToolError(
+                envelope.ERR_PROBE_FAILED,
+                log_detail=f"ffprobe rc={returncode} stream={kind}",
+            )
         return bool(out.strip())
 
     return await has("a"), await has("v")
