@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import subprocess
 from pathlib import Path
@@ -464,3 +465,37 @@ def test_ffmpeg_binaries_reach_the_expected_absolute_paths() -> None:
         resolved = subprocess.run(["which", name], capture_output=True, text=True, check=False)
         assert resolved.returncode == 0, f"{name} 不在 PATH 上（抽帧/转码会失败）"
         assert os.path.isabs(resolved.stdout.strip())
+
+
+# --------------------------------------------------------------------------- #
+# F2：captain 2026-10-22 裁决 —— 带默认值的追加参数属**批准偏离**，不回退签名
+# --------------------------------------------------------------------------- #
+def test_extract_frames_notes_param_is_an_approved_extension() -> None:
+    """`media.extract_frames(..., notes=None)` 是批准过的追加参数，不是漂移。
+
+    captain 2026-10-22 裁决：带默认值的追加参数属批准偏离，见 t2 evidence_note。
+    它让抽帧层把 `frame_extract_failed:<at_s>` 降级词交给调用方（`analyze` 传同一个 notes 列表）；
+    不传时行为与 SPEC §3.2 的冻结签名完全一致 —— 这条用例就是那枚「批准章」。
+    """
+    params = inspect.signature(media.extract_frames).parameters
+    assert 'notes' in params, '批准过的 notes 参数被删了？先看 t2 evidence_note 再动手'
+    assert params['notes'].default is None
+    assert params['notes'].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_frame_grid_and_format_at_s_are_pure_functions() -> None:
+    """`frame_grid` / `format_at_s` 必须是纯函数：同输入同输出、不依赖也不修改模块状态。
+
+    captain 2026-10-22 裁决：带默认值的追加参数属批准偏离，见 t2 evidence_note
+    （这两个函数本身没有追加参数，它们是同一张"批准单"里被点名的公开面：必须存在且保持纯）。
+
+    契约（SPEC §7.3 / §6.4 的 C8）：抽帧坐标与 `notes` 里的 `:<at_s>` 用同一套格式化，
+    所以这两个函数被 `analyze` 与测试同时依赖 —— 一旦有人给它俩加缓存/全局状态，格式就会漂。
+    """
+    assert inspect.isfunction(media.frame_grid)
+    assert inspect.isfunction(media.format_at_s)
+
+    before = set(vars(media))
+    assert media.frame_grid(5.0, 6) == media.frame_grid(5.0, 6) == [0.42, 1.25, 2.08, 2.92, 3.75, 4.58]
+    assert media.format_at_s(2.5) == media.format_at_s(2.5) == '2.50'
+    assert set(vars(media)) == before, '纯函数不该往模块里塞状态'

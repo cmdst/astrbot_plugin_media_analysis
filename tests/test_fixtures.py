@@ -316,3 +316,21 @@ def test_recording_logger_formats_and_searches() -> None:
     assert "code=MEDIA_TOO_LONG" in log.text()
     assert log.contains("clamped to 60")
     assert not log.contains("转写正文")
+
+
+# --------------------------------------------------------------------------- #
+# 5. 套件自身的守卫：不许把偏差「挂」成 xfail（xfail 会掩盖回归）
+# --------------------------------------------------------------------------- #
+def test_no_xfail_markers_are_parked_in_the_suite() -> None:
+    """`tests/` 里不许留 xfail：偏差要么修掉、要么转成真断言。
+
+    t4 曾用两条 xfail 装饰把 SPEC §7.1 的偏差显式在册（当时是对的：让偏差可见），
+    t12 修完实现后 t13 把它们转成了真断言。这条守卫防止以后有人「跑不绿就挂个 xfail」。
+    """
+    needle = 'pytest.mark.' + 'xfail'  # 拼开写：免得本文件命中自己
+    offenders = [
+        path.name
+        for path in sorted(Path(__file__).parent.glob('*.py'))
+        if needle in path.read_text(encoding='utf-8')
+    ]
+    assert not offenders, f'这些文件里还挂着 xfail：{offenders}'

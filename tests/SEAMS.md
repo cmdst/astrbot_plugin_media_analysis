@@ -12,7 +12,7 @@
 | `_fakes.py` | `FakeEvent` / `TrackingFakeEvent` / `FakeChatProvider` / `FakeSTTProvider` / `FakeContext` / `RecordingLogger` |
 | `_astrbot_stub.py` | 只在**真核心不可用**时兜底的最小 astrbot 桩 |
 | `make_fixtures.py` | 合成夹具生成器（lavfi `sine` + `testsrc`，幂等、逐字节可复现） |
-| `test_fixtures.py` | 地基自检（28 条；**不 import 插件模块**） |
+| `test_fixtures.py` | 地基自检（29 条；**不 import 插件模块**，含「套件里不许挂 xfail」守卫） |
 | `SEAMS.md` | 本文件 |
 
 跑法（与 `AGENTS.md` §3 一致）：

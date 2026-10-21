@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
 import time
@@ -1041,28 +1042,50 @@ async def test_frames_and_notes_share_at_s_formatting(
 # 预算（§7.1）：直接测 describe_frames 的截断口径
 # --------------------------------------------------------------------------- #
 @pytest.mark.asyncio
-async def test_describe_frames_truncates_when_deadline_passed(
+async def test_describe_frames_truncates_without_raising_when_no_call_started(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """§6.4：预算耗尽后不再发起新帧，记 `frames_truncated:<kept>/<want>`。
+    """§6.4 / §7.1：**第 0 帧前**就因预算 break ⇒ 返回 `[]` + `frames_truncated:0/1`，**不抛**。
 
-    注意：**一帧都没描述成**时 `describe_frames` 会抛 `VISION_FAILED`（§5 的"全失败"判据），
-    所以这里断言的是"note 记到了 + 不发起新帧 + 抛的是受控 `ToolError`"；
-    "预算耗尽仍返回信封"这一条另见 `test_budget_exhaustion_should_still_return_envelope`（xfail）。
+    t12 之后"预算不足"与"模型失败"分家：这里没有发起过任何 `text_chat`，
+    所以是降级而不是 `VISION_FAILED`（同一条契约另一面见下一条用例）。
     """
     chat = FakeChatProvider()
+    notes: list[str] = []
+    described = await analyze_mod.describe_frames(
+        chat,
+        [(2.5, str(tmp_path / "a.jpg"))],
+        focus="",
+        deadline=time.monotonic() - 1,  # 已经过期：一帧都不该发起
+        notes=notes,
+    )
+    assert described == []
+    assert notes == ["frames_truncated:0/1"]
+    assert not chat.calls.named("text_chat")
+
+
+@pytest.mark.asyncio
+async def test_describe_frames_all_attempts_failed_is_vision_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """§5 / §7.1：**发起过**调用但全部失败 ⇒ 仍是 `VISION_FAILED`。
+
+    预算降级不能顺手把这条也降级 —— 否则"模型侧挂了"会伪装成"没好画面"，
+    用户拿到的会是 `{ok:true, frames:[]}`。
+    """
+    chat = FakeChatProvider(fail_with=RuntimeError("upstream 500"))
     notes: list[str] = []
     with pytest.raises(envelope.ToolError) as exc_info:
         await analyze_mod.describe_frames(
             chat,
             [(2.5, str(tmp_path / "a.jpg"))],
             focus="",
-            deadline=time.monotonic() - 1,  # 已经过期
+            deadline=time.monotonic() + 30,
             notes=notes,
         )
     assert exc_info.value.code == envelope.ERR_VISION_FAILED
-    assert notes == ["frames_truncated:0/1"]
-    assert not chat.calls.named("text_chat")
+    assert notes == ["frame_desc_failed:2.50"]
+    assert chat.calls.named("text_chat"), "必须先真的发起过调用，才能判「全失败」"
 
 
 @pytest.mark.asyncio
@@ -1086,49 +1109,137 @@ async def test_describe_frames_single_call_timeout_degrades(
 
 
 # --------------------------------------------------------------------------- #
-# 已知偏差（报给 captain / reviewer；先 xfail 住，不让它变成"没测到"）
+# F1（t12 已改实现，SPEC §7.1 口径不变）：预算截断是降级，不是失败
 # --------------------------------------------------------------------------- #
-@pytest.mark.xfail(
-    reason="SPEC §7.1：预算耗尽后『信封照常返回』；当前实现把 0 帧当成 FRAME_EXTRACT_FAILED",
-    strict=False,
-)
 @pytest.mark.asyncio
-async def test_budget_exhaustion_should_still_return_envelope(
+async def test_slow_stt_eating_budget_keeps_transcript_and_degrades_frames(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """§7.1：剩余预算 < 一帧的抽取预算 ⇒ 记 `frames_truncated:0/want` 并**照常返回信封**。
+    """§7.1 第 1 面：慢 STT 吃光预算 + `include_frames=true` ⇒ **成功信封 + 保住转写**。
 
-    当前实现：`_extract_frames_budgeted` 记了 note 后返回 `[]`，`analyze` 随即抛
-    `FRAME_EXTRACT_FAILED` —— 与 §7.1"信封照常返回"冲突（已报 captain，等 builder 裁决）。
+    断言四件事：① `ok:true`；② `transcript` 非空（t12 的核心承诺）；③ `notes` 里有
+    `frames_truncated:0/<want>`；④ `frames=[]` 且视觉 provider 一次都没被解析/调用。
     """
-    rig = build_rig(monkeypatch, tmp_path, kind="video", frames=[(2.5, "unused")])
-    monkeypatch.setattr(analyze_mod, "DEADLINE_S", 0.001)
+    rig = build_rig(
+        monkeypatch,
+        tmp_path,
+        kind="video",
+        duration=30.0,
+        frames=[(2.5, "unused")],
+        stt=FakeSTTProvider(text="慢 STT 的转写必须保住", delay=0.08),
+        cfg=settings.Settings(max_frames=6),
+    )
+    monkeypatch.setattr(analyze_mod, "DEADLINE_S", 0.05)  # 预算被 STT 吃光
+
     payload = await rig.run(include_frames=True)
 
     assert payload["ok"] is True
-    assert any(note.startswith("frames_truncated:") for note in payload["notes"])
+    assert list(payload) == list(envelope.OK_KEYS)
+    assert [item["text"] for item in payload["transcript"]] == ["慢 STT 的转写必须保住"]
+    assert "frames_truncated:0/6" in payload["notes"]
+    assert payload["frames"] == []
+    assert rig.prov_calls["vision"] == 0, "预算不足就别再发起视觉调用（省一次 API 花费）"
+    assert rig.media_calls["extract_frames"] == 0
+    assert "summary_skipped_budget" in payload["notes"]
 
 
-@pytest.mark.xfail(
-    reason="SPEC §7.1：抽帧阶段的预算截断不该把整次调用判死（同上一条，同一处根因）",
-    strict=False,
-)
 @pytest.mark.asyncio
-async def test_budget_truncated_frames_do_not_kill_the_call(
+async def test_budget_exhausted_with_nothing_to_deliver_is_still_a_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """§6.4 + §7.1：`describe_frames` 因预算截断（`frames_truncated:k/want`）时不抛错。"""
-    chat = FakeChatProvider()
-    notes: list[str] = []
-    described = await analyze_mod.describe_frames(
-        chat,
-        [(2.5, str(tmp_path / "a.jpg"))],
-        focus="",
-        deadline=time.monotonic() - 1,
-        notes=notes,
+    """§7.1 第 2 面：预算耗尽 **且** 转写与帧都为空 ⇒ 不给"空成功"，仍是 `FRAME_EXTRACT_FAILED`。
+
+    两种"什么都没有"的来源都测：① 视频无音轨（转写天然为空）；② 有音轨但 STT 返回空串。
+    """
+    # ① 无音轨
+    rig = build_rig(
+        monkeypatch, tmp_path, kind="video", duration=30.0, streams=(False, True)
     )
-    assert described == []
-    assert notes == ["frames_truncated:0/1"]
+    monkeypatch.setattr(analyze_mod, "DEADLINE_S", 0.001)
+    payload = await rig.tool(include_frames=True)
+
+    assert list(payload) == list(envelope.FAIL_KEYS), "失败信封必须恰好 3 键"
+    assert payload == {
+        "ok": False,
+        "error": envelope.ERR_FRAME_EXTRACT_FAILED,
+        "hint": envelope.HINTS[envelope.ERR_FRAME_EXTRACT_FAILED],
+    }
+    # ② 有音轨但转写为空
+    rig = build_rig(
+        monkeypatch,
+        tmp_path,
+        kind="video",
+        duration=30.0,
+        stt=FakeSTTProvider(text=""),
+    )
+    monkeypatch.setattr(analyze_mod, "DEADLINE_S", 0.001)
+    payload = await rig.tool(include_frames=True)
+    assert list(payload) == list(envelope.FAIL_KEYS)
+    assert payload["error"] == envelope.ERR_FRAME_EXTRACT_FAILED
+
+
+@pytest.mark.asyncio
+async def test_frame_extract_process_timeout_is_still_a_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """§7.1 第 3 面：抽帧 **总预算 wait_for 超时**（不是"预算不足"的 truncated 分支）⇒ 仍判失败。
+
+    t12 只把"预算不足"改成降级；`wait_for` 超时那条路照旧抛 `FRAME_EXTRACT_FAILED`
+    —— 那是"本机抽帧卡死"，不是"没时间"，语义不同。
+    """
+    rig = build_rig(monkeypatch, tmp_path, kind="video", frames=[(2.5, "unused")])
+
+    async def _timeout(*_args, **_kwargs):
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(media, "extract_frames", _timeout)
+    payload = await rig.tool(include_frames=True)
+
+    assert payload == {
+        "ok": False,
+        "error": envelope.ERR_FRAME_EXTRACT_FAILED,
+        "hint": envelope.HINTS[envelope.ERR_FRAME_EXTRACT_FAILED],
+    }
+
+
+@pytest.mark.asyncio
+async def test_budget_sufficient_path_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """回归护栏：预算充足时 6 帧 + 转写 + 摘要齐全，**不许**被上面的降级逻辑顺手简化掉。"""
+    rig = build_rig(
+        monkeypatch,
+        tmp_path,
+        kind="video",
+        duration=30.0,
+        frames=[(5.0, "unused"), (15.0, "unused"), (25.0, "unused")],
+        stt=FakeSTTProvider(text="正常预算下的转写"),
+        cfg=settings.Settings(max_frames=6),
+    )
+    payload = await rig.run(include_frames=True)
+
+    assert payload["ok"] is True
+    assert payload["frames"] and len(payload["frames"]) == 3
+    assert payload["transcript"][0]["text"] == "正常预算下的转写"
+    assert payload["summary"]
+    assert "frames_truncated:0/6" not in payload["notes"]
+    assert rig.prov_calls["vision"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# F2：captain 2026-10-22 裁决 —— 带默认值的追加参数属**批准偏离**，不回退签名
+# --------------------------------------------------------------------------- #
+def test_build_summary_kind_param_is_an_approved_extension() -> None:
+    """`analyze.build_summary(..., kind="")` 是批准过的追加参数，不是漂移。
+
+    captain 2026-10-22 裁决：带默认值的追加参数属批准偏离，见 t2 evidence_note。
+    它比 SPEC §3.2 的冻结签名多一个 `kind`（提示词 `{kind_cn}` 需要它）；不传时回落「媒体」，
+    行为与 SPEC 一致 —— 这条用例就是那枚"批准章"，谁要删它得先改裁决。
+    """
+    params = inspect.signature(analyze_mod.build_summary).parameters
+    assert "kind" in params, "批准过的 kind 参数被删了？先看 t2 evidence_note 再动手"
+    assert params["kind"].default == ""
+    assert params["kind"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
 # --------------------------------------------------------------------------- #
