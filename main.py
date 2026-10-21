@@ -14,15 +14,40 @@
 
 from __future__ import annotations
 
+import re
 import time
 import traceback
 
 from astrbot.api import AstrBotConfig, logger as LOG
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
-from astrbot.core.utils.error_redaction import redact_sensitive_text
 
 from . import analyze, cache, envelope, settings
+
+# --------------------------------------------------------------------------- #
+# 核心**内部面**加固（`error_redaction` 不在 `astrbot.api.*` 的公开导出里）。
+# 为什么必须 try/except：它一旦在升级中搬家，`from … import` 会在**导入期**抛
+# ImportError，插件就变成**静默拒载** —— 目录在、工具不注册、界面上像"没装"
+# （父手册 §3.4 的最贵失败模式）。加固后最坏情况退化为
+# 「本地兜底脱敏 + 插件照常加载」，而不是整插件消失。
+# 正常路径**逐字等价**：`redact_sensitive_text` 就是核心那个函数，调用点不变。
+# --------------------------------------------------------------------------- #
+_TOKEN_SHAPED = re.compile(r"[A-Za-z0-9_\-]{24,}")
+
+
+def _fallback_redact(text: str) -> str:
+    """本地兜底脱敏：只把 token 形状的长串（≥24 位）替换成 `[REDACTED]`，其余原样保留。"""
+    return _TOKEN_SHAPED.sub("[REDACTED]", text)
+
+
+try:
+    from astrbot.core.utils.error_redaction import redact_sensitive_text
+except Exception:  # noqa: BLE001 —— 拿不到就退化为本地兜底，绝不因此拒载
+    LOG.warning(
+        "media_analysis: 核心内部面 astrbot.core.utils.error_redaction 不可用，"
+        "已切换到本地兜底脱敏（插件仍加载）"
+    )
+    redact_sensitive_text = _fallback_redact
 
 
 class MediaAnalysisPlugin(Star):
