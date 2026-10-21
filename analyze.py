@@ -149,21 +149,28 @@ async def analyze(
                     envelope.ERR_NO_VIDEO_TRACK,
                     log_detail=f"duration_s={duration_s} include_frames=true",
                 )
-            extracted = await _extract_frames_budgeted(
+            extracted, truncated = await _extract_frames_budgeted(
                 path, max_frames, duration_s, workdir, deadline, notes
             )
-            if not extracted:
+            if truncated:
+                # 预算不足：抽帧降级为 0 帧，**不**判死整次调用（手上的转写照常交付，SPEC §7.1）
+                LOG.info(
+                    "media_analysis: 抽帧因预算不足被截断（0/%d），继续走摘要",
+                    max_frames,
+                )
+            elif not extracted:
                 raise envelope.ToolError(
                     envelope.ERR_FRAME_EXTRACT_FAILED,
                     log_detail=f"0/{max_frames} frames",
                 )
-            vision = await providers.resolve_vision_provider(
-                context, settings.vision_provider_id, _umo(event)
-            )
-            frames = await describe_frames(
-                vision, extracted, focus=focus_text, deadline=deadline, notes=notes
-            )
-            notes.append(f"vision_provider:{providers.provider_id_of(vision)}")
+            else:
+                vision = await providers.resolve_vision_provider(
+                    context, settings.vision_provider_id, _umo(event)
+                )
+                frames = await describe_frames(
+                    vision, extracted, focus=focus_text, deadline=deadline, notes=notes
+                )
+                notes.append(f"vision_provider:{providers.provider_id_of(vision)}")
 
         # 9 —— 摘要阶段
         material = _build_material(transcript, frames)
@@ -194,6 +201,12 @@ async def analyze(
                 )
 
         # 10 —— 信封 + 入缓存
+        if include_frames and kind == "video" and not transcript and not frames:
+            # 诚实兜底：用户要的是画面，而画面一帧没拿到、转写也没有 ⇒ 别给模型一个空成功
+            raise envelope.ToolError(
+                envelope.ERR_FRAME_EXTRACT_FAILED,
+                log_detail="include_frames=true 但 transcript 与 frames 都为空",
+            )
         payload = envelope.ok_envelope(
             kind=kind,
             duration_s=duration_s,
@@ -257,10 +270,14 @@ async def describe_frames(
 ) -> list[dict[str, object]]:
     """逐帧 `text_chat`（每帧 15 s）；单帧失败记 note 继续，**全**失败抛 `VISION_FAILED`。
 
-    预算耗尽时不再发起新帧并记 `frames_truncated:<kept>/<want>`（SPEC §6.4）。
+    两种"一帧都没描述成"要分清（SPEC §7.1「预算截断是降级、不是失败」）：
+    - 循环因 `remaining <= 0` 在**第 0 帧前**就 break ⇒ 返回 `[]` **不抛**（预算截断，已记
+      `frames_truncated:0/<want>`）；
+    - **发起过**调用但全部失败/超时 ⇒ 保持 `VISION_FAILED`（模型侧真失败，语义不变）。
     """
     want = len(frames)
     described: list[dict[str, object]] = []
+    attempted = 0
     prompt = _frame_prompt(focus)
     for index, (at_s, jpg_path) in enumerate(frames):
         remaining = deadline - time.monotonic()
@@ -268,6 +285,7 @@ async def describe_frames(
             notes.append(f"frames_truncated:{index}/{want}")
             break
         timeout = min(FRAME_CALL_TIMEOUT_S, remaining)
+        attempted += 1
         try:
             resp = await asyncio.wait_for(
                 provider.text_chat(prompt=prompt, image_urls=[jpg_path]),
@@ -287,7 +305,7 @@ async def describe_frames(
             notes.append(f"frame_desc_failed:{media.format_at_s(at_s)}")
             continue
         described.append({"at_s": at_s, "desc": desc})
-    if want and not described:
+    if attempted and not described:
         raise envelope.ToolError(
             envelope.ERR_VISION_FAILED, log_detail=f"0/{want} frames described"
         )
@@ -346,15 +364,20 @@ async def _extract_frames_budgeted(
     workdir: str,
     deadline: float,
     notes: list[str],
-) -> list[tuple[float, str]]:
-    """在全局预算内抽帧；预算不够就先降级（`frames_truncated:0/want`）。"""
+) -> tuple[list[tuple[float, str]], bool]:
+    """在全局预算内抽帧；返回 `(frames, truncated)`。
+
+    `truncated=True` ＝**预算不足**（一帧都没抽）：记 `frames_truncated:0/<want>` 后返回
+    `([], True)`，**不抛** —— 预算截断是降级不是失败（SPEC §7.1「信封照常返回」），
+    调用方不得因此丢掉手上的转写。真正的抽帧失败/超时**照旧**抛 `FRAME_EXTRACT_FAILED`。
+    """
     remaining = deadline - time.monotonic()
     if remaining < FRAME_EXTRACT_TIMEOUT_S:
         notes.append(f"frames_truncated:0/{want}")
-        return []
+        return [], True
     budget = min(FRAME_EXTRACT_TIMEOUT_S * want + 5.0, remaining)
     try:
-        return await asyncio.wait_for(
+        frames = await asyncio.wait_for(
             media.extract_frames(
                 video_path,
                 count=want,
@@ -368,6 +391,7 @@ async def _extract_frames_budgeted(
         raise envelope.ToolError(
             envelope.ERR_FRAME_EXTRACT_FAILED, log_detail=f"extract timeout {budget:.1f}s"
         ) from None
+    return frames, False
 
 
 def _frame_prompt(focus: str) -> str:
