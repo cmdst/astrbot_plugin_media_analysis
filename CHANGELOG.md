@@ -1,5 +1,102 @@
 # CHANGELOG
 
+## v0.2.0 — 2026-10-23（**待评审 / 待部署**）
+
+修掉 ops 查出的**上线后零成功**缺陷，并落四项产品优化。规格：`SPEC-v0.2.md`（dev lane 工作区，
+1220 行，冻结增量）。
+
+### ① 群文件（`File` 段）—— 缺陷根因与修法
+
+本平台**群视频以「群文件」投递**，而 v0.1 的媒体候选集只有 `Record`/`Video`
+（`media.py` `_AUDIO_KINDS`）⇒ 生产日志里一直是
+`MEDIA_NOT_FOUND detail=quoted: no Record/Video in chain`。
+
+- 候选集 `Record → Video → File`（**全链优先级**：同一条消息里 `Record` 优先于 `File`）。
+- `File` 走**独立取件分支**：`file_` 命中就零 IO 复用（核心多半已 `get_file()` 下好并回写）；
+  `file_` 空但 `url` 有 ⇒ **我们自己有界下载**（`aiohttp` 流式 + 边读边数字节 +
+  `asyncio` 总时长 20 s）；两者都空 ⇒ `MEDIA_UNRESOLVABLE`。
+- **禁用** `File.file` 属性（异步上下文里恒返回 `""` 并打 WARN）与 `File.get_file()`
+  （`io.py:306`：超时 1800 s、无大小上限、落生产 `data/temp`）。
+- 判型三段梯子（扩展名白名单 → `ensure_wav`（`pysilk`/ffmpeg）→ `ffprobe`）：
+  白名单 12 个视频扩展名 / 13 个音频扩展名；**`ffprobe` 单独做不了双保险** —— `silk` 是
+  合法音频但 `ffprobe rc=1`，靠 `ensure_wav` 救。三段都不成立 ⇒ **`UNSUPPORTED_MEDIA_TYPE`**。
+- 字节闸：`limits.max_media_bytes`（默认 64 MiB）在下载与判型两处；超限 `MEDIA_TOO_LARGE`。
+- `log_detail` 现在带上**链里实际出现的组件类型名**（如 `chain=[Plain, Reply]`），
+  v0.1 只写 `no Record/Video` —— ops 当时就是靠这条才没误判。
+
+### ② 音频改走多模态对话模型（不再依赖 `STTProvider`）
+
+- `resolve_stt_provider` 五级阶梯整段删除；新增 `resolve_audio_provider`（§2.5 阶梯）。
+- 调用形状冻结为 `text_chat(prompt=<提示词>, audio_urls=[16 kHz 单声道 s16 wav])`：
+  不传 `image_urls` / `contexts` / `system_prompt` / `func_tool`，`audio_urls` 只放 1 个。
+- 交给 provider 的一律是本插件产出的 wav（`ensure_provider_wav`：已是 16k/mono/s16 就
+  **零重编码**返回原路径；silk/m4a/mp3/amr 走 `ensure_wav` + ffmpeg）。体积口径：
+  2 s 音频我们自己转 ⇒ base64 85,440；让核心转（保留 44.1k 立体声）⇒ 470,504（**5.5×**）。
+- 异常映射：超时 / provider 抛错 / `EmptyModelOutputError` / 内容安全过滤 ⇒ `AUDIO_FAILED`；
+  正文为空或 `[无语音]` ⇒ `transcript: []` + note `audio_empty`（**不是错误**）；
+  `CancelledError` **必须传播**。
+- 错误码分工修正（对 v0.1 的一处覆盖）：**显式配了但不符合** ⇒ `PROVIDER_CAPABILITY_MISMATCH`；
+  **没配且回落到的核心当前对话 provider 也不符合** ⇒ `AUDIO_UNAVAILABLE` / `VISION_UNAVAILABLE`。
+
+### ③ 语音/视频各自独立提示词
+
+- `prompts.audio` / `prompts.video` / `prompts.frame` / `prompts.summary`（空串回退内置默认）。
+- 校验在装配期：非法花括号 / 未知占位符 ⇒ 回退默认 + 一次 `WARNING`；超 2000 字符 ⇒ 截断 +
+  note `prompt_trimmed:<key>`；模板缺焦点占位符而用户给了 focus ⇒ 追加从句 +
+  note `focus_appended:<key>`（**焦点永不被静默丢弃**）。
+- **提示词指纹进缓存键** ⇒ 改提示词即让旧结果失效。
+
+### ④ 解析结果本地缓存（带 TTL）
+
+- `cache.ResultCache`（内存 LRU）→ `cache.DiskCache`：落
+  `data/plugin_data/astrbot_plugin_media_analysis/cache/v1/<前两位>/<64hex>.json`，
+  懒创建、`.tmp/` 同分区 `os.replace` 原子、**绝无默认路径指向 cwd**。
+- 键 = `sha256("v2|digest|kind|include_frames|max_frames|prompts_fp|focus|audio_provider_id|vision_provider_id|PLUGIN_VERSION")`。
+- TTL 默认 86400（0＝关闭，钳 0–2592000）；容量 ≤256 条 / ≤16 MiB / 单条 ≤256 KiB；
+  超限按 `mtime` 最旧淘汰，命中刷新 `mtime`。
+- 命中：`cached: true` + `elapsed_ms` 是**本次**真实耗时 + notes 追加 `cache_hit` /
+  `cache_age_s:<n>`（原始 notes 保留在前）。
+- **只存信封文本**：条目键集合恰好 `{v, key_inputs, created_at, envelope}`；写盘前硬闸：
+  序列化文本含 `/tmp/`、`/root/`、`data:` 就拒绝写入。
+- 降级：损坏/过期/权限/`ENOSPC` ⇒ 静默 miss 或本进程禁用，**不产生 notes、不产生错误码**。
+- 同键 `singleflight`（并发同媒体只花一次 token）；跨进程不处理（单进程部署）。
+- **缓存会进核心备份**（`data/plugin_data` 在备份清单里）；可整目录删，无副作用。
+
+### ⑤ 配置 4 键 → 11 键 + 迁移脚本
+
+- 新键：`provider_settings.audio_provider_id`、`prompts.{audio,video,frame,summary}`、
+  `limits.max_media_bytes`、`cache.ttl_seconds`。
+- **旧键 `provider_settings.stt_provider_id` 原路径、原类型、原 `_special` 保留在 schema 里**：
+  从 schema 删掉的那一刻，核心 `check_config_integrity()` 会把用户旧值当 stale 键
+  **静默删除并 `save_config()`**。代码只读不生效（值非空时打一次弃用 WARNING）。
+- `tools/migrate_config_v02.py`（任务单里也写作 `migrate_config_v2.py`，后者是转发 shim）：
+  默认干跑、`--apply` 先写 **0600** 逐字节备份再原子替换、幂等（第二遍 `changed=0` 且不产生
+  新备份）、`--clear-legacy`（值已搬走才允许置空，**不删键**）、`--rollback`、
+  `--report-legacy`；**任何模式都不打印配置值**（只有键名/动作/类型/长度）。
+  搬值**带能力校验**：只有"该 id 是 chat 类且 `modalities` 明确含 `audio`"才搬，否则原样
+  留在旧键并给原因码（`not_found` / `not_chat` / `no_audio`，退出码 2）。
+- **顺序不可换**：先上代码+schema → 重启 → 再跑迁移；反序时旧 schema 会把新键当 stale 删掉。
+  回滚成对（先回代码、再回配置、最后重启）。
+
+### 版本面
+
+- `metadata.yaml`：`version: v0.2.0`、`desc`/`short_desc` 补"群文件投递 + 结果本地缓存"；
+  `name` 与 `astrbot_version`（`>=4.29,<5`）**不动**；`repo` 保持
+  `https://github.com/cmdst/astrbot_plugin_media_analysis`；`README.md` 顶部补上游仓库一行。
+- 信封不变：成功 **9 键、顺序不变**；失败**恰好 3 键**。
+- 错误码 **16 → 18**（删 `STT_UNAVAILABLE`/`STT_FAILED`；增 `MEDIA_TOO_LARGE` /
+  `UNSUPPORTED_MEDIA_TYPE` / `AUDIO_UNAVAILABLE` / `AUDIO_FAILED`）。
+- `notes` 词表 **12 → 20**（增 `audio_normalized` / `focus_appended:<key>` /
+  `prompt_trimmed:<key>` / `material_trimmed` / `source:file` / `file_downloaded` /
+  `cache_hit` / `cache_age_s:<n>`；`stt_provider:` → `audio_provider:`、`stt_empty` → `audio_empty`）。
+
+### 已知状态（下一单处理）
+
+- **库内 `tests/` 仍是 v0.1 契约**（`resolve_stt_provider` / 4 键 / 16 码 / `ResultCache` /
+  `resolve_media_path(handle)` 旧签名）⇒ 现在跑门禁会红，属预期；`SPEC-v0.2.md` §12 的测试
+  计划由下一单（tester）落地。**本版未改任何测试文件**。
+- 未在真实 provider 上跑过（不花运营方额度）；真机验收按 `SPEC-v0.2.md` §14 的 6/7 两步补量。
+
 ## v0.1.0 — 2026-10-22（**未发布 / 未安装**）
 
 首个版本。单工具 `media_analyze`，音轨优先 + 抽帧按需。

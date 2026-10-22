@@ -1,15 +1,17 @@
 """插件门面：只有三件事 —— 拿配置、调 `analyze`、把异常收成信封。
 
-加载面（SPEC §2.7）：核心按 `data.plugins.<目录名>.main` 把本目录当**包**导入
+加载面（SPEC.md §2.7）：核心按 `data.plugins.<目录名>.main` 把本目录当**包**导入
 （`star_manager.py:461/1124-1126`）⇒ 包内模块之间只能相对导入。
 
-三个容易踩的点（都写在 SPEC §3.3 的要点里）：
+四个容易踩的点（都写在 SPEC 的要点里）：
 1. `__init__` 的第二个形参**必须叫 `config`**：加载器按关键字调用
    `star_cls_type(context=…, config=…)`（`star_manager.py:1229-1238`），名字不对会被
    `except TypeError` 兜成"无配置实例化"，**静默丢配置**。
 2. `Star.__init__` **不保存** `config`（`star/base.py:26-29`）⇒ 自己存。
 3. 工具方法**只挂** `@filter.llm_tool`：叠加 `@filter.permission_type` 会让它被当成
    消息处理器，权限不符就丢用户消息（AGENTS §3 装饰器纪律）。
+4. `_settings()` 是**唯一配置读取点**，11 个键逐条显式读（`settings.KEY_MAP` ↔
+   `_conf_schema.json` ↔ 这里三方一致）。漏一个键 ＝ 生产链路上**静默丢弃**设置。
 """
 
 from __future__ import annotations
@@ -86,36 +88,59 @@ class MediaAnalysisPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
         super().__init__(context)  # Star.__init__ 不保存 config（star/base.py:26-29）
         self.config = config or {}
-        self._cache = cache.ResultCache(maxsize=32)
+        # 缓存实例在 `initialize()` 里建（TTL 来自配置）；这里留空，工具被提前调用时
+        # 由 `_cache_store()` 兜一个同配置的实例（懒建，绝不因为生命周期顺序而抛）。
+        self._cache: cache.DiskCache | None = None
         self._settings_cache: settings.Settings | None = None
 
     async def initialize(self) -> None:
-        """生命周期钩子（`star/base.py:141-145`）：装配配置摘要，只打 id 与上限。"""
+        """生命周期钩子（`star/base.py:141-145`）：装配配置摘要 + 建缓存。
+
+        摘要行只打 **provider id 与数字**（provider id 是配置值不是凭据）；
+        弃用键 `stt_provider_id` 只"是否非空"，**不打值**。
+        """
         self._settings_cache = self._settings()
-        LOG.info(
-            "media_analysis ready: stt_provider_id=%r vision_provider_id=%r "
-            "max_media_seconds=%d max_frames=%d",
-            self._settings_cache.stt_provider_id,
-            self._settings_cache.vision_provider_id,
-            self._settings_cache.max_media_seconds,
-            self._settings_cache.max_frames,
+        current = self._settings_cache
+        self._cache = cache.DiskCache(
+            plugin_name=settings.PLUGIN_NAME, ttl_seconds=current.cache_ttl_seconds
         )
+        LOG.info(
+            "media_analysis ready: audio_provider_id=%r vision_provider_id=%r "
+            "max_media_seconds=%d max_frames=%d max_media_bytes=%d "
+            "cache_ttl_seconds=%d cache_dir=%s",
+            current.audio_provider_id,
+            current.vision_provider_id,
+            current.max_media_seconds,
+            current.max_frames,
+            current.max_media_bytes,
+            current.cache_ttl_seconds,
+            self._cache.directory or "(disabled)",
+        )
+        if current.legacy_stt_provider_id:
+            LOG.warning(
+                "media_analysis: 配置项 provider_settings.stt_provider_id 已弃用且不生效"
+                "（检测到旧值非空，本行不打值）；请改用 provider_settings.audio_provider_id，"
+                "旧值可用 tools/migrate_config_v02.py 迁移"
+            )
 
     async def terminate(self) -> None:
-        """卸载：丢掉配置快照与进程内缓存（缓存里有转写正文，只活在内存里）。"""
+        """卸载：丢掉配置快照，关闭缓存（磁盘条目按 TTL 自然过期，可整目录删）。"""
         self._settings_cache = None
-        self._cache.clear()
+        store, self._cache = self._cache, None
+        if store is not None:
+            await store.close()
 
     def _settings(self) -> settings.Settings:
-        """唯一配置读取点：4 个键逐条显式读（见 SPEC §4.3），禁止散落到别处。
+        """唯一配置读取点：11 个键逐条显式读（SPEC-v0.2 §5.2 键表），禁止散落到别处。
 
         漏一个键 ＝ 生产链路上**静默丢弃**设置（父手册 §3 第 8 条）；
         `tests/test_config_map.py` 用三方一致守卫钉住这里。
         """
         view = settings.ConfigView(self.config)
         return settings.Settings(
-            stt_provider_id=view.text(settings.KEY_STT_PROVIDER_ID),
+            audio_provider_id=view.text(settings.KEY_AUDIO_PROVIDER_ID),
             vision_provider_id=view.text(settings.KEY_VISION_PROVIDER_ID),
+            legacy_stt_provider_id=view.text(settings.KEY_LEGACY_STT_PROVIDER_ID),
             max_media_seconds=view.bounded_int(
                 settings.KEY_MAX_MEDIA_SECONDS,
                 default=settings.DEFAULT_MAX_MEDIA_SECONDS,
@@ -128,7 +153,33 @@ class MediaAnalysisPlugin(Star):
                 lo=settings.MIN_MAX_FRAMES,
                 hi=settings.MAX_MAX_FRAMES,
             ),
+            max_media_bytes=view.bounded_int(
+                settings.KEY_MAX_MEDIA_BYTES,
+                default=settings.DEFAULT_MAX_MEDIA_BYTES,
+                lo=settings.MIN_MAX_MEDIA_BYTES,
+                hi=settings.MAX_MAX_MEDIA_BYTES,
+            ),
+            prompt_audio=view.text(settings.KEY_PROMPTS_AUDIO),
+            prompt_video=view.text(settings.KEY_PROMPTS_VIDEO),
+            prompt_frame=view.text(settings.KEY_PROMPTS_FRAME),
+            prompt_summary=view.text(settings.KEY_PROMPTS_SUMMARY),
+            cache_ttl_seconds=view.bounded_int(
+                settings.KEY_CACHE_TTL_SECONDS,
+                default=settings.DEFAULT_CACHE_TTL_SECONDS,
+                lo=settings.MIN_CACHE_TTL_SECONDS,
+                hi=settings.MAX_CACHE_TTL_SECONDS,
+            ),
         )
+
+    def _cache_store(self) -> cache.DiskCache:
+        """取缓存实例；`initialize()` 还没跑过时按当前配置懒建一个（幂等）。"""
+        if self._cache is None:
+            current = self._settings_cache or self._settings()
+            self._cache = cache.DiskCache(
+                plugin_name=settings.PLUGIN_NAME,
+                ttl_seconds=current.cache_ttl_seconds,
+            )
+        return self._cache
 
     @filter.llm_tool(name="media_analyze")  # 只挂这一个装饰器（AGENTS §3 装饰器纪律）
     async def media_analyze(
@@ -140,8 +191,9 @@ class MediaAnalysisPlugin(Star):
     ) -> str:
         """分析当前消息或引用消息里的语音/视频（可只转写音轨，也可抽帧看画面）。
 
-        当用户发来语音、或发来视频/引用一条语音视频，并且想知道"里面说了什么 / 画面发生了什么"
-        时调用本工具。返回 JSON：转写文本（transcript）、可选的分帧画面描述（frames）、
+        当用户发来语音、视频，或引用了一条语音/视频，并且想知道"里面说了什么 / 画面发生了
+        什么"时调用本工具。**群里以「文件」形式发来的视频/语音也用 current 或 quoted 取，
+        不要传文件路径**。返回 JSON：转写文本（transcript）、可选的分帧画面描述（frames）、
         一句摘要（summary），失败时返回 {ok:false, error, hint}。
 
         Args:
@@ -159,7 +211,7 @@ class MediaAnalysisPlugin(Star):
                 focus=focus,
                 include_frames=include_frames,
                 settings=self._settings_cache or self._settings(),
-                cache=self._cache,
+                cache=self._cache_store(),
             )
             return envelope.dumps(payload)
         except asyncio.CancelledError:

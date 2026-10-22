@@ -1,11 +1,11 @@
 name: astrbot_plugin_media_analysis
 display_name: 语音视频分析
 desc: >-
-  给 LLM 一个工具 media_analyze：把当前消息或引用消息里的语音/视频先做音轨转写，
-  需要时再按需抽帧交视觉模型描述画面，返回固定形状的 JSON 信封（转写、帧描述、摘要、
-  错误码）。视频在本机没有模型能直接吃，所以这条链是本插件存在的理由。
-short_desc: 让 LLM 自主转写语音、抽帧看视频（JSON 信封，永不抛异常）
-version: v0.1.0
+  给 LLM 一个工具 media_analyze：把当前消息或引用消息里的语音/视频（含以群文件形式投递的
+  mp4/mov/m4a/mp3/wav/amr/silk 等）先做音轨转写，需要时再按需抽帧交视觉模型描述画面，
+  返回固定形状的 JSON 信封。解析结果本地缓存带 TTL，同一媒体二次引用不再花 token。
+short_desc: 让 LLM 自主转写语音、抽帧看视频（支持群文件投递，结果本地缓存）
+version: v0.2.0
 author: 大肥鱼
 repo: "https://github.com/cmdst/astrbot_plugin_media_analysis"
 astrbot_version: ">=4.29,<5"

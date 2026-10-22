@@ -1,22 +1,60 @@
 {
   "provider_settings": {
     "description": "模型提供商",
-    "hint": "留空＝回落 AstrBot 当前的 provider（语音识别 / 对话模型）。不在此处填 API key。",
+    "hint": "留空＝回落 AstrBot 当前的对话 provider。不在此处填 API key。",
     "type": "object",
     "items": {
-      "stt_provider_id": {
-        "description": "语音识别模型",
-        "hint": "把语音转成文字的 provider（类型必须是 speech_to_text）。留空＝用 AstrBot 当前的 STT provider。",
+      "audio_provider_id": {
+        "description": "音频模型（多模态对话）",
+        "hint": "转写语音/视频音轨用的对话模型，模型能力里必须勾了「音频」。留空＝回落 AstrBot 当前的对话 provider（若它不支持音频会返回 AUDIO_UNAVAILABLE）。",
         "type": "string",
-        "_special": "select_provider_stt",
+        "_special": "select_provider",
         "default": ""
       },
       "vision_provider_id": {
         "description": "视觉模型",
-        "hint": "读抽帧图片的对话模型（模型能力里必须勾了「图像」）。留空＝用 AstrBot 当前的对话 provider。",
+        "hint": "读抽帧图片的对话模型，模型能力里必须勾了「图像」。留空＝回落 AstrBot 当前的对话 provider。",
         "type": "string",
         "_special": "select_provider",
         "default": ""
+      },
+      "stt_provider_id": {
+        "description": "【已弃用】语音识别模型",
+        "hint": "v0.2 起音频改走多模态对话模型（见上面的「音频模型」），本项不再生效；仅为保留历史设置而保留，请勿再填。迁移脚本会把旧值搬到 audio_provider_id。",
+        "type": "string",
+        "_special": "select_provider_stt",
+        "default": ""
+      }
+    }
+  },
+  "prompts": {
+    "description": "提示词",
+    "hint": "留空使用内置默认值。可用占位符见 README；写坏（非法花括号/未知占位符）会回退默认值并告警。",
+    "type": "object",
+    "items": {
+      "audio": {
+        "description": "语音转写提示词",
+        "hint": "对「语音消息」的音轨。可用占位符：{focus_clause}。必须让模型只输出转写正文，无人声时输出 [无语音]。",
+        "type": "text",
+        "default": "这是一段语音消息的录音。请把音频里说的话完整转写成文字：\n1) 保留原话，不要总结、不要改写、不要补充音频里没有的信息；\n2) 说话人变化或明显停顿处换行；\n3) 听不清的地方写 [听不清]，不要猜；\n4) 只输出转写结果本身，不要任何前言、标题或解释。\n如果整段音频里没有任何人声，只输出：[无语音]\n{focus_clause}"
+      },
+      "video": {
+        "description": "视频音轨转写提示词",
+        "hint": "对「视频」的音轨（画面另有抽帧分析）。可用占位符：{focus_clause}。纯音乐/无对白时输出 [无语音]。",
+        "type": "text",
+        "default": "这是一段视频的音轨（画面另有抽帧分析）。请把音轨里说的话完整转写成文字：\n1) 保留原话，不要总结、不要改写、不要补充音频里没有的信息；\n2) 如果是纯音乐、环境音或没有人声，只输出：[无语音]；\n3) 听不清的地方写 [听不清]，不要猜；\n4) 只输出转写结果本身，不要任何前言、标题或解释。\n{focus_clause}"
+      },
+      "frame": {
+        "description": "单帧画面描述提示词",
+        "hint": "include_frames=true 时每一帧调一次。可用占位符：{focus_clause}。",
+        "type": "text",
+        "default": "这是一段视频里截取的一帧画面。请用一到两句话客观描述画面里能看到的内容（人物/动作/场景/画面上的文字）。不要猜测视频主题，不要评价，不要补充画面里没有的信息。\n{focus_clause}"
+      },
+      "summary": {
+        "description": "摘要提示词",
+        "hint": "最后一步。可用占位符：{kind_cn}（语音/视频）、{task}（通篇概括或定向回答的固定指令）、{material}（材料正文）。",
+        "type": "text",
+        "default": "下面的材料来自一段{kind_cn}的分析结果。{task}\n\n材料：\n{material}"
       }
     }
   },
@@ -27,7 +65,7 @@
     "items": {
       "max_media_seconds": {
         "description": "单条媒体最长秒数",
-        "hint": "超过即返回 MEDIA_TOO_LONG。默认 60（见 SPEC §4.2）。允许 5–300。",
+        "hint": "超过即返回 MEDIA_TOO_LONG。默认 60。允许 5–300。",
         "type": "int",
         "default": 60
       },
@@ -36,6 +74,25 @@
         "hint": "include_frames=true 时最多抽几帧、调几次视觉模型。默认 6。允许 1–12。",
         "type": "int",
         "default": 6
+      },
+      "max_media_bytes": {
+        "description": "媒体文件最大字节数",
+        "hint": "群文件（File 段）下载/读取的硬闸，超过即返回 MEDIA_TOO_LARGE。默认 67108864（64 MiB）。允许 1048576–536870912。",
+        "type": "int",
+        "default": 67108864
+      }
+    }
+  },
+  "cache": {
+    "description": "缓存",
+    "hint": "解析结果本地缓存（同一媒体第二次引用不再花 token）。缓存只存信封文本，不存媒体。",
+    "type": "object",
+    "items": {
+      "ttl_seconds": {
+        "description": "缓存有效期（秒）",
+        "hint": "默认 86400（1 天）。0＝关闭缓存。允许 0–2592000（30 天），越界钳位并告警。",
+        "type": "int",
+        "default": 86400
       }
     }
   }
