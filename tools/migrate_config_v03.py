@@ -87,7 +87,7 @@ NEW_KEY_DEFAULTS: dict[str, object] = {
     "video.probe_ttl_seconds": 604800,
     "video.max_direct_bytes": 8388608,
     "video.native_timeout_seconds": 60,
-    "video.native_max_tokens": 1024,
+    "video.native_max_tokens": 2048,
     "video.compress_enabled": True,
     "video.compress_target_bytes": 8388608,
     "video.compress_timeout_seconds": 30,

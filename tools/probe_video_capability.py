@@ -24,11 +24,16 @@
     python3 tools/probe_video_capability.py --provider <id> --show
     python3 tools/probe_video_capability.py --provider <id> --clear
 
+退出码：`0` 拿到裁决（写缓存）/ `1` 用法或配置错误 / **`2` 通道类失败**（4xx/5xx、DNS、
+超时、协议异常 ⇒ **不写缓存**，免得把"没打成"记成"看不见"）。
+
 纪律（照 t8）：
 - 只**读** `data/cmd_config.json`（默认 `<root>/data/cmd_config.json`，root 取 `--root` 或
   `$ASTRBOT_ROOT`），**不写**它；不打印 key、不打印 base64（只打字节数与耗时）；
 - 只写 `data/plugin_data/<插件>/probe/v1/` 里的 `l1` / `latency` 字段（插件会复用它，
-  所以别在高峰乱跑）；
+  所以别在高峰乱跑）；**通道类失败（4xx/5xx/网络/超时）一律不写缓存**，退出码 `2`；
+- 请求带 `User-Agent`（与核心 HTTP 客户端同形状）—— 没有 UA 时 Cloudflare 会回 403，
+  那不是"模型看不见"（`VERIFY-v0.3.md` F1）；
 - 合成样本只落 `/tmp`（`--workdir` 可指定），退出时删。
 """
 
@@ -48,6 +53,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from typing import NamedTuple
 
 PLUGIN_NAME = "astrbot_plugin_media_analysis"
 PROBE_SCHEMA_VERSION = "probe-v1"
@@ -204,10 +210,109 @@ def build_size_sample(workdir: str, target_bytes: int, *, seconds: int = 6) -> s
 
 
 # --------------------------------------------------------------------------- #
-# 一次调用（形状与插件一致：`video_url` + 内联 base64）
+# 通道类失败 vs 裁决（VERIFY-v0.3 F1：**本工具最险的地方**）
+#
+# 本工具与插件共用 `probe/v1/` 缓存。写进去的 `l1_ok=false` 会让插件在 **7 天**里不再尝试
+# 原生视频。所以一次调用必须分成三类，只有前两类能变成"裁决"：
+#
+# | 类 | 例子 | 能写缓存吗 |
+# | --- | --- | --- |
+# | `ok` | 200 且正文非空 | 能（再看判据） |
+# | `rejected` | 200 但正文为空（模型没答，§1.1-5） | 能（这是裁决：试过、不行） |
+# | `channel_error` | **任何 4xx/5xx**、DNS/连接失败、超时、200 但 JSON 不可解析 | **不能** |
+#
+# 真实事故：urllib 默认 UA（`Python-urllib/3.x`）被 Cloudflare 挡回 403（`error code: 1010`），
+# 本工具把它记成"看不见"并落盘 ⇒ 插件 1 ms 命中失败、7 天不走原生视频。修复两条：
+# ① 带上与核心 HTTP 客户端同形状的 `User-Agent`；② 通道类失败不写缓存 + 退出码 2。
 # --------------------------------------------------------------------------- #
-def call_video(provider: Provider, path: str, prompt: str, *, max_tokens: int, timeout: float):
-    """发一次原生视频请求，返回 `(ok, text, elapsed_ms, status_or_err)`；绝不打印密钥/base64。"""
+CHANNEL_REASONS: frozenset[str] = frozenset(
+    {"channel_error", "http_error", "timeout", "error", "dns", "network", "connect"}
+)
+CHANNEL_REASON_PREFIXES: tuple[str, ...] = ("http_", "dns_", "network_", "connect_", "channel_")
+
+CALL_OK = "ok"
+CALL_REJECTED = "rejected"
+CALL_CHANNEL_ERROR = "channel_error"
+
+EXIT_OK = 0
+EXIT_USAGE = 1
+EXIT_CHANNEL_ERROR = 2
+
+
+def is_channel_failure_reason(reason: object) -> bool:
+    """与 `probe.is_channel_failure_reason` **同口径**（独立脚本不能 import 插件模块）。"""
+    text = str(reason or "").strip().lower()
+    if not text:
+        return False
+    if text in CHANNEL_REASONS:
+        return True
+    return any(text.startswith(prefix) for prefix in CHANNEL_REASON_PREFIXES)
+
+
+def user_agent() -> str:
+    """与核心那条 HTTP 客户端**同形状**的 UA：`AsyncOpenAI/Python <SDK 版本>`。
+
+    为什么必须带：Cloudflare 前置把 urllib 默认的 `Python-urllib/3.x` 当爬虫，直接
+    403 `error code: 1010` —— 那不是"模型看不见视频"，而是"请求没到模型"。
+    版本号取自**已安装 SDK 的元数据**（`importlib.metadata`），不硬编码猜测。
+    """
+    try:
+        from importlib.metadata import version as _pkg_version
+
+        sdk = _pkg_version("openai")
+    except Exception:  # noqa: BLE001 —— 没装 SDK 也照样能跑（只少一个版本号）
+        sdk = ""
+    return f"AsyncOpenAI/Python {sdk}" if sdk else "AsyncOpenAI/Python"
+
+
+class CallResult(NamedTuple):
+    """一次调用的**分类**结果；`is_verdict=False` 的那个绝不进缓存。"""
+
+    kind: str  # ok | rejected | channel_error
+    text: str
+    elapsed_ms: int
+    status: str
+
+    @property
+    def is_verdict(self) -> bool:
+        return self.kind != CALL_CHANNEL_ERROR
+
+    @property
+    def accepted(self) -> bool:
+        return self.kind == CALL_OK
+
+
+def _extract_text(decoded: object) -> str | None:
+    """从响应当中取正文；**形状不对回 `None`**（＝协议异常，按通道处理）。
+
+    与插件 `video_native.completion_text` 同口径：`choices[0].message.content`
+    可能是 str，也可能是 part 列表。
+    """
+    if not isinstance(decoded, dict):
+        return None
+    choices = decoded.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = [
+            part.get("text")
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ]
+        return "".join(parts).strip()
+    return None
+
+
+def call_video(
+    provider: Provider, path: str, prompt: str, *, max_tokens: int, timeout: float
+) -> CallResult:
+    """发一次原生视频请求并**分类**；绝不打印密钥/base64。"""
     with open(path, "rb") as handle:
         raw = handle.read()
     data_url = "data:video/mp4;base64," + base64.b64encode(raw).decode("ascii")
@@ -227,7 +332,11 @@ def call_video(provider: Provider, path: str, prompt: str, *, max_tokens: int, t
         ],
     }
     payload = json.dumps(body).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": user_agent(),  # F1：没有它，CF 前置直接 403
+    }
     headers.update({str(k): str(v) for k, v in provider.headers.items()})
     if provider.api_key:
         headers.setdefault("Authorization", f"Bearer {provider.api_key}")
@@ -239,27 +348,28 @@ def call_video(provider: Provider, path: str, prompt: str, *, max_tokens: int, t
             raw_body = response.read()
             status = response.status
     except urllib.error.HTTPError as exc:
-        return False, "", int((time.monotonic() - started) * 1000), f"http {exc.code}"
-    except Exception as exc:  # noqa: BLE001 —— 网络侧什么都可能抛，工具只报类型
-        return False, "", int((time.monotonic() - started) * 1000), type(exc).__name__
+        # **任何 4xx/5xx 都是通道问题**（403/1010、429、瞬时 400、5xx）：不构成裁决
+        return CallResult(
+            CALL_CHANNEL_ERROR, "", int((time.monotonic() - started) * 1000), f"http {exc.code}"
+        )
+    except Exception as exc:  # noqa: BLE001 —— DNS/连接/超时/证书：同样不是裁决
+        return CallResult(
+            CALL_CHANNEL_ERROR, "", int((time.monotonic() - started) * 1000), type(exc).__name__
+        )
     elapsed_ms = int((time.monotonic() - started) * 1000)
+    if status >= 400:
+        return CallResult(CALL_CHANNEL_ERROR, "", elapsed_ms, f"http {status}")
     try:
         decoded = json.loads(raw_body.decode("utf-8", "replace"))
     except ValueError:
-        return False, "", elapsed_ms, f"http {status} bad json"
-    text = ""
-    try:
-        message = decoded["choices"][0]["message"]
-        content = message.get("content")
-        if isinstance(content, str):
-            text = content.strip()
-        elif isinstance(content, list):
-            text = "".join(
-                part.get("text", "") for part in content if isinstance(part, dict)
-            ).strip()
-    except (KeyError, IndexError, TypeError):
-        text = ""
-    return (status < 400 and bool(text)), text, elapsed_ms, f"http {status}"
+        return CallResult(CALL_CHANNEL_ERROR, "", elapsed_ms, f"http {status} bad-json")
+    text = _extract_text(decoded)
+    if text is None:
+        return CallResult(CALL_CHANNEL_ERROR, "", elapsed_ms, f"http {status} bad-shape")
+    if not text:
+        # 200 且形状对、正文空 ⇒ **裁决**：模型没答（§1.1-5 的 reasoning 陷阱）
+        return CallResult(CALL_REJECTED, "", elapsed_ms, f"http {status}")
+    return CallResult(CALL_OK, text, elapsed_ms, f"http {status}")
 
 
 # --------------------------------------------------------------------------- #
@@ -365,13 +475,19 @@ def main(argv=None) -> int:
     if args.show:
         l1 = entry.get("l1") or {}
         latency = entry.get("latency") or {}
+        channel_class = (not l1.get("ok")) and is_channel_failure_reason(l1.get("reason"))
         print(
             f"probe_cache={cache_path}\n"
             f"l1={'ok' if l1.get('ok') else 'failed'} reason={l1.get('reason', '-')} "
-            f"at={l1.get('at', '-')}\n"
+            f"at={l1.get('at', '-')} channel_class={'yes' if channel_class else 'no'}\n"
             f"latency_p50_ms={latency.get('p50_ms', '-')} size_bytes={latency.get('size_bytes', '-')}"
         )
-        return 0
+        if channel_class:
+            print(
+                "warn: 缓存里是**通道类失败**（不是裁决）⇒ 插件会视同 miss 重新实测；"
+                "本工具下次运行也会重新探测。"
+            )
+        return EXIT_OK
 
     if args.clear:
         removed = 0
@@ -397,35 +513,63 @@ def main(argv=None) -> int:
 
     workdir = args.workdir or tempfile.mkdtemp(prefix="probe_video_")
     created = not args.workdir
+    channel_errors = 0
+    verdicts = 0
     try:
         # ---- L1 ----
         if not args.skip_l1:
-            l1_ok = None
-            if entry.get("l1") and entry["l1"].get("ok"):
-                l1_ok = True
+            cached_l1 = entry.get("l1") if isinstance(entry.get("l1"), dict) else {}
+            if cached_l1.get("ok"):
+                verdicts += 1
                 print("l1=cached_ok")
-            if l1_ok is None:
+            elif cached_l1 and not is_channel_failure_reason(cached_l1.get("reason")):
+                # 缓存里是**裁决性失败**（答错/空文本）⇒ 与插件同口径，尊重它
+                verdicts += 1
+                print(f"l1=cached_failed reason={cached_l1.get('reason', '-')}")
+            else:
+                if cached_l1:
+                    print(
+                        f"l1=cached_channel_class reason={cached_l1.get('reason', '-')} "
+                        "ignored=yes"
+                    )
                 sample, number, word = build_l1_sample(workdir)
-                ok, text, elapsed_ms, status = call_video(
+                result = call_video(
                     provider,
                     sample,
                     L1_QUESTION,
                     max_tokens=args.max_tokens,
                     timeout=args.timeout,
                 )
-                hit = ok and judge(text, number, word)
+                if not result.is_verdict:
+                    channel_errors += 1
+                    print(
+                        f"l1=channel_error status={result.status} "
+                        f"elapsed_ms={result.elapsed_ms} cached=no "
+                        f"sample_bytes={os.path.getsize(sample)}"
+                    )
+                    print(
+                        "error: 通道类失败（不是\"模型看不见\"）：不写 probe 缓存、退出码 2。"
+                        "若是 403/1010，先确认 UA 与外网可达；稍后重跑。",
+                        file=sys.stderr,
+                    )
+                    return EXIT_CHANNEL_ERROR
+                hit = result.accepted and judge(result.text, number, word)
+                reason = "ok" if hit else ("empty" if result.kind == CALL_REJECTED else "mismatch")
                 entry["l1"] = {
                     "ok": bool(hit),
-                    "reason": "ok" if hit else ("empty" if ok else "error"),
+                    "reason": reason,
                     "at": int(time.time()),
-                    "elapsed_ms": elapsed_ms,
+                    "elapsed_ms": result.elapsed_ms,
                 }
+                verdicts += 1
                 print(
-                    f"l1={'ok' if hit else 'failed'} sample_bytes={os.path.getsize(sample)} "
-                    f"elapsed_ms={elapsed_ms} status={status} answer_chars={len(text)}"
+                    f"l1={'ok' if hit else 'failed'} reason={reason} "
+                    f"sample_bytes={os.path.getsize(sample)} "
+                    f"elapsed_ms={result.elapsed_ms} status={result.status} "
+                    f"answer_chars={len(result.text)}"
                 )
 
-        # ---- 延迟阶梯 ----
+        # ---- 延迟阶梯（**只有拿到裁决的样本才算延迟**）----
         if args.file:
             sizes = [("file", os.path.abspath(os.path.expanduser(args.file)))]
         else:
@@ -439,25 +583,38 @@ def main(argv=None) -> int:
 
         best = 0
         measured = []
+        prompt = L1_QUESTION if not args.skip_l1 else "用一句话描述这段视频。"
         for label, path in sizes:
             size_bytes = os.path.getsize(path)
             samples: list[int] = []
             accepted = False
             for index in range(max(1, args.repeat)):
-                ok, text, elapsed_ms, status = call_video(
+                result = call_video(
                     provider,
                     path,
-                    L1_QUESTION if not args.skip_l1 else "用一句话描述这段视频。",
+                    prompt,
                     max_tokens=args.max_tokens,
                     timeout=args.timeout,
                 )
-                samples.append(elapsed_ms)
-                accepted = accepted or ok
+                if not result.is_verdict:
+                    channel_errors += 1
+                    print(
+                        f"size={label} run={index + 1}/{max(1, args.repeat)} "
+                        f"channel_error status={result.status} elapsed_ms={result.elapsed_ms} "
+                        "counted=no"
+                    )
+                    continue
+                verdicts += 1
+                samples.append(result.elapsed_ms)
+                accepted = accepted or result.accepted
                 print(
                     f"size={label} run={index + 1}/{max(1, args.repeat)} bytes={size_bytes} "
-                    f"elapsed_ms={elapsed_ms} accepted={'yes' if ok else 'no'} "
-                    f"chars={len(text)} status={status}"
+                    f"elapsed_ms={result.elapsed_ms} accepted={'yes' if result.accepted else 'no'} "
+                    f"chars={len(result.text)} status={result.status}"
                 )
+            if not samples:
+                print(f"size={label} no_verdict=1 (全部为通道类失败，不计入延迟)")
+                continue
             p50 = int(statistics.median(samples))
             p90 = int(sorted(samples)[max(0, int(len(samples) * 0.9) - 1)])
             measured.append((label, size_bytes, p50, p90, accepted))
@@ -474,13 +631,24 @@ def main(argv=None) -> int:
                     "size_bytes": last[1],
                     "at": int(time.time()),
                 }
+
+        if verdicts == 0:
+            # 一个裁决都没拿到 ⇒ **绝不写缓存**（否则又是一次"离线工具毒化线上"）
+            print(
+                f"error: 本次没有任何裁决（channel_errors={channel_errors}），"
+                "probe 缓存未改动",
+                file=sys.stderr,
+            )
+            return EXIT_CHANNEL_ERROR
+
         entry["updated_at"] = int(time.time())
         write_probe(root, cache_path, entry)
         print(
             f"suggested_max_direct_bytes={best} "
-            f"rule=p50<={P50_BUDGET_MS}ms probe_cache={cache_path}"
+            f"rule=p50<={P50_BUDGET_MS}ms verdicts={verdicts} "
+            f"channel_errors={channel_errors} probe_cache={cache_path}"
         )
-        return 0
+        return EXIT_OK
     finally:
         if created:
             shutil.rmtree(workdir, ignore_errors=True)

@@ -85,6 +85,25 @@ class NativeOutcome:
         )
 
 
+def _attr_of(obj: object, name: str) -> object:
+    """`getattr` 的**兜底版**：属性访问本身抛错（property 里炸了）也只返回 `None`。
+
+    为什么需要（评审 F10）：`_create_of` 原来只防 `None`，可 `provider.client` 完全可能是
+    一个**会抛异常的 property**（核心内部面换实现 / 懒加载失败 / 适配器自定义）——
+    那时异常会一路冒到工具门面，被收成 `INTERNAL_ERROR`，看起来像"插件坏了"。
+    这类失败的真实语义只有一种：**这条通道这次用不了**（⇒ `video_native_unavailable`）。
+    """
+    try:
+        return getattr(obj, name, None)
+    except Exception as exc:  # noqa: BLE001 —— 属性访问失败＝没有这个能力
+        LOG.debug(
+            "media_analysis: 取 provider.%s 失败（%s），按无原生通道处理",
+            name,
+            type(exc).__name__,
+        )
+        return None
+
+
 def channel_reason(provider: object) -> str:
     """这个 provider 能不能走原生视频通道：`""` 表示能。
 
@@ -96,7 +115,7 @@ def channel_reason(provider: object) -> str:
 
     刻意**不读** `modalities`（核心没有 `video` 选项，读了恒 False，§16.2-2）。
     """
-    config = getattr(provider, "provider_config", None)
+    config = _attr_of(provider, "provider_config")
     if not isinstance(config, dict):
         return "adapter_not_openai"
     adapter = config.get("type")
@@ -108,18 +127,23 @@ def channel_reason(provider: object) -> str:
 
 
 def _create_of(provider: object):
-    """`client.chat.completions.create`（拿不到回 `None`）；全程 `getattr`，不 import SDK。"""
-    client = getattr(provider, "client", None)
+    """`client.chat.completions.create`（拿不到回 `None`）；全程兜底 `getattr`，不 import SDK。
+
+    评审 F10：链路上**任何一次属性访问都可能抛**（`provider.client` 是 property，
+    `client.chat` / `.completions` / `.create` 也可能是），所以每一层都用 `_attr_of` 兜住
+    —— 拿不到就是"没有原生通道"，绝不让它变成 `INTERNAL_ERROR`。
+    """
+    client = _attr_of(provider, "client")
     if client is None:
         return None
-    completions = getattr(getattr(client, "chat", None), "completions", None)
-    create = getattr(completions, "create", None)
+    completions = _attr_of(_attr_of(client, "chat"), "completions")
+    create = _attr_of(completions, "create")
     return create if callable(create) else None
 
 
 def model_of(provider: object) -> str:
     """模型名：先 `get_model()`，再 `provider_config["model"]`，最后 `"unknown"`。"""
-    getter = getattr(provider, "get_model", None)
+    getter = _attr_of(provider, "get_model")
     if callable(getter):
         try:
             value = getter()
@@ -127,7 +151,7 @@ def model_of(provider: object) -> str:
             value = None
         if isinstance(value, str) and value:
             return value
-    config = getattr(provider, "provider_config", None)
+    config = _attr_of(provider, "provider_config")
     if isinstance(config, dict):
         value = config.get("model")
         if isinstance(value, str) and value:
@@ -169,7 +193,12 @@ async def call_native(
     **底层调用绕过了核心的超时与重试**（`retry_provider_request` 不在链上），
     所以这里必须自建 `asyncio.wait_for`（§7.2 护栏③）。
     """
-    create = _create_of(provider)
+    try:
+        create = _create_of(provider)
+    except Exception as exc:  # noqa: BLE001 —— 兜底（`_attr_of` 已挡，双保险）
+        return NativeOutcome(
+            ok=False, note=NOTE_UNAVAILABLE, detail=type(exc).__name__
+        )
     if create is None:
         return NativeOutcome(ok=False, note=NOTE_UNAVAILABLE, detail="no client")
 

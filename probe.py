@@ -86,16 +86,86 @@ REASON_MISMATCH = "mismatch"
 REASON_TIMEOUT = "timeout"
 REASON_ERROR = "error"
 
+# --------------------------------------------------------------------------- #
+# 通道类失败 vs 裁决（VERIFY-v0.3 F1 的教训，**这是本模块最贵的一条分界**）
+#
+# `l1.reason` 里有两类东西，语义完全不同：
+#
+# | 类 | 例子 | 能说明什么 |
+# | --- | --- | --- |
+# | **裁决**（verdict） | `ok` / `mismatch` / `empty` / `no_font` / `ffmpeg_missing` / `build_failed` | "这次**确实**试过、且结果是它不行" |
+# | **通道失败**（channel） | `channel_error` / `http_403` / `timeout` / `error` / `dns_*` / `network_*` | 只说明**这次没打成**，什么都没证明 |
+#
+# 为什么必须分开：`probe/v1/` 是**共享缓存** —— 任何写它的东西（本地 CLI 工具、旧版本、
+# 一次网络抖动）写进去的 `l1_ok=false` 都会让插件在 7 天里**不再尝试原生视频**。
+# 真实事故（`VERIFY-v0.3.md` F1）：校准工具用 urllib 默认 UA ⇒ Cloudflare 回 403
+# `error code: 1010` ⇒ 工具把 403 记成"看不见"并落盘 ⇒ 插件 1 ms、0 网络就记
+# `video_probe_l1_failed`，`--clear` 后插件自己的 L1（真 SDK client）11.6 s **通过**。
+#
+# 于是三条硬规则（读取侧 + 写入侧）：
+# 1. 读缓存：`ok=false` 且 `reason` 属通道类 ⇒ **视同 miss**（重新实测），不当"不支持"证据；
+# 2. 写缓存：通道类失败 **不落盘**（只留在进程内做短期冷却），绝不写 `l1_ok=false`；
+# 3. 进程内冷却：通道类失败后 `CHANNEL_RETRY_SECONDS` 内不再打网（否则每次调用都白等一次
+#    超时，把 100 s 预算吃光）—— 冷却不是裁决，冷却窗口过期即重新实测。
+# --------------------------------------------------------------------------- #
+REASON_CHANNEL_ERROR = "channel_error"
+
+CHANNEL_REASONS: frozenset[str] = frozenset(
+    {REASON_CHANNEL_ERROR, "http_error", "timeout", "error", "dns", "network", "connect"}
+)
+CHANNEL_REASON_PREFIXES: tuple[str, ...] = (
+    "http_",  # http_403 / http_429 / http_5xx（CLI 会把状态码拼进来）
+    "dns_",
+    "network_",
+    "connect_",
+    "channel_",
+)
+
+#: 通道类失败在同一进程内的冷却窗口（秒）。只影响"要不要再打一次网"，不影响裁决。
+CHANNEL_RETRY_SECONDS = 60.0
+
+#: **本地环境类**失败（没有字体 / 没有 ffmpeg / 编码失败）的短 TTL：评审 F3 的裁决 ——
+#: "瞬时失败不该按 7 天缓存"。装个字体、补个 ffmpeg 都是分钟级就能修好的事，让插件因为
+#: 一次缺字体而 7 天不用原生视频，和 F1 的"毒化"是同一类伤害（只是更轻）。
+LOCAL_FAILURE_TTL_S = 3600
+
+#: 进程内记忆的**最长寿命**（秒）：评审 F2 —— `--clear` 或 `rm -rf probe/` 之后，运行中的
+#: 插件最多再"记得"这么久就必须回磁盘确认一次。否则删了缓存也白删（内存里还留着结论）。
+MEMO_MAX_AGE_S = 300
+
+#: 判据失败（模型答错/空文本）＝**真裁决**，按配置 TTL（默认 7 天）缓存。
+VERDICT_FAILURE_REASONS: frozenset[str] = frozenset({REASON_MISMATCH, REASON_EMPTY})
+
+
+def is_channel_failure_reason(reason: object) -> bool:
+    """这个 `reason` 是否属**通道类**（＝不能当作"模型看不见"的证据）。纯函数。"""
+    text = str(reason or "").strip().lower()
+    if not text:
+        return False
+    if text in CHANNEL_REASONS:
+        return True
+    return any(text.startswith(prefix) for prefix in CHANNEL_REASON_PREFIXES)
+
+
+def is_verdict_reason(reason: object) -> bool:
+    """反过来：这个 `reason` 能不能当"试过且不行"的裁决（`ok=true` 时恒为 True）。"""
+    return not is_channel_failure_reason(reason)
+
 _FULLWIDTH_DIGITS = str.maketrans("０１２３４５６７８９", "0123456789")
 
 #: 进程内记忆（键 → 条目）。存在的理由不只是"省一次读盘"：**落盘失败时**也靠它
 #: 保证"每 TTL 窗口最多自动跑 1 次"（§3.3 的降级要求）。
 _MEMO: dict[str, dict[str, object]] = {}
 
+#: 通道类失败的**冷却窗口**（键 → `time.time()`）。与 `_MEMO` 分开：记忆是"结论"，
+#: 冷却只是"刚打过一次网、别马上再打"（见文件头"通道类失败 vs 裁决"）。
+_CHANNEL_LAST_FAIL: dict[str, float] = {}
+
 
 def reset_memo() -> None:
-    """清空进程内记忆（测试与 CLI 用；生产没有调用者）。"""
+    """清空进程内记忆与冷却表（测试与 CLI 用；生产没有调用者）。"""
     _MEMO.clear()
+    _CHANNEL_LAST_FAIL.clear()
 
 
 class Sample:
@@ -282,6 +352,8 @@ async def run_l1(
         timeout=timeout,
     )
     if outcome.note == video_native.NOTE_UNAVAILABLE:
+        # 没有 client / client 形状变了 ⇒ 这次**根本没发出去**，对"能不能看见"零信息
+        # ⇒ `REASON_ERROR`（通道类，见上方分类表；不落盘、冷却后重试）
         return L1Result(False, REASON_ERROR, outcome.elapsed_ms)
     if outcome.note == video_native.NOTE_FAILED:
         reason = REASON_TIMEOUT if outcome.detail.startswith("timeout") else REASON_ERROR
@@ -352,6 +424,9 @@ class ProbeStore:
         age = time.time() - float(updated_at)
         if age < 0 or age > ttl:
             return None
+        # 评审 F3：按结论类型再收一次（本地环境类 1 小时、通道类 0）
+        if age > _entry_ttl(entry, ttl):
+            return None
         return entry
 
     async def write(self, key: str, entry: dict[str, object]) -> None:
@@ -366,7 +441,12 @@ class ProbeStore:
             self._degrade(exc)
 
     async def clear(self) -> None:
-        """整目录清空（`tools/probe_video_capability.py --clear` 的等价物）。"""
+        """整目录清空 + **连进程内记忆一起清**（评审 F2）。
+
+        不清记忆的话，「清缓存」对运行中的插件等于没做：结论还在 `_MEMO` 里，
+        下一次调用仍会 1 ms 命中一条已经不存在的条目。
+        """
+        reset_memo()
         directory = self.directory
         if not directory:
             return
@@ -408,21 +488,43 @@ async def ensure_l1(
     key = build_key(provider_id, model, plugin_version)
     store = store or ProbeStore(plugin_name=PROBE_STORE_PLUGIN_NAME)
 
-    cached = _MEMO.get(key)
-    if cached is None:
-        cached = await store.read(key, ttl_seconds)
+    # 1) 进程内记忆：只有**裁决**能直接复用（通道类失败不是结论，见文件头）；
+    #    且必须过两道时效（评审 F2）：条目自身的 TTL（F3 分流）与 `MEMO_MAX_AGE_S`
+    memo_entry = _MEMO.get(key)
+    if _memo_entry_is_fresh(memo_entry, ttl_seconds):
+        memo = _outcome_from_entry(memo_entry)
+        if memo is not None:
+            return memo
+    elif memo_entry is not None:
+        _MEMO.pop(key, None)  # 过期/失效：丢掉，回磁盘或重测
+
+    # 2) 磁盘缓存：**通道类条目视同 miss**并重新实测
+    #    这一条是 F1 的正面修复：任何外部写入（CLI / 旧版本 / 网络抖动）留下的
+    #    `l1_ok=false + reason=http_403` 都不许变成"这个模型看不见视频"的 7 天判决。
+    cached = await store.read(key, ttl_seconds)
+    cached_outcome = _outcome_from_entry(cached)
+    if cached_outcome is not None:
+        _MEMO[key] = dict(cached)  # 记进内存（带 `updated_at`，寿命受 MEMO_MAX_AGE_S 约束）
+        return cached_outcome
     if cached is not None:
-        l1 = cached.get("l1") if isinstance(cached, dict) else None
-        if isinstance(l1, dict):
-            return ProbeOutcome(
-                bool(l1.get("ok")),
-                "cache",
-                L1Result(
-                    bool(l1.get("ok")),
-                    str(l1.get("reason") or REASON_ERROR),
-                    int(l1.get("elapsed_ms") or 0),
-                ),
-            )
+        # 刻意**不删**这条条目：这次实测若成功会直接覆盖它（`store.write`）；若又失败，
+        # 说明通道还没好，留着也只是"再被忽略一次"，比反复删写更简单。
+        LOG.info(
+            "media_analysis: probe 缓存里是通道类失败（reason=%s），不是裁决，"
+            "视同 miss 重新实测",
+            _reason_of(cached),
+        )
+
+    # 3) 冷却窗口：刚打过一次网且只得到通道类失败 ⇒ 别马上再打（否则每次调用都白等一次超时）
+    last_fail = _CHANNEL_LAST_FAIL.get(key)
+    if last_fail is not None and time.time() - last_fail < CHANNEL_RETRY_SECONDS:
+        entry = _MEMO.get(key) or {}
+        reason = _reason_of(entry) or REASON_CHANNEL_ERROR
+        return ProbeOutcome(
+            False,
+            "cooldown",
+            L1Result(False, reason, _elapsed_of(entry)),
+        )
 
     result = await run_l1(provider, workdir=workdir, timeout=timeout)
     now = int(time.time())
@@ -441,7 +543,15 @@ async def ensure_l1(
         "updated_at": now,
     }
     _MEMO[key] = entry  # 先记内存：落盘失败也不会把成本放大（§3.3）
-    await store.write(key, entry)
+    if result.ok or is_verdict_reason(result.reason):
+        # 4) 写入侧：**只有裁决才落盘**。通道类失败绝不写 `l1_ok=false`（F1 的根因）
+        await store.write(key, entry)
+    else:
+        _CHANNEL_LAST_FAIL[key] = time.time()
+        LOG.info(
+            "media_analysis: L1 因通道类失败未完成（reason=%s），本次不写入 probe 缓存",
+            result.reason,
+        )
     return ProbeOutcome(result.ok, "live", result)
 
 
@@ -473,6 +583,92 @@ def _write_atomic(path: str, data: bytes) -> None:
 def _remove_tree(directory: str) -> None:
     if os.path.isdir(directory):
         shutil.rmtree(directory, ignore_errors=True)
+
+
+def cache_ttl_for(ok: bool, reason: object, configured_ttl: int) -> int:
+    """这条结论在磁盘/内存里**最多**能活多久（秒）。评审 F3 的冻结分流表：
+
+    | 结论 | TTL |
+    | --- | --- |
+    | `ok=true`（看见过） | 配置值（默认 7 天） |
+    | 判据不过（`mismatch` / `empty`） | 配置值（真裁决，值得记住） |
+    | 本地环境类（`no_font` / `ffmpeg_missing` / `build_failed`） | **min(配置值, 1 小时)** |
+    | 通道类（4xx/5xx/timeout/dns/error） | **0**（不该在缓存里；写入侧已经拦了） |
+
+    `0` 的含义是"当作过期"（读侧视同 miss），不是"永久"。
+    """
+    ttl = _clamp_ttl(configured_ttl)
+    if ok or str(reason or "") in VERDICT_FAILURE_REASONS:
+        return ttl
+    if is_channel_failure_reason(reason):
+        return 0
+    return min(ttl, LOCAL_FAILURE_TTL_S)
+
+
+def _memo_entry_is_fresh(entry: object, configured_ttl: int) -> bool:
+    """进程内记忆里的这条还算不算数（评审 F2）。
+
+    两道闸：① 条目自身 TTL（F3 分流：裁决 7 天 / 本地环境 1 小时 / 通道类 0）；
+    ② `MEMO_MAX_AGE_S` —— 再长也不超过 5 分钟，保证 `--clear` / `rm -rf probe/`
+    对运行中的进程**最多 5 分钟后生效**（否则删了缓存也白删）。
+
+    `ttl_seconds=0`（探测关闭）时批 `MEMO_MAX_AGE_S`：此时 `analyze` 根本不会调到这里，
+    留这条只是让"直接调用方"的重复调用不至于反复打网（成本保护优先）。
+    """
+    if not isinstance(entry, dict):
+        return False
+    updated_at = entry.get("updated_at")
+    if not isinstance(updated_at, (int, float)):
+        return False
+    age = time.time() - float(updated_at)
+    if age < 0:
+        return False
+    if _clamp_ttl(configured_ttl) <= 0:
+        return age <= MEMO_MAX_AGE_S
+    return age <= min(MEMO_MAX_AGE_S, _entry_ttl(entry, configured_ttl))
+
+
+def _entry_ttl(entry: object, configured_ttl: int) -> int:
+    """条目 → 有效 TTL（`ok` 与 `reason` 都从 `l1` 里取）。"""
+    l1 = entry.get("l1") if isinstance(entry, dict) else None
+    if not isinstance(l1, dict):
+        return 0
+    return cache_ttl_for(bool(l1.get("ok")), l1.get("reason"), configured_ttl)
+
+
+def _reason_of(entry: object) -> str:
+    """条目里的 `l1.reason`（取不到回 `""`）。"""
+    l1 = entry.get("l1") if isinstance(entry, dict) else None
+    if isinstance(l1, dict):
+        return str(l1.get("reason") or "")
+    return ""
+
+
+def _elapsed_of(entry: object) -> int:
+    l1 = entry.get("l1") if isinstance(entry, dict) else None
+    if isinstance(l1, dict):
+        try:
+            return int(l1.get("elapsed_ms") or 0)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def _outcome_from_entry(entry: object) -> ProbeOutcome | None:
+    """把一条缓存条目变成结局；**通道类失败返回 `None`（＝视同 miss）**。
+
+    `ok=true` 的条目永远可用（"能看见"是正面证据，通道抖动不会伪造它）。
+    """
+    if not isinstance(entry, dict):
+        return None
+    l1 = entry.get("l1")
+    if not isinstance(l1, dict):
+        return None
+    ok = bool(l1.get("ok"))
+    reason = str(l1.get("reason") or REASON_ERROR)
+    if not ok and not is_verdict_reason(reason):
+        return None
+    return ProbeOutcome(ok, "cache", L1Result(ok, reason, _elapsed_of(entry)))
 
 
 def _decode_entry(raw: bytes) -> dict[str, object] | None:

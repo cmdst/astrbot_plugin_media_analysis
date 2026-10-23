@@ -34,8 +34,10 @@ EXPECTED_SOURCE_MODULES = [
     "envelope.py",
     "main.py",
     "media.py",
+    "probe.py",
     "providers.py",
     "settings.py",
+    "video_native.py",
 ]
 
 

@@ -48,16 +48,19 @@ def _envelope(text: str = "转写正文", *, summary: str = "摘要") -> dict[st
 
 
 def _key(**overrides) -> str:
+    """默认一组**全非空**的分量（v0.3：12 个，见 SPEC-v0.3 §9.1）。"""
     base = dict(
         digest="0123456789abcdef",
         kind="audio",
-        include_frames=False,
+        mode="auto",
         max_frames=6,
         focus="",
         prompts_fp="ffffffffffffffff",
         audio_provider_id="a1",
+        video_provider_id="vid1",
         vision_provider_id="v1",
-        plugin_version="0.2.0",
+        video_fp="deadbeef",
+        plugin_version="0.3.0",
     )
     base.update(overrides)
     return cache_mod.build_key(**base)
@@ -73,8 +76,18 @@ def cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> cache_mod.DiskCach
 
 
 # --------------------------------------------------------------------------- #
-# 1. 键公式（§6.1）：10 个分量、64 hex、逐分量敏感
+# 1. 键公式（SPEC-v0.3 §9.1）：12 个分量、64 hex、逐分量敏感
 # --------------------------------------------------------------------------- #
+def test_key_schema_version_is_v3_and_there_are_twelve_components() -> None:
+    """v2 → v3 是**换公式**，不是加迁移：`KEY_SCHEMA_VERSION` 必须逐字 `v3`。
+
+    键公式版本是缓存键的**第一分量**（`build_key` 的 material 首段），所以 v3 的键与
+    任何 v2 键必然不同 ⇒ 旧条目自然不命中、按 TTL 老化淘汰（不是靠人记得清目录）。
+    """
+    assert cache_mod.KEY_SCHEMA_VERSION == "v3"
+    assert cache_mod.CACHE_SCHEMA_VERSION == "v1", "目录名不变（v2 条目仍躺在同一棵树里等 TTL）"
+
+
 def test_build_key_is_64_hex_and_deterministic() -> None:
     key = _key()
     assert len(key) == 64
@@ -87,13 +100,15 @@ def test_build_key_is_64_hex_and_deterministic() -> None:
     [
         ("digest", "ffff0000ffff0000"),
         ("kind", "video"),
-        ("include_frames", True),
+        ("mode", "false"),
         ("max_frames", 12),
         ("focus", "他在说什么"),
         ("prompts_fp", "0000000000000000"),
         ("audio_provider_id", "a2"),
+        ("video_provider_id", "vid2"),
         ("vision_provider_id", "v2"),
-        ("plugin_version", "0.2.1"),
+        ("video_fp", "cafebabe"),
+        ("plugin_version", "0.3.1"),
     ],
 )
 def test_build_key_changes_with_every_component(field: str, value: object) -> None:
@@ -101,13 +116,54 @@ def test_build_key_changes_with_every_component(field: str, value: object) -> No
     assert _key(**{field: value}) != _key(), f"{field} 没有进缓存键"
 
 
+def test_mode_is_a_component_so_auto_and_false_never_collide() -> None:
+    """v0.3 把布尔 `include_frames` 换成三态 `mode` ⇒ **三种取值两两不同键**。
+
+    这是"同媒体 `auto` 与 `false` 不得互相命中"的纯函数半条（行为半条在
+    `tests/test_analyze.py`）：`false` 的产物里**没有画面结论**，一旦命中 `auto` 的条目
+    就等于把"没看画面"记成"看过"。
+    """
+    keys = {mode: _key(mode=mode) for mode in ("auto", "true", "false")}
+    assert len(set(keys.values())) == 3, keys
+    # 旧的布尔语义若被写回键里（`True`/`False` 字符串化），也必须与三态不同键
+    assert _key(mode="true") != _key(mode="True")
+    assert _key(mode="false") != _key(mode="False")
+
+
+def test_video_fp_is_a_component_so_threshold_changes_invalidate() -> None:
+    """`video_fp`（直送门槛 / 压缩开关 / 压缩预算的指纹）必须在键里（§9.1 的第二个新分量）。"""
+    assert _key(video_fp="00000000") != _key(video_fp="ffffffff")
+
+
+def test_a_v2_style_key_material_never_matches_the_v3_key() -> None:
+    """v2 的 10 分量公式算出来的 64 hex **不可能**等于 v3 的键（首段就不同）。"""
+    import hashlib
+
+    v2_material = "|".join(
+        (
+            "v2",
+            "0123456789abcdef",
+            "audio",
+            "False",
+            "6",
+            "ffffffffffffffff",
+            "",
+            "a1",
+            "v1",
+            "0.2.0",
+        )
+    )
+    v2_key = hashlib.sha256(v2_material.encode("utf-8")).hexdigest()
+    assert v2_key != _key()
+
+
 def test_build_key_is_not_ambiguous_about_separator_collisions() -> None:
     """`|` 连接的下一个坑：分量里本身带 `|` 时不许与另一组输入撞键。
 
-    实现用的是固定顺序拼接，所以 `focus="a|1"` 与 `focus="a"`+`include_frames=True`
-    在**字符串**上可能相同；这条用例把"哪些输入算同键"钉在行为面上（撞了就红）。
+    实现用的是固定顺序拼接，所以 `focus="a|1"` 与 `focus="a"`+`mode="1"` 在**字符串**上
+    可能相同；这条用例把"哪些输入算同键"钉在行为面上（撞了就红）。
     """
-    assert _key(focus="a|1") != _key(focus="a", include_frames=True)
+    assert _key(focus="a|1") != _key(focus="a", mode="1")
 
 
 # --------------------------------------------------------------------------- #

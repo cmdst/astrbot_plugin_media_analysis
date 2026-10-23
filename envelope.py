@@ -84,7 +84,7 @@ HINTS: dict[str, str] = {
     "VISION_FAILED": "视觉模型调用全部失败或超时；请稍后重试。",
     "VIDEO_UNAVAILABLE": (
         "没有可用的视频模型，也无法回退抽帧；请让管理员在插件配置里指定「视频模型」"
-        "（走原生视频），或把 include_frames 设为 auto 或 true 并配置「视觉模型」。"
+        "（走原生视频），或把 include_frames 设为 true 并配置「视觉模型」。"
     ),
     "VIDEO_FAILED": (
         "视频模型调用失败或超时；请稍后重试，或让管理员调大 video.native_timeout_seconds。"

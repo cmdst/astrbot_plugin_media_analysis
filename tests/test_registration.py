@@ -5,8 +5,9 @@
 1. **导入形态**：测试按包导入（`astrbot_plugin_media_analysis.main`）⇒ `__package__` 是包名，
    且全部包内导入都是**相对导入**。生产按 `data.plugins.<目录名>.main` 把插件当包导入，
    扁平 `import media` 在库里可能过、在生产必挂（2026-10-18 的静默拒载）。
-2. **schema 只从 docstring 生成**：三参数有默认值、类型只有 `string`/`boolean`、
-   顶层键恰好 `["properties","type"]`（无 `required`）、描述非空且带取值约束。
+2. **schema 只从 docstring 生成**：三参数有默认值、类型只有 `string`（v0.3 起
+   `include_frames` 从 `boolean` 变 `string` 三态）、顶层键恰好 `["properties","type"]`
+   （无 `required`）、描述非空且带取值约束。
 3. **装饰器纪律**：工具方法上只有 `@filter.llm_tool`，**没有** `permission_type`
    （叠加会让它被当消息处理器，权限不符就丢用户消息）。
 4. **可测形状**：`__init__(context, config=None)` 形参名逐字（加载器按关键字调用）、
@@ -39,6 +40,9 @@ _PACKAGE_MODULES = {
     "media",
     "analyze",
     "cache",
+    # v0.3 新增两个模块（原生视频通道 / L1 探测）；漏登记 = 漏扫一片扁平导入
+    "probe",
+    "video_native",
 }
 
 #: docstring 能生成的类型词（`provider/func_tool_manager.py:128-145`）。
@@ -192,7 +196,9 @@ def test_tool_params_use_only_docstring_renderable_types() -> None:
     }
     assert annotations["target"] == "str"
     assert annotations["focus"] == "str"
-    assert annotations["include_frames"] == "bool"
+    # v0.3：三态字符串（`auto|true|false`）—— 类型从 bool 变 str 是**规格变更**，
+    # 不是实现漂移：布尔表达不了"让我自己选路"（SPEC-v0.3 §7.1 / §13.1）。
+    assert annotations["include_frames"] == "str"
 
     for name, text in annotations.items():
         for banned in ("Literal", "Union", "Optional", "|", "list[", "dict["):
@@ -235,7 +241,7 @@ def test_tool_is_registered_with_three_params_and_no_required() -> None:
     assert "required" not in parameters
 
     types = {name: spec.get("type") for name, spec in parameters["properties"].items()}
-    assert types == {"target": "string", "focus": "string", "include_frames": "boolean"}
+    assert types == {"target": "string", "focus": "string", "include_frames": "string"}
 
 
 def test_registered_schema_descriptions_are_nonempty() -> None:
@@ -271,7 +277,8 @@ def test_envelope_exports_the_frozen_key_orders() -> None:
     assert envelope.FAIL_KEYS == ("ok", "error", "hint")
 
 
-#: 16 条 `hint` 的**逐字快照**（评审 F3）。模型唯一读到的操作性文案，改一个字都要改这里。
+#: **21 条** `hint` 的逐字快照（v0.2 的 18 条 + v0.3 的 3 条）。模型唯一读到的操作性文案，
+#: 改一个字都要改这里。
 #: 抄自 `envelope.py` 的 `HINTS`；这不是"再抄一遍实现"，而是**契约文本**——
 #: 之前用 `envelope.HINTS[...]` 自证，改错文案全套仍绿，等于没人守。
 HINTS_SNAPSHOT: dict[str, str] = {
@@ -292,21 +299,64 @@ HINTS_SNAPSHOT: dict[str, str] = {
     "PROVIDER_CAPABILITY_MISMATCH": "所选 provider 不具备该能力（音频输入 / 图像输入）；请让管理员改选，或在后台给该 provider 的「模型能力」勾上「音频」/「图像」。",
     "VISION_UNAVAILABLE": "没有可用的对话 provider 来读图；请让管理员在插件配置里指定「视觉模型」。",
     "VISION_FAILED": "视觉模型调用全部失败或超时；请稍后重试。",
+    # —— v0.3 新增 3 条（SPEC-v0.3 §11.1，既有 18 条逐字不变）——
+    "VIDEO_UNAVAILABLE": "没有可用的视频模型，也无法回退抽帧；请让管理员在插件配置里指定「视频模型」（走原生视频），或把 include_frames 设为 true 并配置「视觉模型」。",
+    "VIDEO_FAILED": "视频模型调用失败或超时；请稍后重试，或让管理员调大 video.native_timeout_seconds。",
+    "VIDEO_TOO_LARGE": "视频体积超过直送门槛且压不到门槛内；请让管理员调大 video.max_direct_bytes，或把 include_frames 设为 auto 或 true 改走抽帧。",
     "INTERNAL_ERROR": "插件内部错误；已记录日志，请让管理员查看插件日志。",
 }
 
 
-def test_envelope_hints_cover_all_eighteen_codes() -> None:
-    """v0.2 是 **18** 码（删 `STT_UNAVAILABLE`/`STT_FAILED`，增 4 条：体积 / 非媒体 /
-    音频不可用 / 音频调用失败）。码集合与 `HINTS` 键集合必须逐字相等。"""
+def test_envelope_hints_cover_all_twenty_one_codes() -> None:
+    """v0.3 是 **21** 码 = v0.2 的 18 条（逐字不变）+ 视频链路的 3 条终态码。
+
+    码集合与 `HINTS` 键集合必须逐字相等：只加 `ERR_*` 忘了加 hint ⇒ 信封里会出现
+    `hint=None` 或 KeyError（`fail_envelope` 会把它归到 `INTERNAL_ERROR`，把真因藏掉）。
+    """
     codes = {
         value
         for name, value in vars(envelope).items()
         if name.startswith("ERR_") and isinstance(value, str)
     }
-    assert len(codes) == 18, sorted(codes)
+    assert len(codes) == 21, sorted(codes)
     assert set(envelope.HINTS) == codes
+    assert set(HINTS_SNAPSHOT) == codes
+    # v0.3 只加不改：18 条老码一个都没消失
+    for legacy in (
+        "BAD_TARGET",
+        "MEDIA_NOT_FOUND",
+        "MEDIA_UNRESOLVABLE",
+        "PROBE_FAILED",
+        "MEDIA_TOO_LONG",
+        "MEDIA_TOO_LARGE",
+        "UNSUPPORTED_MEDIA_TYPE",
+        "NO_AUDIO_TRACK",
+        "NO_VIDEO_TRACK",
+        "AUDIO_EXTRACT_FAILED",
+        "FRAME_EXTRACT_FAILED",
+        "AUDIO_UNAVAILABLE",
+        "AUDIO_FAILED",
+        "PROVIDER_NOT_FOUND",
+        "PROVIDER_CAPABILITY_MISMATCH",
+        "VISION_UNAVAILABLE",
+        "VISION_FAILED",
+        "INTERNAL_ERROR",
+    ):
+        assert legacy in codes, f"v0.2 的错误码 {legacy} 被删了（SPEC-v0.3 §11.1 只加不改）"
     assert envelope.OK_KEYS + envelope.FAIL_KEYS  # 常量存在性（顺序由上面两条钉）
+
+
+def test_new_video_hints_carry_no_runtime_data() -> None:
+    """新 3 条 hint 必须与其它 hint 同一条纪律：**常量**，不含数字/路径/键值。
+
+    信封会被框架按 INFO 全量写进生产日志 ⇒ hint 是唯一可能夹带运行时数据的位置。
+    """
+    for code in ("VIDEO_UNAVAILABLE", "VIDEO_FAILED", "VIDEO_TOO_LARGE"):
+        hint = envelope.HINTS[code]
+        assert hint and hint.strip() == hint
+        assert not re.search(r"\d", hint), f"{code} 的 hint 里出现数字：{hint!r}"
+        assert "/" not in hint and "\\" not in hint, f"{code} 的 hint 里出现路径分隔符"
+        assert "http" not in hint.lower()
 
 
 def test_removed_stt_codes_are_really_gone() -> None:
@@ -318,9 +368,9 @@ def test_removed_stt_codes_are_really_gone() -> None:
 
 
 def test_envelope_hints_match_the_frozen_snapshot_verbatim() -> None:
-    """评审 F3：18 条 `hint` 逐字快照（dict 全等，不只看键集合）。
+    """评审 F3：21 条 `hint` 逐字快照（dict 全等，不只看键集合）。
 
-    这是本仓库唯一的"文案级"契约：模型看到的就是这 18 句，错一个字就等于给模型
+    这是本仓库唯一的"文案级"契约：模型看到的就是这 21 句，错一个字就等于给模型
     错误的操作指令（"换一条视频"vs"去看日志"指错方向）。要改文案：先改 SPEC §5 表，
     再改 `envelope.HINTS`，最后改这里 —— 三处一起动才算契约变更。
     """

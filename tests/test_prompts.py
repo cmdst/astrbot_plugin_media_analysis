@@ -125,6 +125,8 @@ def test_allowed_placeholders_per_prompt() -> None:
     assert settings.ALLOWED_PLACEHOLDERS["video"] == frozenset({"focus_clause"})
     assert settings.ALLOWED_PLACEHOLDERS["frame"] == frozenset({"focus_clause"})
     assert settings.ALLOWED_PLACEHOLDERS["summary"] == frozenset({"kind_cn", "task", "material"})
+    # v0.3 的第 5 份：原生视频（一次调用同时要"画面 + 声音"）
+    assert settings.ALLOWED_PLACEHOLDERS["video_native"] == frozenset({"focus_clause"})
 
 
 def test_prompts_fingerprint_changes_with_any_template() -> None:
@@ -137,6 +139,7 @@ def test_prompts_fingerprint_changes_with_any_template() -> None:
         "prompt_video": "不同的视频模板 {focus_clause}",
         "prompt_frame": "不同的帧模板 {focus_clause}",
         "prompt_summary": "不同的摘要模板 {kind_cn}{task}{material}",
+        "prompt_video_native": "不同的原生视频模板 {focus_clause}",
     }
     for field, template in templates.items():
         other = settings.Settings(**{field: template})
@@ -144,18 +147,56 @@ def test_prompts_fingerprint_changes_with_any_template() -> None:
 
 
 def test_prompts_tuple_order_is_frozen() -> None:
-    """4 元组顺序冻结 `(audio, video, frame, summary)` —— `_PROMPT_INDEX` 与它必须同步。"""
+    """5 元组顺序冻结 `(audio, video, frame, summary, video_native)` —— `_PROMPT_INDEX` 同步。
+
+    v0.3 的新键**追加在末位**（前四位与 v0.2 一致）：这样 v0.2 的四个老下标一个都不动，
+    少一次"全表错位"的机会（错位的后果是把视频音轨模板发给语音条，且**不报错**）。
+    """
     cfg = settings.Settings(
         prompt_audio="A{focus_clause}",
         prompt_video="V{focus_clause}",
         prompt_frame="F{focus_clause}",
         prompt_summary="{material}",
+        prompt_video_native="N{focus_clause}",
     )
+    assert len(cfg.prompts) == 5
     assert cfg.prompts[0].startswith("A")
     assert cfg.prompts[1].startswith("V")
     assert cfg.prompts[2].startswith("F")
     assert cfg.prompts[3] == "{material}"
-    assert analyze_mod._PROMPT_INDEX == {"audio": 0, "video": 1, "frame": 2, "summary": 3}
+    assert cfg.prompts[4].startswith("N")
+    assert analyze_mod._PROMPT_INDEX == {
+        "audio": 0,
+        "video": 1,
+        "frame": 2,
+        "summary": 3,
+        "video_native": 4,
+    }
+    assert set(analyze_mod._PROMPT_INDEX) == set(settings.PROMPT_KEYS)
+
+
+def test_native_prompt_is_rendered_with_the_focus_clause() -> None:
+    """`prompts.video_native` 走 `_native_prompt`：焦点从句注入、缺占位符时补在末尾。
+
+    原生路径只发**一次**调用，焦点一旦被静默丢弃，用户就永远不知道"问题没问出去"
+    （SPEC-v0.3 §12.2）—— 所以这条与 audio/frame 用同一套补偿规则。
+    """
+    cfg = settings.Settings(prompt_video_native="【原生模板】{focus_clause}")
+    notes: list[str] = []
+    assert analyze_mod._native_prompt("", cfg, notes) == "【原生模板】"
+
+    notes.clear()
+    rendered = analyze_mod._native_prompt("他在说什么", cfg, notes)
+    assert "【原生模板】" in rendered and "他在说什么" in rendered
+    assert notes == []
+
+    # 模板里没有 `{focus_clause}` ⇒ 从句**补在末尾** + 一条 note（焦点永不被静默丢弃）
+    cfg = settings.Settings(prompt_video_native="【没有占位符】")
+    notes = []
+    rendered = analyze_mod._native_prompt("他在说什么", cfg, notes)
+    assert rendered.startswith("【没有占位符】")
+    assert "他在说什么" in rendered
+    assert notes == ["focus_appended:video_native"]
 
 
 # --------------------------------------------------------------------------- #

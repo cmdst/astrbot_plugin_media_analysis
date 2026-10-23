@@ -1,4 +1,4 @@
-"""版本与仓库信息守卫（SPEC-v0.2 §11 C9 / §13；评审 t5 的 F3）。
+"""版本与仓库信息守卫（SPEC-v0.3 §14.1；v0.2 §11 C9 / §13 的同一套）。
 
 **为什么必须存在这一条**：`settings.PLUGIN_VERSION` 是**缓存键成分**（升级即整体失效），
 而 `metadata.yaml` 的 `version` 是加载器、面板与运维（`pin-check.sh`）看到的版本面。
@@ -29,7 +29,7 @@ METADATA = REPO_DIR / "metadata.yaml"
 CHANGELOG = REPO_DIR / "CHANGELOG.md"
 
 #: 用户要求的版本面（与 `metadata.yaml` / `settings.PLUGIN_VERSION` 三方一致）
-EXPECTED_VERSION = "0.2.0"
+EXPECTED_VERSION = "0.3.0"
 #: 用户要求补齐的上游仓库（逐字）
 EXPECTED_REPO = "https://github.com/cmdst/astrbot_plugin_media_analysis"
 
@@ -70,8 +70,9 @@ def test_metadata_exposes_the_four_loader_facing_scalars() -> None:
 def test_plugin_version_equals_metadata_version() -> None:
     """C9：`settings.PLUGIN_VERSION` == `metadata.yaml:version`（去掉 `v` 前缀后逐字）。
 
-    这条守的是缓存键：`PLUGIN_VERSION` 在 `cache.build_key` 的 10 个分量里 ⇒ 版本升级
-    会让全部旧条目自然失效。两边不一致时，升级不会清缓存、也不会体现在键里。
+    这条守的是缓存键：`PLUGIN_VERSION` 在 `cache.build_key` 的 **12 个分量**里（v0.3）
+    与 probe 缓存的键（`probe.build_key(provider, model, PLUGIN_VERSION)`）里 ⇒ 版本升级
+    会让结果缓存与探测记录**同时**自然失效。两边不一致时，升级不会清缓存、也不会体现在键里。
     """
     assert _normalize_version(_scalar("version")) == _normalize_version(
         settings.PLUGIN_VERSION

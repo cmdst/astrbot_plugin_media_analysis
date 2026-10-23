@@ -1,0 +1,89 @@
+"""`notes` 词表（SPEC-v0.3 §11.2 的 39 条 + 评审 F7 的 1 条 = **40** 条）—— 主链路测试共用的唯一副本。
+
+为什么单独一份：v0.3 把 notes 从 20 条扩到 39 条，而"词表是封闭的"这条守卫要在**两个**
+主链路测试文件里都成立（`test_analyze.py` 守 v0.2 语义骨架、`test_video_chain.py` 守
+v0.3 的原生/压缩/回退链）。各抄一份的结果必然漂：一边加了新词、另一边还按旧词表断言，
+于是"新分支的 note 不合规"只在某个文件里被抓到。
+
+词表本身**仍是实现的事实的照抄**（`analyze.py` + `probe.py` 的 `notes.append(...)`），
+它在这里被写死成字面量，是为了让"多出一个没评审过的词"变成红灯 —— 不是为了让实现自证。
+
+40 条 = v0.2 的 20 条（逐字不变）+ v0.3 的 19 条 + 评审 F7 的 1 条
+（`video_unavailable_no_provider`：`auto` 且未配视频模型 ⇒ 不抽帧、只转写）。
+"""
+
+from __future__ import annotations
+
+import re
+
+#: v0.2 的 20 条（`SPEC-v0.2.md` §8.2，逐字不变）
+V02_NOTES: frozenset[str] = frozenset(
+    {
+        "audio_provider",
+        "vision_provider",
+        "source",
+        "audio_extracted",
+        "audio_normalized",
+        "audio_empty",
+        "no_audio_track",
+        "frames_skipped_audio_only",
+        "frames_truncated",
+        "frame_extract_failed",
+        "frame_desc_failed",
+        "summary_skipped_budget",
+        "summary_failed",
+        "focus_trimmed",
+        "prompt_trimmed",
+        "focus_appended",
+        "material_trimmed",
+        "cache_hit",
+        "cache_age_s",
+        "file_downloaded",
+    }
+)
+
+#: v0.3 新增 19 条（`SPEC-v0.3.md` §11.2）+ 评审 F7 的 1 条
+V03_NOTES: frozenset[str] = frozenset(
+    {
+        # 评审 F7：`mode=auto` 且未配视频模型 ⇒ 不抽帧（成本回归修复）
+        "video_unavailable_no_provider",
+        "video_provider",
+        "video_asserted",
+        "video_probe_cached",
+        "video_probe_l1_ok",
+        "video_probe_l1_failed",
+        "video_probe_disabled",
+        "video_native_unavailable",
+        "video_native",
+        "video_native_failed",
+        "video_native_empty",
+        "video_compressed",
+        "video_compress_skipped",
+        "video_compress_failed",
+        "video_compress_infeasible",
+        "video_compressed_noaudio",
+        "video_fallback_frames",
+        "video_frames_forbidden",
+        "video_no_vision_provider",
+        "video_skip_budget",
+    }
+)
+
+NOTE_WORDS: frozenset[str] = V02_NOTES | V03_NOTES
+
+#: 带参形态：`<word>:<param>`（`audio_provider:<id>` / `video_compressed:<from>-><to>` /
+#: `cache_age_s:<n>` / `frames_truncated:<kept>/<want>` …）。参数里**不许**有空白或换行。
+NOTE_PATTERN = re.compile(
+    r"^(?:" + "|".join(sorted(NOTE_WORDS, key=len, reverse=True)) + r")(?::\S+)?$"
+)
+
+
+def split_note(note: str) -> tuple[str, str]:
+    """`note` → `(词, 参数)`；无参数时参数是 `""`。"""
+    word, _, param = note.partition(":")
+    return word, param
+
+
+def bad_notes(notes: list[str]) -> list[str]:
+    """返回不合规的 note 列表（空列表 = 全部合规）。"""
+    return [note for note in notes if not NOTE_PATTERN.match(note)]

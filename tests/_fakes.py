@@ -18,6 +18,9 @@
   对象，所以插件若误写成 `await context.get_provider_by_id(...)` 会直接 `TypeError`
   —— 那个最贵的坑（同名方法在 `ProviderManager` 上是异步、`manager.py:221-223`）由这个
   形状自动兜住，不需要额外断言。
+- **v0.3 的视频位假身 `FakeNativeProvider` 有 `client.chat.completions.create`**：
+  原生视频走 provider 底层 `AsyncOpenAI`（核心 `text_chat` 放不进 video 块），所以它的
+  `text_chat` 刻意**抛 AssertionError** —— 谁把原生链路退回 `text_chat`，测试立刻红。
 - 所有假对象记录 `.calls`（`Call(name, args, kwargs)`），断言"调了什么、传了什么"。
 
 用法：
@@ -56,6 +59,7 @@ __all__ = [
     "FakeChatProvider",
     "FakeContext",
     "FakeEvent",
+    "FakeNativeProvider",
     "FakeSTTProvider",
     "NotAProvider",
     "RecordingLogger",
@@ -67,6 +71,7 @@ __all__ = [
     "make_file",
     "make_record",
     "make_video",
+    "native_video",
 ]
 
 
@@ -215,6 +220,126 @@ def audio_chat(
         modalities=["text", "audio"],
         model_name=model_name,
     )
+
+
+# --------------------------------------------------------------------------- #
+# 视频位假身（v0.3）：原生通道的唯一入口是 `provider.client.chat.completions.create`
+# --------------------------------------------------------------------------- #
+_COMPLETION_SENTINEL: Any = object()
+
+
+class FakeNativeProvider(Provider):
+    """视频位假身：**有** `client.chat.completions.create`（v0.3 原生通道的入口）。
+
+    v0.3 的原生视频走 provider 底层 `AsyncOpenAI` 实例（核心 `text_chat` 的形参里没有
+    `video_urls`，`openai_source.py:1424` 对未知块直接抛 `ValueError`）。所以假身必须模
+    两个面：一个**能调**的 `create`（记录 kwargs、可注入异常/延迟），以及 `text_chat`
+    **一次都不该被调用**（视频位只走原生通道；走 text_chat 就说明形状退回 v0.2 了）。
+
+    Args:
+        text: `create` 返回的 `choices[0].message.content`（`""` 测"200 但空文本"）。
+        model_name: `provider_config["model"]` 与 `get_model()` 的返回。
+        adapter_type: 适配器类型；`openai_chat_completion` 之外 ⇒ 无原生通道
+            （`video_native.channel_reason` 判 `adapter_not_openai`，**不是**错误）。
+        with_client: `False` ⇒ 实例上没有 `client`（核心内部面搬家 / 换 SDK 形状）。
+        fail_with: 非空则 `create` 抛该异常（测 `video_native_failed` 与回退）。
+        delay: `create` 前 `await asyncio.sleep(delay)`（测自建 `wait_for` 超时，别用真网络）。
+        reasoning: 空文本时塞进 `reasoning_content` 的长度（只影响日志，不进信封）。
+    """
+
+    def __init__(
+        self,
+        *,
+        text: str = "画面里有一个数字与一个单词，声音里有人说了一句话。",
+        model_name: str = "fake-native",
+        adapter_type: str = "openai_chat_completion",
+        with_client: bool = True,
+        fail_with: BaseException | None = None,
+        delay: float = 0.0,
+        reasoning: int = 0,
+        provider_id: str | None = None,
+    ) -> None:
+        config: dict[str, Any] = {
+            "type": adapter_type,
+            "id": provider_id or model_name,
+            "model": model_name,
+            # 视频**不读** modalities（核心没有 video 选项）⇒ 给个普通 chat 值即可
+            "modalities": ["text", "image"],
+        }
+        super().__init__(config, {})
+        self.provider_config = config
+        self.model_name = model_name
+        self.text = text
+        self.fail_with = fail_with
+        self.delay = delay
+        self.reasoning = reasoning
+        self.calls = _CallLog()
+        self.client = (
+            types.SimpleNamespace(
+                chat=types.SimpleNamespace(
+                    completions=types.SimpleNamespace(create=self._create)
+                )
+            )
+            if with_client
+            else None
+        )
+
+    # -- 原生通道的唯一面 ---------------------------------------------------- #
+    async def _create(self, **kwargs: Any) -> Any:
+        self.calls.record("create", **kwargs)
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.fail_with is not None:
+            raise self.fail_with
+        message = types.SimpleNamespace(content=self.text)
+        if self.reasoning:
+            message.reasoning_content = "想" * self.reasoning
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=message)])
+
+    # -- 抽象方法（真 Provider 是 ABC） --------------------------------------- #
+    async def text_chat(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
+        self.calls.record("text_chat", *args, **kwargs)
+        raise AssertionError("视频位不该走 text_chat（原生通道只认 provider.client）")
+
+    async def get_models(self) -> list[str]:
+        return [self.model_name]
+
+    def set_key(self, key: str) -> None:
+        self._key = key
+
+    def get_current_key(self) -> str:
+        return getattr(self, "_key", "")
+
+    # -- 断言辅助 ----------------------------------------------------------- #
+    def creates(self) -> list[Call]:
+        return self.calls.named("create")
+
+    def payloads(self) -> list[dict[str, Any]]:
+        return [dict(call.kwargs) for call in self.creates()]
+
+    def prompt_texts(self) -> list[str]:
+        """每次 `create` 的第一个 text 块内容（= 生效提示词）。"""
+        texts: list[str] = []
+        for payload in self.payloads():
+            for block in (payload.get("messages") or [{}])[0].get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    texts.append(str(block.get("text") or ""))
+        return texts
+
+    def video_urls(self) -> list[str]:
+        """每次 `create` 的 `video_url.url`（`data:video/mp4;base64,…`）。"""
+        urls: list[str] = []
+        for payload in self.payloads():
+            for block in (payload.get("messages") or [{}])[0].get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "video_url":
+                    urls.append(str((block.get("video_url") or {}).get("url") or ""))
+        return urls
+
+
+def native_video(**kwargs: Any) -> FakeNativeProvider:
+    """一行造一个"能走原生通道"的视频 provider（默认适配器/默认有 client）。"""
+    return FakeNativeProvider(**kwargs)
+
 
 
 class FakeSTTProvider(STTProvider):

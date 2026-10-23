@@ -447,14 +447,29 @@ def test_plan_does_not_mutate_the_input_config() -> None:
     assert config == snapshot
 
 
-def test_key_order_covers_every_settings_key() -> None:
-    """脚本报告的 11 个键必须与 `settings.KEY_MAP` **完全一致**（少一个=没报告）。
+def test_v02_key_order_is_the_frozen_eleven_keys() -> None:
+    """v0.2 迁移器报告的 **11** 个键是**冻结**的（它承诺的是 v0.1→v0.2，不跟着新版本长）。
 
-    这是"配置键只有一个事实源"的第四处守卫（另三处：schema / KEY_MAP / main 白名单）。
-    迁移脚本刻意不 import 插件模块，所以这条交叉检查只能放在测试里。
+    v0.3 的 21 键由 `tools/migrate_config_v03.py:KEY_ORDER` 负责（守卫在
+    `tests/test_migrate_config_v03.py` 与 `tests/test_config_map.py` 的四处一致里）。
+    这里只需要两条：① 11 条逐字不动；② 它们**都是**当前 21 键的子集（v0.3 没删没改名）。
     """
+    frozen_v02 = {
+        "provider_settings.audio_provider_id",
+        "provider_settings.vision_provider_id",
+        "provider_settings.stt_provider_id",
+        "prompts.audio",
+        "prompts.video",
+        "prompts.frame",
+        "prompts.summary",
+        "limits.max_media_seconds",
+        "limits.max_frames",
+        "limits.max_media_bytes",
+        "cache.ttl_seconds",
+    }
     script_keys = {key for key, _type in migrator.KEY_ORDER}
-    assert script_keys == set(settings.KEY_MAP), script_keys ^ set(settings.KEY_MAP)
+    assert script_keys == frozen_v02, script_keys ^ frozen_v02
+    assert script_keys <= set(settings.KEY_MAP), "v0.2 的键在 v0.3 里被删/改名了"
 
 
 def test_legacy_key_is_present_and_never_removed() -> None:

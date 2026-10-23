@@ -48,9 +48,14 @@ FOCUS_MAX_CHARS = 200
 WORKDIR_PREFIX = "media_analysis_"  # 中间产物只落 /tmp（SPEC.md §9-4）
 
 # ---- v0.3 预算护栏（§5.2 推论 2/3、§7.2 护栏③）----
-NATIVE_RESERVE_S = 15.0  # 原生调用之后必须留出的余量（`min(上限, remaining - 15)`）
+FRAMES_MIN_BUDGET_S = 25.0  # 抽帧这一跳最少要多少秒才值得起（推论 3）
+#: 原生调用之后必须留出的余量。**评审 F6**：原来固定 15 s < `FRAMES_MIN_BUDGET_S`(25)，
+#: 于是"原生超时 ⇒ 抽帧几乎必然 `video_skip_budget`"—— 主打回退在最该生效时失效。
+#: 现在改成"抽帧最小预算 + 余量"，原生阶段最多吃到 `remaining - 35`。
+NATIVE_RESERVE_MARGIN_S = 10.0
+NATIVE_RESERVE_S = FRAMES_MIN_BUDGET_S + NATIVE_RESERVE_MARGIN_S  # 35 s
 PROBE_BUDGET_RESERVE_S = 30.0  # 跑 L1 还要留的量（`remaining < L1_TIMEOUT + 30` ⇒ 不跑）
-FRAMES_MIN_BUDGET_S = 25.0  # 任一跳之后剩余 < 25 s ⇒ 不再起抽帧回退（推论 3）
+AUDIO_MIN_ATTEMPT_S = 5.0  # 给音轨至少留这么多；不足就别扣预留（后续本来也做不成）
 
 # ---- `include_frames` 三态（SPEC-v0.3 §7.1）----
 MODE_AUTO = "auto"
@@ -117,6 +122,24 @@ def is_valid_mode_value(value: object) -> bool:
         text = value.strip().lower()
         return text in MODES or text in _TRUE_LITERALS or text in _FALSE_LITERALS
     return False
+
+
+def budgeted_timeout(
+    remaining: float, cap: float, reserve_s: float, *, floor_s: float = AUDIO_MIN_ATTEMPT_S
+) -> float:
+    """在 `remaining` 里给这一步圈一段时间，同时尽量给后面留 `reserve_s`（评审 F6）。
+
+    规则（三条，按顺序）：
+    1. `remaining <= 0` ⇒ `0`（预算已尽）；
+    2. `remaining - reserve_s >= floor_s` ⇒ 扣掉预留（`min(cap, remaining - reserve_s)`）；
+    3. 否则不扣（`min(cap, remaining)`）—— 反正后面那跳也做不成了，别把这一步也饿死。
+    """
+    if remaining <= 0:
+        return 0.0
+    leftover = remaining - max(0.0, float(reserve_s))
+    if leftover >= float(floor_s):
+        return max(0.0, min(float(cap), leftover))
+    return max(0.0, min(float(cap), float(remaining)))
 
 
 def normalize_mode(value: object) -> str:
@@ -228,7 +251,7 @@ async def analyze(
                 return _replay(hit, started)
 
             if kind == "video":
-                transcript, frames, summary = await _video_stage(
+                transcript, frames, summary, frames_degraded = await _video_stage(
                     context=context,
                     event=event,
                     path=path,
@@ -244,7 +267,7 @@ async def analyze(
                     workdir=workdir,
                 )
             else:
-                transcript, frames, summary = await _audio_stage(
+                transcript, frames, summary, frames_degraded = await _audio_stage(
                     context=context,
                     event=event,
                     path=path,
@@ -257,8 +280,18 @@ async def analyze(
                 )
 
             # 7 —— 信封 + 入缓存 + 结构化日志（只打结构/计数/耗时）
-            if kind == "video" and not transcript and not frames and not summary:
-                # 诚实兜底：什么都没拿到 ⇒ 别给模型一个空成功
+            if (
+                kind == "video"
+                and not transcript
+                and not frames
+                and not summary
+                and not frames_degraded
+            ):
+                # 诚实兜底：**想要画面却没拿到**且连转写都空 ⇒ 别给模型一个空成功。
+                # 评审 F4：`mode=false` / `auto`（无视频模型、无视觉位）／预算截断这些
+                # "按设计降级"的情形**不走这里** —— 它们该是 `ok:true` + `audio_empty`
+                # （有音轨但没转出内容属正常降级），拿 `FRAME_EXTRACT_FAILED` 描述"没有
+                # 画面诉求"既错码又误导用户去换媒体。
                 raise envelope.ToolError(
                     envelope.ERR_FRAME_EXTRACT_FAILED,
                     log_detail=f"mode={mode} 但 transcript 与 frames 都为空",
@@ -331,7 +364,7 @@ async def _audio_stage(
         notes=notes,
         settings=settings,
     )
-    return transcript, [], summary
+    return transcript, [], summary, True  # 语音消息没有"画面诉求"⇒ 永远算按设计降级
 
 
 # --------------------------------------------------------------------------- #
@@ -377,7 +410,7 @@ async def _video_stage(
                 workdir=workdir,
             )
             if native_state == NATIVE_OK:
-                return [], [], text
+                return [], [], text, False
     elif mode == MODE_TRUE:
         # 没有视频流却点名要画面 ⇒ v0.2 的判据逐字沿用
         raise envelope.ToolError(
@@ -402,7 +435,7 @@ async def _video_stage(
     else:
         notes.append("no_audio_track")
 
-    frames = await _frames_fallback(
+    frames, frames_degraded = await _frames_fallback(
         context,
         event,
         path=path,
@@ -431,7 +464,7 @@ async def _video_stage(
         notes=notes,
         settings=settings,
     )
-    return transcript, frames, summary
+    return transcript, frames, summary, frames_degraded
 
 
 async def _frames_fallback(
@@ -450,38 +483,55 @@ async def _frames_fallback(
     notes: list[str],
     settings: settings_mod.Settings,
     workdir: str,
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], bool]:
     """抽帧回退（§7.3-[5]）。**`mode=false` 任何组合都不许走到这里抽帧**。
 
-    四种不抽帧的情形要分清（每一种都只降级，不判死整次调用）：
-    - `mode=false`：用户的显式成本约束 ⇒ note `video_frames_forbidden`；
-    - `mode=auto` 且 `vision_provider_id` 空：不猜、不回落核心对话 provider
-      （§7.1 表格：auto 的"允许"以 `vision_provider_id` 非空为前提）⇒ note
-      `video_no_vision_provider`；`mode=true` 同情形 ⇒ `VISION_UNAVAILABLE`；
-    - 容器里没有视频流 ⇒ 抽帧无从谈起（`mode=true` 已在 `_video_stage` 判 `NO_VIDEO_TRACK`）；
-    - 剩余预算 < 25 s ⇒ note `video_skip_budget`（预算优先于功能）。
+    返回 `(frames, degraded)`：`degraded=True` ＝这次"没有画面"是**按设计降级**，
+    不是"想要却没拿到"（评审 F4：后者才配 `FRAME_EXTRACT_FAILED`，前者必须 `ok:true`）。
 
-    这些都只降级；只有**没有音轨**时（既没转写也没画面）才按 §7.4 给终态码。
+    五种不抽帧的情形要分清（每一种都只降级，不判死整次调用）：
+    - `mode=false`：用户的显式成本约束 ⇒ note `video_frames_forbidden`；
+    - **`mode=auto` 且 `video_provider_id` 空**（评审 F7）：没有视频模型＝这条链路根本
+      没有"原生优先"可谈，再拿 6 次视觉调用去补，等于把 v0.2 的 0 次变成 6 次
+      ⇒ note `video_unavailable_no_provider`，退化为"只转写"。**`mode=true` 不受此限**；
+    - `mode=auto` 且 `vision_provider_id` 空：不猜、不回落核心对话 provider
+      （§7.1 表格）⇒ note `video_no_vision_provider`；`mode=true` 同情形 ⇒ `VISION_UNAVAILABLE`；
+    - 容器里没有视频流 ⇒ 抽帧无从谈起（`mode=true` 已在 `_video_stage` 判 `NO_VIDEO_TRACK`）；
+    - 剩余预算 < 25 s（或抽帧层 truncate）⇒ note `video_skip_budget`：`auto/false` 按设计
+      降级，只有 `mode=true` 才算"想要却没拿到"（评审 F6 的第二半）。
+
+    其余情形（没有音轨）按 §7.4 给终态码。
     """
     if mode == MODE_FALSE:
         notes.append("video_frames_forbidden")
-        return _terminal_or_empty(native_state, has_audio, "mode=false")
+        return _terminal_or_empty(native_state, has_audio, "mode=false"), True
 
     if not settings.vision_provider_id:
+        # 先看视觉位：它空着时"配一个视觉模型"才是眼前该做的事（v0.2 语义不变）
         if mode == MODE_TRUE:
             raise envelope.ToolError(
                 envelope.ERR_VISION_UNAVAILABLE,
                 log_detail="mode=true 但 vision_provider_id 为空",
             )
         notes.append("video_no_vision_provider")
-        return _terminal_or_empty(native_state, has_audio, "mode=auto no vision id")
+        return _terminal_or_empty(native_state, has_audio, "mode=auto no vision id"), True
+
+    if mode == MODE_AUTO and not settings.video_provider_id:
+        # 评审 F7：视觉位配了、但**视频模型没配**时，`auto` 不许拿 6 次视觉调用去补
+        # （那是把 v0.2 的 0 次调用变成 6 次的成本回归）⇒ 退化为"只转写"。
+        # `mode=true` 是用户点名要画面，不受此限（下一条分支继续走抽帧）。
+        notes.append("video_unavailable_no_provider")
+        return _terminal_or_empty(native_state, has_audio, "mode=auto no video provider"), True
 
     if not has_video:
-        return _terminal_or_empty(native_state, has_audio, "no video stream")
+        return _terminal_or_empty(native_state, has_audio, "no video stream"), True
 
     if deadline - time.monotonic() < FRAMES_MIN_BUDGET_S:
         notes.append("video_skip_budget")
-        return _terminal_or_empty(native_state, has_audio, "frames budget")
+        return (
+            _terminal_or_empty(native_state, has_audio, "frames budget"),
+            mode != MODE_TRUE,
+        )
 
     vision = await providers.resolve_vision_provider(
         context, settings.vision_provider_id, _umo(event)
@@ -490,11 +540,12 @@ async def _frames_fallback(
         path, max_frames, duration_s, workdir, deadline, notes
     )
     if truncated:
-        # 预算不足：抽帧降级为 0 帧，**不**判死整次调用（手上的转写照常交付）
+        # 预算不足：抽帧降级为 0 帧，**不**判死整次调用（手上的转写照常交付）；
+        # `mode=true` 属"想要却没拿到"（交给上层诚实兜底），`auto/false` 属按设计降级
         LOG.info(
             "media_analysis: 抽帧因预算不足被截断（0/%d），继续走摘要", max_frames
         )
-        return []
+        return [], mode != MODE_TRUE
     if not extracted:
         raise envelope.ToolError(
             envelope.ERR_FRAME_EXTRACT_FAILED,
@@ -510,7 +561,7 @@ async def _frames_fallback(
         settings=settings,
     )
     notes.append(f"vision_provider:{providers.provider_id_of(vision)}")
-    return frames
+    return frames, False
 
 
 def _terminal_or_empty(
