@@ -57,7 +57,7 @@ from _fakes import (
     make_video,
 )
 
-#: notes 词表（SPEC-v0.3 §11.2 的 39 条 + 评审 F7 的 1 条 = 40 条）的唯一副本在 `tests/_vocab.py` ——
+#: notes 词表（SPEC-v0.3 §11.2 的 39 条 + 评审 F7/R1 各 1 条 = 41 条）的唯一副本在 `tests/_vocab.py` ——
 #: 两个主链路测试文件共用一份，避免"一边加了新词、另一边还按旧词表断言"。
 from _vocab import NOTE_PATTERN, NOTE_WORDS, bad_notes  # noqa: E402
 
@@ -877,8 +877,8 @@ async def test_hint_is_static_across_runs(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert first == second
 
 
-def test_note_vocabulary_has_forty_words() -> None:
-    """词表 = 40 条（v0.2 的 20 条逐字不变 + v0.3 的 19 条 + 评审 F7 的 1 条），且带参形态可解析。
+def test_note_vocabulary_has_forty_one_words() -> None:
+    """词表 = 41 条（v0.2 的 20 条逐字不变 + v0.3 的 19 条 + 评审 F7/R1 各 1 条），且带参形态可解析。
 
     这条在**不跑主链路**的情况下就能红：谁在 `analyze.py` 里新加一个 note 却忘了同步词表，
     `test_notes_always_come_from_the_frozen_vocabulary` 会红，而这条说明"正确的条数是多少"。
@@ -886,8 +886,8 @@ def test_note_vocabulary_has_forty_words() -> None:
     from _vocab import V02_NOTES, V03_NOTES
 
     assert len(V02_NOTES) == 20
-    assert len(V03_NOTES) == 20  # v0.3 的 19 条 + 评审 F7 的 1 条
-    assert len(NOTE_WORDS) == 40
+    assert len(V03_NOTES) == 21  # v0.3 的 19 条 + 评审 F7 的 1 条 + R1 的 1 条
+    assert len(NOTE_WORDS) == 41
     assert V02_NOTES & V03_NOTES == set(), "v0.3 的 19 条不许与 v0.2 重名"
     # 带参形态：`:参数` 可含 `->` / `/` / `:`，但不许有空白（否则日志会被拆词）
     assert NOTE_PATTERN.match("video_compressed:1234->567")
@@ -902,7 +902,7 @@ def test_note_vocabulary_has_forty_words() -> None:
 async def test_notes_always_come_from_the_frozen_vocabulary(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """C7：`notes` 词必须 ⊆ 40 条词表（含 `:<参数>` 形式；F7 另加 1 条）。
+    """C7：`notes` 词必须 ⊆ 41 条词表（含 `:<参数>` 形式；F7/R1 各另加 1 条）。
 
     覆盖的场景要足够杂：带帧回退 / 无音轨 / 仅语音 / 空转写 / 截断 focus / 缓存命中。
     v0.3 的原生-压缩-回退链另在 `tests/test_video_chain.py` 里做同一份断言。

@@ -124,6 +124,27 @@ def is_valid_mode_value(value: object) -> bool:
     return False
 
 
+def frames_possible(
+    mode: str, settings: settings_mod.Settings, *, has_video: bool
+) -> bool:
+    """本轮**是否可能要抽帧**（决定音轨要不要为画面留预算、超时后能否降级）。
+
+    与 `_frames_fallback` 的三道门**逐条对齐**（顺序也一致：`has_video` → `mode=false` →
+    视觉位 → `auto` 且无视频模型）—— 但只回答"要不要"，不产生 note、不判终态码。
+    单独抽出来的理由（评审 R1）：这条判据现在有**两个**消费方（音轨预留 + 音轨超时降级），
+    再复制一份就是又一处"两份逻辑必然分叉"。
+    """
+    if not has_video:
+        return False
+    if mode == MODE_FALSE:
+        return False
+    if not settings.vision_provider_id:
+        return False
+    if mode == MODE_AUTO and not settings.video_provider_id:
+        return False
+    return True
+
+
 def budgeted_timeout(
     remaining: float, cap: float, reserve_s: float, *, floor_s: float = AUDIO_MIN_ATTEMPT_S
 ) -> float:
@@ -420,6 +441,7 @@ async def _video_stage(
 
     # [5] 回退：音轨（v0.2 链路）+ 按三态决定是否抽帧
     transcript: list[dict[str, object]] = []
+    wants_frames = frames_possible(mode, settings, has_video=has_video)
     if has_audio:
         transcript = await _transcribe_path(
             context,
@@ -431,6 +453,9 @@ async def _video_stage(
             notes=notes,
             settings=settings,
             workdir=workdir,
+            # 评审 R1：要画面 ⇒ 音轨给抽帧留 25 s 预留，且超时只降级不判死
+            reserve_s=FRAMES_MIN_BUDGET_S if wants_frames else 0.0,
+            soft_timeout=wants_frames,
         )
     else:
         notes.append("no_audio_track")
@@ -747,8 +772,14 @@ async def _transcribe_path(
     notes: list[str],
     settings: settings_mod.Settings,
     workdir: str,
+    reserve_s: float = 0.0,
+    soft_timeout: bool = False,
 ) -> list[dict[str, object]]:
-    """取 provider wav → 多模态 `text_chat(audio_urls=[wav])` → 转写列表。"""
+    """取 provider wav → 多模态 `text_chat(audio_urls=[wav])` → 转写列表。
+
+    `reserve_s` / `soft_timeout` 只在**视频**回退链里非默认（见 `transcribe` 的分流表）：
+    有画面诉求时给抽帧留预算、超时降级为 `audio_timeout`。
+    """
     audio_provider = await providers.resolve_audio_provider(
         context, settings.audio_provider_id, _umo(event)
     )
@@ -762,7 +793,13 @@ async def _transcribe_path(
         notes.append("audio_normalized")
     prompt = _audio_prompt(kind, focus, settings, notes)
     text = await transcribe(
-        audio_provider, wav_path, prompt, deadline=deadline, notes=notes
+        audio_provider,
+        wav_path,
+        prompt,
+        deadline=deadline,
+        notes=notes,
+        reserve_s=reserve_s,
+        soft_timeout=soft_timeout,
     )
     notes.append(f"audio_provider:{providers.provider_id_of(audio_provider)}")
     if not text:
@@ -824,6 +861,8 @@ async def transcribe(
     *,
     deadline: float,
     notes: list[str],
+    reserve_s: float = 0.0,
+    soft_timeout: bool = False,
 ) -> str:
     """一次多模态 `text_chat(audio_urls=[wav])`，返回**整段**文本（SPEC-v0.2 §2.1）。
 
@@ -831,20 +870,48 @@ async def transcribe(
     `contexts`/`system_prompt`/`func_tool`（一次调用＝一次独立转写请求）。
 
     返回值可能为空串或哨兵 `[无语音]`：那是**成功但没内容**，写 `audio_empty` note、
-    `transcript=[]`，不是错误。超时/抛错才是 `AUDIO_FAILED`（§2.3 冻结表）。
+    `transcript=[]`，不是错误。
+
+    **预算（评审 R1 的接线点）**：超时不再写 `min(AUDIO_TIMEOUT_S, remaining)`，而是
+    `budgeted_timeout(remaining, AUDIO_TIMEOUT_S, reserve_s)` —— 扣掉后面那一跳（抽帧）
+    要用的预留。不扣的话，慢音轨会把抽帧预算吃光，主打回退在最该生效时 `video_skip_budget`。
+
+    **超时后的分流（评审 R1 的裁决）**：
+
+    | 情形 | 行为 |
+    | --- | --- |
+    | 本轮**要画面**（`soft_timeout=True`） | 记 note `audio_timeout`，返回 `""`，**继续走画面阶段** |
+    | 不要画面（`soft_timeout=False`） | `AUDIO_FAILED`（主诉求就是转写，不能假成功） |
+
+    「要画面」的判据是 `frames_possible()`（`mode=true`，或 `auto` + 视频模型 + 视觉位都配了）。
+    **只有超时**走这条降级：provider 抛错（4xx/5xx/安全过滤…）仍一律 `AUDIO_FAILED` ——
+    那说明模型侧真出问题了，不是"预算不够"。
     """
     remaining = deadline - time.monotonic()
-    if remaining <= 0:
+    timeout = budgeted_timeout(remaining, AUDIO_TIMEOUT_S, reserve_s)
+    if timeout <= 0:
+        if soft_timeout:
+            notes.append("audio_timeout")
+            LOG.info("media_analysis: 音轨没有可用预算（要画面）⇒ 记 audio_timeout 继续")
+            return ""
         raise envelope.ToolError(
             envelope.ERR_AUDIO_FAILED, log_detail="budget exhausted"
         )
-    timeout = min(AUDIO_TIMEOUT_S, remaining)
     try:
         resp = await asyncio.wait_for(
             provider.text_chat(prompt=prompt, audio_urls=[wav_path]),
             timeout=timeout,
         )
     except (asyncio.TimeoutError, TimeoutError):
+        if soft_timeout:
+            # 要画面 ⇒ 别让慢音轨把整次调用拖死（评审 R1）
+            notes.append("audio_timeout")
+            LOG.info(
+                "media_analysis: 音轨超时（%.1f s，已扣 %.0f s 画面预留）⇒ 记 audio_timeout 继续",
+                timeout,
+                reserve_s,
+            )
+            return ""
         raise envelope.ToolError(
             envelope.ERR_AUDIO_FAILED, log_detail=f"text_chat timeout {timeout:.1f}s"
         ) from None

@@ -10,7 +10,7 @@
 | [4] 原生调用 | 成功 ⇒ 信封里 `transcript=[]` + `summary=<整段回答>`，**零视觉、零抽帧、零音轨调用** |
 | [5] 回退 | 三态矩阵 36 组合逐一断言；**`mode=false` 任何组合都不得抽帧**（最硬的一条） |
 | [6] 摘要 | 原生成功时**不再**调摘要（那一跳的钱也不花） |
-| [7] 信封 | 9 键 / 恰好 3 键；notes ⊆ 40 条词表（F7 另加 1 条） |
+| [7] 信封 | 9 键 / 恰好 3 键；notes ⊆ 41 条词表（F7/R1 各另加 1 条） |
 
 以及两条跨跳的不变式：
 
@@ -1087,13 +1087,13 @@ async def test_workdir_and_compressed_product_are_removed_after_the_run(
 
 
 # --------------------------------------------------------------------------- #
-# 全部新分支的 note 合规（与 test_analyze 的同一份 40 条词表）
+# 全部新分支的 note 合规（与 test_analyze 的同一份 41 条词表）
 # --------------------------------------------------------------------------- #
 @pytest.mark.asyncio
 async def test_every_v03_branch_emits_only_vocabulary_notes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """v0.3 新分支（原生/压缩/探测/预算/F7 成本闸）产出的 notes 全部落在 40 条词表里。"""
+    """v0.3 新分支（原生/压缩/探测/预算/F7 成本闸/R1 音轨降级）产出的 notes 全部落在 41 条词表里。"""
     from astrbot_plugin_media_analysis import settings
 
     seen: set[str] = set()
@@ -1445,18 +1445,133 @@ async def test_native_burning_its_whole_budget_still_leaves_frames_usable(
     assert payload["ok"] is True
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("remaining", "cap", "reserve", "expected"),
-    [
-        (100.0, 60.0, 35.0, 60.0),  # 预算宽裕 ⇒ 取配置上限
-        (40.0, 60.0, 35.0, 5.0),  # 扣完预留只剩 5 s
-        (30.0, 60.0, 35.0, 30.0),  # 扣完不足 floor(5 s) ⇒ 不扣（后面本来也做不成）
-        (0.0, 60.0, 35.0, 0.0),  # 预算已尽
-        (-3.0, 60.0, 0.0, 0.0),
-    ],
+    ("mode", "expected_reserve"),
+    [("true", 25.0), ("false", 0.0)],
 )
-def test_budgeted_timeout_is_a_pure_function(
-    remaining: float, cap: float, reserve: float, expected: float
+async def test_budgeted_timeout_is_actually_wired_into_the_audio_stage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mode: str,
+    expected_reserve: float,
 ) -> None:
-    """**评审 F6** 的分配规则（纯函数）：先扣预留、扣不动就不扣、耗尽即 0。"""
-    assert analyze_mod.budgeted_timeout(remaining, cap, reserve) == pytest.approx(expected)
+    """**评审 R2**：`budgeted_timeout()` 必须在**生产路径**上被真的调用（`calls ≥ 1`）。
+
+    上一版只有一条"纯函数表"用例，于是函数**从未被生产调用**（评审 t14 用 spy 实测
+    `calls=0`）却一路绿 —— 那是"测死代码制造已接线的错觉"。这里改成 spy：
+    既断言被调用，又断言"要画面 ⇒ 扣 25 s 预留 / 不要画面 ⇒ 不扣"的接线方向。
+    """
+    from astrbot_plugin_media_analysis import settings as settings_mod
+
+    cfg = settings_mod.Settings(
+        video_provider_id="fake-video",
+        vision_provider_id="fake-chat",
+        video_probe_enabled=False,
+    )
+    rig = build_rig(
+        monkeypatch,
+        tmp_path,
+        kind="video",
+        native=native_video(fail_with=RuntimeError("boom")),
+        cfg=cfg,
+        frames=[(2.5, "unused")],
+    )
+
+    real = analyze_mod.budgeted_timeout
+    calls: list[tuple[float, float, float]] = []
+
+    def _spy(remaining: float, cap: float, reserve_s: float, **kwargs: float) -> float:
+        calls.append((float(remaining), float(cap), float(reserve_s)))
+        return real(remaining, cap, reserve_s, **kwargs)
+
+    monkeypatch.setattr(analyze_mod, "budgeted_timeout", _spy)
+
+    payload = await rig.run(include_frames=mode)
+
+    assert calls, "生产路径必须真的调用 budgeted_timeout（评审 R2：不许再是死函数）"
+    assert calls[0][1] == pytest.approx(analyze_mod.AUDIO_TIMEOUT_S), "cap 应是音轨上限"
+    assert calls[0][2] == pytest.approx(expected_reserve), (
+        f"mode={mode} 的音轨预留应为 {expected_reserve}s"
+    )
+    assert payload["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_slow_audio_with_mode_true_degrades_to_audio_timeout_and_keeps_frames(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """**评审 R1**：要画面时慢音轨只降级（note `audio_timeout`），画面照拿。
+
+    用户点名要的是画面 —— 让一条超时的音轨把整次调用判死，等于"最该拿到的东西被拖死"。
+    """
+    from astrbot_plugin_media_analysis import settings as settings_mod
+
+    cfg = settings_mod.Settings(
+        video_provider_id="fake-video",
+        vision_provider_id="fake-chat",
+        video_probe_enabled=False,
+    )
+    rig = build_rig(
+        monkeypatch,
+        tmp_path,
+        kind="video",
+        native=native_video(fail_with=RuntimeError("boom")),
+        audio=audio_chat(delay=0.3),  # 慢音轨
+        cfg=cfg,
+        frames=[(2.5, "unused")],
+    )
+    monkeypatch.setattr(analyze_mod, "AUDIO_TIMEOUT_S", 0.05)
+
+    payload = await rig.run(include_frames="true")
+
+    assert payload["ok"] is True, "要画面 ⇒ 慢音轨不许把整次调用判死"
+    assert "audio_timeout" in payload["notes"]
+    assert "audio_provider" in " ".join(payload["notes"]), "音轨阶段仍然走完了"
+    assert payload["transcript"] == [], "超时 ⇒ 没有转写（不是空成功）"
+    assert len(payload["frames"]) == 1, "画面照拿"
+    assert "video_fallback_frames" in payload["notes"]
+
+
+@pytest.mark.asyncio
+async def test_slow_audio_with_mode_false_is_audio_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """**评审 R1** 的对称面：不要画面 ⇒ 音轨就是主诉求，超时仍 `AUDIO_FAILED`（不许假成功）。"""
+    from astrbot_plugin_media_analysis import settings as settings_mod
+
+    cfg = settings_mod.Settings(
+        video_provider_id="fake-video",
+        vision_provider_id="fake-chat",
+        video_probe_enabled=False,
+    )
+    rig = build_rig(
+        monkeypatch,
+        tmp_path,
+        kind="video",
+        native=native_video(fail_with=RuntimeError("boom")),
+        audio=audio_chat(delay=0.3),
+        cfg=cfg,
+        frames=[(2.5, "unused")],
+    )
+    monkeypatch.setattr(analyze_mod, "AUDIO_TIMEOUT_S", 0.05)
+
+    payload = await rig.tool(include_frames="false")
+
+    assert list(payload) == list(envelope.FAIL_KEYS)
+    assert payload["error"] == envelope.ERR_AUDIO_FAILED
+    assert rig.media_calls["extract_frames"] == 0
+
+
+@pytest.mark.asyncio
+async def test_voice_message_slow_audio_is_still_audio_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """语音消息（没有画面这一跳）超时 ⇒ 仍是 `AUDIO_FAILED`，不会被 R1 的降级误伤。"""
+    rig = build_rig(monkeypatch, tmp_path, kind="audio", audio=audio_chat(delay=0.3))
+    monkeypatch.setattr(analyze_mod, "AUDIO_TIMEOUT_S", 0.05)
+
+    payload = await rig.tool(include_frames="auto")
+
+    assert list(payload) == list(envelope.FAIL_KEYS)
+    assert payload["error"] == envelope.ERR_AUDIO_FAILED

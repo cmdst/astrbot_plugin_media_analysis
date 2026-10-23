@@ -1,4 +1,4 @@
-"""`notes` 词表（SPEC-v0.3 §11.2 的 39 条 + 评审 F7 的 1 条 = **40** 条）—— 主链路测试共用的唯一副本。
+"""`notes` 词表（SPEC-v0.3 §11.2 的 39 条 + 评审 F7 / R1 各 1 条 = **41** 条）—— 主链路测试共用的唯一副本。
 
 为什么单独一份：v0.3 把 notes 从 20 条扩到 39 条，而"词表是封闭的"这条守卫要在**两个**
 主链路测试文件里都成立（`test_analyze.py` 守 v0.2 语义骨架、`test_video_chain.py` 守
@@ -8,8 +8,9 @@ v0.3 的原生/压缩/回退链）。各抄一份的结果必然漂：一边加�
 词表本身**仍是实现的事实的照抄**（`analyze.py` + `probe.py` 的 `notes.append(...)`），
 它在这里被写死成字面量，是为了让"多出一个没评审过的词"变成红灯 —— 不是为了让实现自证。
 
-40 条 = v0.2 的 20 条（逐字不变）+ v0.3 的 19 条 + 评审 F7 的 1 条
-（`video_unavailable_no_provider`：`auto` 且未配视频模型 ⇒ 不抽帧、只转写）。
+41 条 = v0.2 的 20 条（逐字不变）+ v0.3 的 19 条 + 评审的 2 条：
+- F7 `video_unavailable_no_provider`（`auto` 且未配视频模型 ⇒ 不抽帧、只转写）；
+- R1 `audio_timeout`（要画面时音轨超时只降级：记这条、继续走画面）。
 """
 
 from __future__ import annotations
@@ -47,6 +48,8 @@ V03_NOTES: frozenset[str] = frozenset(
     {
         # 评审 F7：`mode=auto` 且未配视频模型 ⇒ 不抽帧（成本回归修复）
         "video_unavailable_no_provider",
+        # 评审 R1：要画面时音轨超时 ⇒ 只降级（不判死整次调用）
+        "audio_timeout",
         "video_provider",
         "video_asserted",
         "video_probe_cached",
