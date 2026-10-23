@@ -1,4 +1,12 @@
-"""主链路行为：信封契约、分支、降级、缓存、预算（SPEC §5 / §6 / §7 / §8 / §9）。
+"""主链路行为：信封契约、分支、降级、缓存、预算（SPEC §5 / §6 / §7 / §8 / §9 + SPEC-v0.2 §9）。
+
+v0.1 → v0.2 的测试面变化（逐条对应 SPEC-v0.2）：
+- **STT 链路没了**：`providers.resolve_stt_provider` / `FakeSTTProvider` 换成"多模态 chat
+  provider"（`_fakes.audio_chat()`），断言的是 `text_chat(prompt=…, audio_urls=[本地 wav])`；
+- **判型合并进 `media.classify`**（一次调用拿 `kind/duration/has_audio/has_video`），
+  所以这里的假媒体层桩的是 `classify` 与 `ensure_provider_wav`，不再是 `probe_*` / `extract_wav`；
+- **缓存落盘带 TTL**：`ResultCache` → `cache.DiskCache`（每个用例一个 `tmp_path` 下的
+  插件数据目录），键是 10 个分量哈希 —— `focus` / 提示词 / provider 配置都会改变键。
 
 测试策略（与 SPEC §11.2 一致）：
 
@@ -32,19 +40,24 @@ from astrbot_plugin_media_analysis import envelope, main, media, providers, sett
 from _fakes import (
     FakeChatProvider,
     FakeContext,
-    FakeSTTProvider,
-    NotAProvider,
     RecordingLogger,
+    audio_chat,
     make_event,
     make_record,
     make_video,
 )
 
-#: SPEC §6.4 的 12 条 notes 词表（含 `:<参数>` 形式）。
+#: SPEC-v0.2 §8.2 的 20 条 notes 词表（含 `:<参数>` 形式）。
+#:
+#: v0.1 的 12 条里改名 3 条（`stt_provider:` → `audio_provider:`、`stt_empty` → `audio_empty`、
+#: 另加 `audio_normalized`），v0.2 新增 8 条：`source:file` / `file_downloaded` /
+#: `prompt_trimmed:<key>` / `prompt_appended:<key>`（见 analyze 的 `focus_appended:<key>`）/
+#: `material_trimmed` / `cache_hit` / `cache_age_s:<n>`。
 NOTE_PATTERN = re.compile(
-    r"^(?:stt_provider|vision_provider|audio_extracted|stt_empty|no_audio_track|"
-    r"frames_skipped_audio_only|frames_truncated|frame_extract_failed|frame_desc_failed|"
-    r"summary_skipped_budget|summary_failed|focus_trimmed)(?::.+)?$"
+    r"^(?:audio_provider|vision_provider|source|audio_extracted|audio_normalized|audio_empty|"
+    r"no_audio_track|frames_skipped_audio_only|frames_truncated|frame_extract_failed|"
+    r"frame_desc_failed|summary_skipped_budget|summary_failed|focus_trimmed|prompt_trimmed|"
+    r"focus_appended|material_trimmed|cache_hit|cache_age_s|file_downloaded)(?::.+)?$"
 )
 
 
@@ -57,11 +70,11 @@ class Rig:
     event: object
     context: FakeContext
     settings: settings.Settings
-    cache: cache_mod.ResultCache
+    cache: cache_mod.DiskCache
     plugin: main.MediaAnalysisPlugin
     media_calls: dict[str, int]
     prov_calls: dict[str, int]
-    stt: FakeSTTProvider
+    audio: FakeChatProvider
     chat: FakeChatProvider
 
     async def run(
@@ -71,7 +84,7 @@ class Rig:
         focus: str = "",
         include_frames: bool = False,
         settings_obj: settings.Settings | None = None,
-        cache_obj: cache_mod.ResultCache | None = None,
+        cache_obj: cache_mod.DiskCache | None = None,
     ) -> dict[str, object]:
         """直接跑 `analyze.analyze`（受控失败会抛 `ToolError`）。"""
         return await analyze_mod.analyze(
@@ -111,37 +124,45 @@ def _stub_media(
     frames: list[tuple[float, str]] | None = None,
     digest: str = "0123456789abcdef",
 ) -> tuple[Path, dict[str, int]]:
-    """把 `media.*` 全换成内存实现；返回 (组件用的本地路径, 调用计数)。"""
+    """把 `media.*` 的**重 IO 面**换成内存实现；返回 (组件用的本地路径, 调用计数)。
+
+    桩的是 v0.2 的两个合并点：
+    - `classify`（一次拿 `kind/duration/has_audio/has_video`，`File` 的三段梯子在它内部）；
+    - `ensure_provider_wav`（`extracted=True` 时等于视频抽音轨）。
+
+    取件面（`find_media` / `resolve_media_path` / `file_download_needed`）**保持真实现**：
+    它们只做 `os.path.isfile` 级别的判断，没有 IO 成本，桩掉反而会让"File 段取件"
+    这条 v0.2 的主路径在主链路测试里失去覆盖。
+    """
     media_path = tmp_path / ("clip.wav" if kind == "audio" else "clip.mp4")
     media_path.write_bytes(b"\x00" * 2048)
     wav_path = tmp_path / "audio.wav"
     wav_path.write_bytes(b"RIFF" + b"\x00" * 64)
 
     calls = {
-        "probe_duration_s": 0,
-        "probe_streams": 0,
+        "classify": 0,
+        "ensure_provider_wav": 0,
         "extract_wav": 0,
         "extract_frames": 0,
         "content_digest": 0,
     }
 
-    async def _duration(_path: str) -> float:
-        calls["probe_duration_s"] += 1
+    async def _classify(_handle, _path, *, max_media_bytes: int, workdir: str):
+        calls["classify"] += 1
         if isinstance(duration, BaseException):
             raise duration
-        return float(duration)
+        return kind, float(duration), streams[0], streams[1]
 
     async def _digest(_path: str) -> str:
         calls["content_digest"] += 1
         return digest
 
-    async def _streams(_path: str) -> tuple[bool, bool]:
-        calls["probe_streams"] += 1
-        return streams
-
-    async def _wav(_path: str, *, workdir: str) -> str:
-        calls["extract_wav"] += 1
-        return str(wav_path)
+    async def _provider_wav(_path: str, *, workdir: str, extracted: bool = False) -> str:
+        calls["ensure_provider_wav"] += 1
+        if extracted:
+            calls["extract_wav"] += 1
+            return str(wav_path)
+        return str(_path)  # 已经是规范 wav ⇒ 零重编码（v0.2 的 ensure_provider_wav 口径）
 
     async def _frames(
         _path: str, *, count: int, duration_s: float, workdir: str, notes: list[str] | None = None
@@ -154,10 +175,9 @@ def _stub_media(
             produced.append((at_s, str(jpg)))
         return produced
 
-    monkeypatch.setattr(media, "probe_duration_s", _duration)
+    monkeypatch.setattr(media, "classify", _classify)
     monkeypatch.setattr(media, "content_digest", _digest)
-    monkeypatch.setattr(media, "probe_streams", _streams)
-    monkeypatch.setattr(media, "extract_wav", _wav)
+    monkeypatch.setattr(media, "ensure_provider_wav", _provider_wav)
     monkeypatch.setattr(media, "extract_frames", _frames)
     return media_path, calls
 
@@ -165,17 +185,23 @@ def _stub_media(
 def _stub_providers(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    stt: object,
+    audio: object,
     chat: object,
     vision: object | None = None,
 ) -> dict[str, int]:
-    calls = {"stt": 0, "vision": 0, "chat": 0}
+    """把三条 provider 解析入口换成"记录 + 可注入失败"的假身。
 
-    async def _stt(_context, _provider_id, _umo):
-        calls["stt"] += 1
-        if isinstance(stt, BaseException):
-            raise stt
-        return stt
+    v0.2 的音频入口是 `resolve_audio_provider`（多模态 chat），**不是** v0.1 的
+    `resolve_stt_provider`；后者已从 `providers` 删除 ⇒ 这里 patch 不到就会红，
+    等价于一条"STT 链路不许回来"的静态守卫。
+    """
+    calls = {"audio": 0, "vision": 0, "chat": 0}
+
+    async def _audio(_context, _provider_id, _umo):
+        calls["audio"] += 1
+        if isinstance(audio, BaseException):
+            raise audio
+        return audio
 
     async def _vision(_context, _provider_id, _umo):
         calls["vision"] += 1
@@ -190,7 +216,7 @@ def _stub_providers(
             raise chat
         return chat
 
-    monkeypatch.setattr(providers, "resolve_stt_provider", _stt)
+    monkeypatch.setattr(providers, "resolve_audio_provider", _audio)
     monkeypatch.setattr(providers, "resolve_vision_provider", _vision)
     monkeypatch.setattr(providers, "resolve_chat_provider", _chat)
     return calls
@@ -205,11 +231,11 @@ def build_rig(
     streams: tuple[bool, bool] = (True, True),
     frames: list[tuple[float, str]] | None = None,
     digest: str = "0123456789abcdef",
-    stt: object | None = None,
+    audio: object | None = None,
     chat: object | None = None,
     vision: object | None = None,
     cfg: settings.Settings | None = None,
-    cache: cache_mod.ResultCache | None = None,
+    cache: cache_mod.DiskCache | None = None,
     event=None,
     context: FakeContext | None = None,
     providers_real: bool = False,
@@ -223,13 +249,13 @@ def build_rig(
         frames=frames,
         digest=digest,
     )
-    stt_obj = stt if stt is not None else FakeSTTProvider(provider_id="fake_stt")
+    audio_obj = audio if audio is not None else audio_chat()
     chat_obj = chat if chat is not None else FakeChatProvider(model_name="fake-chat")
     if providers_real:
         # 走真 `providers.resolve_*` + FakeContext：专测"空串回落阶梯"在 analyze 里的落点
-        prov_calls = {"stt": 0, "vision": 0, "chat": 0}
+        prov_calls = {"audio": 0, "vision": 0, "chat": 0}
     else:
-        prov_calls = _stub_providers(monkeypatch, stt=stt_obj, chat=chat_obj, vision=vision)
+        prov_calls = _stub_providers(monkeypatch, audio=audio_obj, chat=chat_obj, vision=vision)
 
     if event is None:
         component = (
@@ -238,7 +264,17 @@ def build_rig(
         event = make_event(current=[component])
 
     cfg = cfg if cfg is not None else settings.Settings()
-    cache_obj = cache if cache is not None else cache_mod.ResultCache()
+    if cache is None:
+        # 每个用例一个**独立**的插件数据目录：缓存绝不能落到库目录或生产树
+        plugin_data = tmp_path / "plugin_data"
+        monkeypatch.setattr(
+            cache_mod, "_core_plugin_data_path", lambda: str(plugin_data), raising=False
+        )
+        cache_obj = cache_mod.DiskCache(
+            plugin_name=settings.PLUGIN_NAME, ttl_seconds=cfg.cache_ttl_seconds
+        )
+    else:
+        cache_obj = cache
     ctx = context or FakeContext()
     plugin = main.MediaAnalysisPlugin(context=ctx, config={})
     plugin._settings_cache = cfg
@@ -252,7 +288,7 @@ def build_rig(
         plugin=plugin,
         media_calls=media_calls,
         prov_calls=prov_calls,
-        stt=stt_obj if isinstance(stt_obj, FakeSTTProvider) else FakeSTTProvider(),
+        audio=audio_obj if isinstance(audio_obj, FakeChatProvider) else audio_chat(),
         chat=chat_obj if isinstance(chat_obj, FakeChatProvider) else FakeChatProvider(),
     )
 
@@ -275,7 +311,7 @@ async def test_success_envelope_audio_has_exactly_nine_ordered_keys(
     assert payload["transcript"] == [{"t": 0.0, "text": "这是一段合成测试音轨的转写结果。"}]
     assert payload["frames"] == []
     assert isinstance(payload["summary"], str) and payload["summary"]
-    assert f"stt_provider:{providers.provider_id_of(rig.stt)}" in payload["notes"]
+    assert f"audio_provider:{providers.provider_id_of(rig.audio)}" in payload["notes"]
     assert isinstance(payload["elapsed_ms"], int) and payload["elapsed_ms"] >= 0
     assert payload["cached"] is False
 
@@ -312,11 +348,17 @@ async def test_success_envelope_video_with_frames(
 async def test_audio_has_no_video_stream_in_envelope(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """语音天然无视频流：不该调用 `probe_streams`（§7 第 6 步的 else 分支）。"""
+    """语音天然无视频流：判型只调一次、且**不抽音轨**（`extracted=False`）。
+
+    v0.2 把"判型 + 时长 + 流"合并成一次 `classify`（`File` 段的三段梯子在里面），
+    所以这里的判据是"classify 恰好一次 + 没有走抽音轨分支"，等价于 v0.1 的
+    "不调 probe_streams + 不调 extract_wav"。
+    """
     rig = build_rig(monkeypatch, tmp_path, kind="audio")
     await rig.run()
-    assert rig.media_calls["probe_streams"] == 0
-    assert rig.media_calls["extract_wav"] == 0
+    assert rig.media_calls["classify"] == 1, "判型只该发生一次（v0.2 合并了三次 ffprobe）"
+    assert rig.media_calls["extract_wav"] == 0, "语音不该走视频抽音轨那条路"
+    assert rig.media_calls["ensure_provider_wav"] == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -336,7 +378,7 @@ async def test_invalid_target_returns_bad_target_envelope(
         "error": envelope.ERR_BAD_TARGET,
         "hint": envelope.HINTS[envelope.ERR_BAD_TARGET],
     }
-    assert rig.media_calls["probe_duration_s"] == 0, "target 校验必须在最前面"
+    assert rig.media_calls["classify"] == 0, "target 校验必须在最前面"
 
 
 @pytest.mark.asyncio
@@ -345,7 +387,7 @@ async def test_quoted_target_reads_reply_chain(
 ) -> None:
     """§5-6：`target=quoted` 从 `Reply.chain` 里取媒体。"""
     media_path, _calls = _stub_media(monkeypatch, tmp_path, kind="audio")
-    _stub_providers(monkeypatch, stt=FakeSTTProvider(), chat=FakeChatProvider())
+    _stub_providers(monkeypatch, audio=audio_chat(), chat=FakeChatProvider())
     event = make_event(current=[], quoted=[make_record(media_path)])
     rig = build_rig(monkeypatch, tmp_path, event=event)
     payload = await rig.run(target="quoted")
@@ -388,7 +430,7 @@ async def test_over_limit_is_media_too_long(monkeypatch: pytest.MonkeyPatch, tmp
         "error": envelope.ERR_MEDIA_TOO_LONG,
         "hint": envelope.HINTS[envelope.ERR_MEDIA_TOO_LONG],
     }
-    assert rig.prov_calls["stt"] == 0, "超限必须在调 provider 之前拒绝（成本闸门）"
+    assert rig.prov_calls["audio"] == 0, "超限必须在调 provider 之前拒绝（成本闸门）"
 
 
 @pytest.mark.asyncio
@@ -490,7 +532,7 @@ async def test_no_audio_track_with_frames_is_success_with_note(
     assert payload["transcript"] == []
     assert "no_audio_track" in payload["notes"]
     assert len(payload["frames"]) == 1
-    assert rig.prov_calls["stt"] == 0, "无音轨就别再解析 STT"
+    assert rig.prov_calls["audio"] == 0, "无音轨就别再解析音频模型"
 
 
 @pytest.mark.asyncio
@@ -516,10 +558,11 @@ async def test_audio_extract_failure_is_normalized(
     """§5：转码失败 ⇒ `AUDIO_EXTRACT_FAILED`（不是裸异常）。"""
     rig = build_rig(monkeypatch, tmp_path, kind="video")
 
-    async def _boom(_path: str, *, workdir: str) -> str:
+    async def _boom(_path: str, *, workdir: str, extracted: bool = False) -> str:
         raise envelope.ToolError(envelope.ERR_AUDIO_EXTRACT_FAILED)
 
-    monkeypatch.setattr(media, "extract_wav", _boom)
+    # v0.2 的抽音轨入口是 `ensure_provider_wav(..., extracted=True)`（`extract_wav` 成了它的内层）
+    monkeypatch.setattr(media, "ensure_provider_wav", _boom)
     payload = await rig.tool()
     assert payload["error"] == envelope.ERR_AUDIO_EXTRACT_FAILED
 
@@ -588,58 +631,88 @@ async def test_vision_provider_capability_mismatch_is_error(
 
 
 # --------------------------------------------------------------------------- #
-# §5 STT 失败面
+# §5 / SPEC-v0.2 §2.3：音频阶段失败面（多模态 `text_chat` 的四种坏结果）
 # --------------------------------------------------------------------------- #
 @pytest.mark.asyncio
-async def test_stt_exception_is_stt_failed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """§5：`get_text` 抛错 ⇒ `STT_FAILED`（provider 侧什么都可能抛，必须归一）。"""
+async def test_audio_call_exception_is_audio_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """§2.3：`text_chat` 抛错 ⇒ `AUDIO_FAILED`（provider 侧什么都可能抛，必须归一）。"""
     rig = build_rig(
-        monkeypatch, tmp_path, stt=FakeSTTProvider(fail_with=RuntimeError("quota exceeded"))
+        monkeypatch, tmp_path, audio=audio_chat(fail_with=RuntimeError("quota exceeded"))
     )
     payload = await rig.tool()
     assert payload == {
         "ok": False,
-        "error": envelope.ERR_STT_FAILED,
-        "hint": envelope.HINTS[envelope.ERR_STT_FAILED],
+        "error": envelope.ERR_AUDIO_FAILED,
+        "hint": envelope.HINTS[envelope.ERR_AUDIO_FAILED],
     }
 
 
 @pytest.mark.asyncio
-async def test_stt_timeout_is_stt_failed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """§7.1：STT 单步 60 s 超时 ⇒ `STT_FAILED`（不是冒泡成框架超时）。"""
-    rig = build_rig(monkeypatch, tmp_path, stt=FakeSTTProvider(delay=0.2))
-    monkeypatch.setattr(analyze_mod, "STT_TIMEOUT_S", 0.01)
+async def test_audio_call_timeout_is_audio_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """§2.2：`min(AUDIO_TIMEOUT_S, 剩余预算)` 超时 ⇒ `AUDIO_FAILED`（不冒泡成框架超时）。"""
+    rig = build_rig(monkeypatch, tmp_path, audio=audio_chat(delay=0.2))
+    monkeypatch.setattr(analyze_mod, "AUDIO_TIMEOUT_S", 0.01)
     payload = await rig.tool()
-    assert payload["error"] == envelope.ERR_STT_FAILED
+    assert payload["error"] == envelope.ERR_AUDIO_FAILED
+
+
+@pytest.mark.asyncio
+async def test_audio_budget_exhausted_before_call_is_audio_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`remaining <= 0` 时**一次调用都不发**，直接 `AUDIO_FAILED`（省一次真金白银）。"""
+    rig = build_rig(monkeypatch, tmp_path)
+    monkeypatch.setattr(analyze_mod, "DEADLINE_S", 0.0)
+    payload = await rig.tool()
+    assert payload["error"] == envelope.ERR_AUDIO_FAILED
+    assert not rig.audio.calls.named("text_chat"), "预算已耗尽就不许再发请求"
 
 
 @pytest.mark.asyncio
 async def test_empty_transcript_is_not_an_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """§6.4：`get_text` 返回空串 ⇒ `transcript=[]` + `stt_empty`，**不是错误**。"""
-    rig = build_rig(monkeypatch, tmp_path, stt=FakeSTTProvider(text="   "))
+    """§9 第 9 步：返回空串 ⇒ `transcript=[]` + `audio_empty`，**不是错误**。"""
+    rig = build_rig(monkeypatch, tmp_path, audio=audio_chat(text="   "))
     payload = await rig.run()
 
     assert payload["ok"] is True
     assert payload["transcript"] == []
-    assert "stt_empty" in payload["notes"]
+    assert "audio_empty" in payload["notes"]
 
 
 @pytest.mark.asyncio
-async def test_stt_provider_unavailable(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """§5：阶梯 ①–④ 全落空 ⇒ `STT_UNAVAILABLE`。"""
+async def test_no_speech_sentinel_is_not_an_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`[无语音]` 哨兵与空串同义：成功但没内容（纯音乐 / 环境音）。"""
+    rig = build_rig(monkeypatch, tmp_path, audio=audio_chat(text=analyze_mod.NO_SPEECH_SENTINEL))
+    payload = await rig.run()
+
+    assert payload["ok"] is True
+    assert payload["transcript"] == []
+    assert "audio_empty" in payload["notes"]
+
+
+@pytest.mark.asyncio
+async def test_audio_provider_unavailable(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """§2.5：没配音频模型且回落也不符合 ⇒ `AUDIO_UNAVAILABLE`（缺配置，不是配错）。"""
     rig = build_rig(
-        monkeypatch, tmp_path, stt=envelope.ToolError(envelope.ERR_STT_UNAVAILABLE)
+        monkeypatch, tmp_path, audio=envelope.ToolError(envelope.ERR_AUDIO_UNAVAILABLE)
     )
     payload = await rig.tool()
-    assert payload["error"] == envelope.ERR_STT_UNAVAILABLE
+    assert payload["error"] == envelope.ERR_AUDIO_UNAVAILABLE
 
 
 @pytest.mark.asyncio
-async def test_stt_capability_mismatch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_audio_capability_mismatch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """§2.5：显式配了但不符合（例如填了 STT provider）⇒ `PROVIDER_CAPABILITY_MISMATCH`。"""
     rig = build_rig(
         monkeypatch,
         tmp_path,
-        stt=envelope.ToolError(envelope.ERR_PROVIDER_CAPABILITY_MISMATCH),
+        audio=envelope.ToolError(envelope.ERR_PROVIDER_CAPABILITY_MISMATCH),
     )
     payload = await rig.tool()
     assert payload["error"] == envelope.ERR_PROVIDER_CAPABILITY_MISMATCH
@@ -714,7 +787,7 @@ async def test_empty_material_skips_summary_call(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """§7.5：材料为空（无转写且无帧）⇒ 不调模型，`summary=""`，也不记 `summary_failed`。"""
-    rig = build_rig(monkeypatch, tmp_path, stt=FakeSTTProvider(text=""))
+    rig = build_rig(monkeypatch, tmp_path, audio=audio_chat(text=""))
     payload = await rig.run()
 
     assert payload["summary"] == ""
@@ -736,10 +809,14 @@ async def test_second_identical_call_hits_cache(
 
     assert first["cached"] is False
     assert second["cached"] is True
-    for key in ("kind", "duration_s", "transcript", "frames", "summary", "notes"):
+    for key in ("kind", "duration_s", "transcript", "frames", "summary"):
         assert second[key] == first[key], key
+    # §6.3：命中时 notes 是"原样 notes + cache_hit + cache_age_s:<n>"，其余逐字相同
+    assert second["notes"][: len(first["notes"])] == first["notes"]
+    assert second["notes"][-2] == "cache_hit"
+    assert re.fullmatch(r"cache_age_s:\d+", second["notes"][-1]), second["notes"]
     assert isinstance(second["elapsed_ms"], int)
-    assert rig.prov_calls["stt"] == 1, "命中最多次只该调一次 STT"
+    assert rig.prov_calls["audio"] == 1, "命中最多次只该调一次音频模型"
     assert rig.media_calls["extract_frames"] == 0
 
 
@@ -751,7 +828,7 @@ async def test_different_focus_misses_cache(monkeypatch: pytest.MonkeyPatch, tmp
     second = await rig.run(focus="画面里有什么")
 
     assert second["cached"] is False
-    assert rig.prov_calls["stt"] == 2
+    assert rig.prov_calls["audio"] == 2
 
 
 @pytest.mark.asyncio
@@ -787,19 +864,25 @@ def _digest_of(value: str):
 
 
 @pytest.mark.asyncio
-async def test_lru_evicts_oldest_when_maxsize_is_one(
+async def test_cache_survives_a_new_cache_instance(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """§8：`maxsize` 可注入 ⇒ 容量 1 时，第二次写就把第一条挤出去（淘汰策略可验证）。"""
-    rig = build_rig(monkeypatch, tmp_path, cache=cache_mod.ResultCache(maxsize=1))
-    await rig.run()
-    monkeypatch.setattr(media, "content_digest", _digest_of("cccc2222cccc2222"))
-    await rig.run()  # 挤掉第一条
+    """§6.4：缓存落在插件数据目录 ⇒ **新建一个实例**（等价于进程重启）仍能命中。
 
-    monkeypatch.setattr(media, "content_digest", _digest_of("0123456789abcdef"))
-    third = await rig.run()
-    assert third["cached"] is False, "被淘汰的第一条不该命中"
-    assert len(rig.cache) == 1
+    v0.1 的内存 LRU 重启即失效，做不到"同一媒体二次引用不再花 token"；这条用例把
+    v0.2 的落盘承诺钉在**行为面**（容量淘汰的细口径在 `tests/test_cache.py`）。
+    """
+    rig = build_rig(monkeypatch, tmp_path)
+    first = await rig.run()
+
+    reopened = cache_mod.DiskCache(
+        plugin_name=settings.PLUGIN_NAME, ttl_seconds=rig.settings.cache_ttl_seconds
+    )
+    second = await rig.run(cache_obj=reopened)
+
+    assert first["cached"] is False
+    assert second["cached"] is True
+    assert rig.prov_calls["audio"] == 1, "跨实例命中不该再花 token"
 
 
 @pytest.mark.asyncio
@@ -854,7 +937,7 @@ async def test_success_log_contains_counts_not_transcript(
     """§9-1：成功日志只打结构/计数，**不打**转写正文与画面描述。"""
     log = RecordingLogger()
     monkeypatch.setattr(analyze_mod, "LOG", log)
-    rig = build_rig(monkeypatch, tmp_path, stt=FakeSTTProvider(text="转写正文不许进日志"))
+    rig = build_rig(monkeypatch, tmp_path, audio=audio_chat(text="转写正文不许进日志"))
     await rig.run()
 
     text = log.text()
@@ -896,7 +979,7 @@ async def test_extracted_wav_is_tracked_on_event(
     from _fakes import TrackingFakeEvent
 
     media_path, _calls = _stub_media(monkeypatch, tmp_path, kind="video")
-    _stub_providers(monkeypatch, stt=FakeSTTProvider(), chat=FakeChatProvider())
+    _stub_providers(monkeypatch, audio=audio_chat(), chat=FakeChatProvider())
     event = TrackingFakeEvent(chain=[make_video(media_path)])
     rig = build_rig(monkeypatch, tmp_path, kind="video", event=event)
     await rig.run()
@@ -992,7 +1075,7 @@ async def test_tool_failure_envelope_always_has_exactly_three_keys(
     cases.append(("no_audio", await rig.tool()))
 
     rig = build_rig(
-        monkeypatch, tmp_path, stt=FakeSTTProvider(fail_with=RuntimeError("x"))
+        monkeypatch, tmp_path, audio=audio_chat(fail_with=RuntimeError("x"))
     )
     cases.append(("stt_failed", await rig.tool()))
 
@@ -1022,7 +1105,7 @@ async def test_notes_always_come_from_the_frozen_vocabulary(
     seen.update((await rig.run(include_frames=True))["notes"])  # 命中缓存时 notes 原样返回
     seen.update((await build_rig(monkeypatch, tmp_path, kind="video", streams=(False, True), frames=[(2.5, "u")]).run(include_frames=True))["notes"])
     seen.update((await build_rig(monkeypatch, tmp_path, kind="audio").run(include_frames=True))["notes"])
-    seen.update((await build_rig(monkeypatch, tmp_path, stt=FakeSTTProvider(text="")).run())["notes"])
+    seen.update((await build_rig(monkeypatch, tmp_path, audio=audio_chat(text="")).run())["notes"])
     seen.update((await build_rig(monkeypatch, tmp_path).run(focus="问" * 260))["notes"])
 
     assert seen, "一个 note 都没收到？"
@@ -1054,6 +1137,7 @@ async def test_frames_and_notes_share_at_s_formatting(
         focus="",
         deadline=time.monotonic() + 30,
         notes=notes,
+        settings=settings.Settings(),
     )
     assert [frame["at_s"] for frame in described] == [2.5, 7.5]
     assert all(isinstance(frame["at_s"], float) for frame in described)
@@ -1079,6 +1163,7 @@ async def test_describe_frames_truncates_without_raising_when_no_call_started(
         focus="",
         deadline=time.monotonic() - 1,  # 已经过期：一帧都不该发起
         notes=notes,
+        settings=settings.Settings(),
     )
     assert described == []
     assert notes == ["frames_truncated:0/1"]
@@ -1103,6 +1188,7 @@ async def test_describe_frames_all_attempts_failed_is_vision_failed(
             focus="",
             deadline=time.monotonic() + 30,
             notes=notes,
+            settings=settings.Settings(),
         )
     assert exc_info.value.code == envelope.ERR_VISION_FAILED
     assert notes == ["frame_desc_failed:2.50"]
@@ -1124,6 +1210,7 @@ async def test_describe_frames_single_call_timeout_degrades(
             focus="",
             deadline=time.monotonic() + 30,
             notes=notes,
+            settings=settings.Settings(),
         )
     assert exc_info.value.code == envelope.ERR_VISION_FAILED
     assert notes == ["frame_desc_failed:2.50"]
@@ -1133,13 +1220,17 @@ async def test_describe_frames_single_call_timeout_degrades(
 # F1（t12 已改实现，SPEC §7.1 口径不变）：预算截断是降级，不是失败
 # --------------------------------------------------------------------------- #
 @pytest.mark.asyncio
-async def test_slow_stt_eating_budget_keeps_transcript_and_degrades_frames(
+async def test_slow_audio_eating_budget_keeps_transcript_and_degrades_frames(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """§7.1 第 1 面：慢 STT 吃光预算 + `include_frames=true` ⇒ **成功信封 + 保住转写**。
+    """§7.1 第 1 面：慢音频调用吃光预算 + `include_frames=true` ⇒ **成功信封 + 保住转写**。
 
     断言四件事：① `ok:true`；② `transcript` 非空（t12 的核心承诺）；③ `notes` 里有
     `frames_truncated:0/<want>`；④ `frames=[]` 且视觉 provider 一次都没被解析/调用。
+
+    v0.2 的预算闸换了两处：单次音频调用是 `min(AUDIO_TIMEOUT_S, 剩余预算)`，而"抽帧还有没有
+    时间"看的是 `剩余 < FRAME_EXTRACT_TIMEOUT_S(15 s)` —— 所以 `DEADLINE_S=0.5` + 100 ms 的
+    慢调用就能精确落在"音频成功、抽帧截断"这条缝里（无需真的 sleep 100 s）。
     """
     rig = build_rig(
         monkeypatch,
@@ -1147,16 +1238,16 @@ async def test_slow_stt_eating_budget_keeps_transcript_and_degrades_frames(
         kind="video",
         duration=30.0,
         frames=[(2.5, "unused")],
-        stt=FakeSTTProvider(text="慢 STT 的转写必须保住", delay=0.08),
+        audio=audio_chat(text="慢音频调用的转写必须保住", delay=0.1),
         cfg=settings.Settings(max_frames=6),
     )
-    monkeypatch.setattr(analyze_mod, "DEADLINE_S", 0.05)  # 预算被 STT 吃光
+    monkeypatch.setattr(analyze_mod, "DEADLINE_S", 0.5)  # 音频吃得下、抽帧吃不下
 
     payload = await rig.run(include_frames=True)
 
     assert payload["ok"] is True
     assert list(payload) == list(envelope.OK_KEYS)
-    assert [item["text"] for item in payload["transcript"]] == ["慢 STT 的转写必须保住"]
+    assert [item["text"] for item in payload["transcript"]] == ["慢音频调用的转写必须保住"]
     assert "frames_truncated:0/6" in payload["notes"]
     assert payload["frames"] == []
     assert rig.prov_calls["vision"] == 0, "预算不足就别再发起视觉调用（省一次 API 花费）"
@@ -1170,13 +1261,13 @@ async def test_budget_exhausted_with_nothing_to_deliver_is_still_a_failure(
 ) -> None:
     """§7.1 第 2 面：预算耗尽 **且** 转写与帧都为空 ⇒ 不给"空成功"，仍是 `FRAME_EXTRACT_FAILED`。
 
-    两种"什么都没有"的来源都测：① 视频无音轨（转写天然为空）；② 有音轨但 STT 返回空串。
+    两种"什么都没有"的来源都测：① 视频无音轨（转写天然为空）；② 有音轨但音频模型返回空串。
     """
-    # ① 无音轨
+    # ① 无音轨（音频阶段根本不解析 ⇒ 预算全留给抽帧，仍然吃不下 15 s 的单帧预算）
     rig = build_rig(
         monkeypatch, tmp_path, kind="video", duration=30.0, streams=(False, True)
     )
-    monkeypatch.setattr(analyze_mod, "DEADLINE_S", 0.001)
+    monkeypatch.setattr(analyze_mod, "DEADLINE_S", 0.5)
     payload = await rig.tool(include_frames=True)
 
     assert list(payload) == list(envelope.FAIL_KEYS), "失败信封必须恰好 3 键"
@@ -1191,9 +1282,9 @@ async def test_budget_exhausted_with_nothing_to_deliver_is_still_a_failure(
         tmp_path,
         kind="video",
         duration=30.0,
-        stt=FakeSTTProvider(text=""),
+        audio=audio_chat(text=""),
     )
-    monkeypatch.setattr(analyze_mod, "DEADLINE_S", 0.001)
+    monkeypatch.setattr(analyze_mod, "DEADLINE_S", 0.5)
     payload = await rig.tool(include_frames=True)
     assert list(payload) == list(envelope.FAIL_KEYS)
     assert payload["error"] == envelope.ERR_FRAME_EXTRACT_FAILED
@@ -1234,7 +1325,7 @@ async def test_budget_sufficient_path_is_unchanged(
         kind="video",
         duration=30.0,
         frames=[(5.0, "unused"), (15.0, "unused"), (25.0, "unused")],
-        stt=FakeSTTProvider(text="正常预算下的转写"),
+        audio=audio_chat(text="正常预算下的转写"),
         cfg=settings.Settings(max_frames=6),
     )
     payload = await rig.run(include_frames=True)
@@ -1267,45 +1358,47 @@ def test_build_summary_kind_param_is_an_approved_extension() -> None:
 # ⑥ 真阶梯 × analyze：空串回落（不 patch providers，只 patch media）
 # --------------------------------------------------------------------------- #
 @pytest.mark.asyncio
-async def test_empty_stt_id_falls_back_to_curr_stt_instance(
+async def test_empty_audio_id_falls_back_to_current_chat_provider(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """§2.2 阶梯 ②→③：空串 + 核心 `enable=False`（②返回 None）⇒ ③ `curr_stt_provider_inst`。
+    """§2.5 阶梯 ②：`audio_provider_id=""` ⇒ 回落核心当前对话 provider（它必须能吃音频）。
 
-    这是生产实况：`provider_stt_settings.enable=False`，只有 `mimo_stt` 一个实例。
+    v0.1 这里走的是 STT 五级阶梯（`enable=False` 时靠 `curr_stt_provider_inst` 兜底）；
+    v0.2 没有 STT 链路，回落面就是**当前对话 provider** 一个 —— 也因此少了一条
+    "绕过 enable 开关"的隐式分支。
     """
-    stt = FakeSTTProvider(provider_id="mimo_stt")
-    ctx = FakeContext(using_stt=None, curr_stt=stt)
+    provision = audio_chat(model_name="mimo_audio")
+    ctx = FakeContext(using_provider=provision)
     rig = build_rig(monkeypatch, tmp_path, context=ctx, providers_real=True)
     payload = await rig.run()
 
     assert payload["ok"] is True
-    assert "stt_provider:mimo_stt" in payload["notes"]
-    assert ctx.calls.named("get_using_stt_provider_async"), "空串必须先问核心当前 STT"
+    assert "audio_provider:mimo_audio" in payload["notes"]
+    assert ctx.calls.named("get_using_provider_async"), "空串必须先问核心当前对话 provider"
 
 
 @pytest.mark.asyncio
-async def test_empty_stt_id_with_nothing_loaded_is_unavailable(
+async def test_empty_audio_id_with_nothing_loaded_is_audio_unavailable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """§2.2 阶梯 ⑤：一个 STT 都没有 ⇒ `STT_UNAVAILABLE`（错误信封，不是裸异常）。"""
-    ctx = FakeContext(using_stt=None, all_stt=[], curr_stt=None)
+    """§2.5 阶梯 ② 落空：核心没有可用对话 provider ⇒ `AUDIO_UNAVAILABLE`（不是裸异常）。"""
+    ctx = FakeContext(using_provider=None)
     rig = build_rig(monkeypatch, tmp_path, context=ctx, providers_real=True)
     payload = await rig.tool()
-    assert payload["error"] == envelope.ERR_STT_UNAVAILABLE
+    assert payload["error"] == envelope.ERR_AUDIO_UNAVAILABLE
 
 
 @pytest.mark.asyncio
-async def test_configured_missing_stt_id_is_provider_not_found(
+async def test_configured_missing_audio_id_is_provider_not_found(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """§5：配了 id 但核心没有 ⇒ `PROVIDER_NOT_FOUND`（不是回落到"当前 STT"）。"""
-    ctx = FakeContext(by_id={}, using_stt=FakeSTTProvider(provider_id="core"))
+    """§2.5 阶梯 ①：配了 id 但核心没有 ⇒ `PROVIDER_NOT_FOUND`（不是回落到当前对话 provider）。"""
+    ctx = FakeContext(by_id={}, using_provider=audio_chat(model_name="core"))
     rig = build_rig(
         monkeypatch,
         tmp_path,
         context=ctx,
-        cfg=settings.Settings(stt_provider_id="ghost"),
+        cfg=settings.Settings(audio_provider_id="ghost"),
         providers_real=True,
     )
     payload = await rig.tool()
@@ -1317,8 +1410,9 @@ async def test_empty_vision_id_uses_current_chat_provider(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """§2.2：`vision_provider_id=""` ⇒ 回落核心当前对话 provider（有 image 能力才能读图）。"""
-    chat = FakeChatProvider(modalities=["text", "image"], model_name="core-chat")
-    ctx = FakeContext(using_provider=chat, using_stt=FakeSTTProvider(provider_id="core_stt"))
+    # 同一个核心 provider 要同时承担音频与读图两件事（v0.2 的回落面只有它一个）
+    chat = FakeChatProvider(modalities=["text", "audio", "image"], model_name="core-chat")
+    ctx = FakeContext(using_provider=chat)
     rig = build_rig(
         monkeypatch,
         tmp_path,
@@ -1331,18 +1425,23 @@ async def test_empty_vision_id_uses_current_chat_provider(
 
     assert payload["ok"] is True
     assert len(payload["frames"]) == 1
+    assert "audio_provider:core-chat" in payload["notes"]
     assert "vision_provider:core-chat" in payload["notes"]
 
 
 @pytest.mark.asyncio
-async def test_empty_vision_id_with_text_only_provider_is_mismatch(
+async def test_empty_vision_id_with_no_image_modality_is_vision_unavailable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """§2.2 严格口径：落回到的 provider 没有 image 能力 ⇒ `PROVIDER_CAPABILITY_MISMATCH`。"""
-    ctx = FakeContext(
-        using_provider=FakeChatProvider(modalities=["text"]),
-        using_stt=FakeSTTProvider(provider_id="core_stt"),
-    )
+    """SPEC-v0.2 §2.5 覆盖 v0.1 的一处判据：**回落**到的 provider 没有 image ⇒ `VISION_UNAVAILABLE`。
+
+    v0.1 这里判 `PROVIDER_CAPABILITY_MISMATCH`（hint 让人去"改选/勾能力"），真实病因却是
+    "你根本没指定视觉模型"。这条用例把新的分裂钉在**主链路**上（provider 层另有对应用例）。
+
+    注意音频位必须可用（给 core provider 勾上 audio），否则音频阶段先挂 —— 这正是用
+    "同一 provider 承担两个模态"来表达生产实况的地方。
+    """
+    ctx = FakeContext(using_provider=FakeChatProvider(modalities=["text", "audio"]))
     rig = build_rig(
         monkeypatch,
         tmp_path,
@@ -1352,7 +1451,7 @@ async def test_empty_vision_id_with_text_only_provider_is_mismatch(
         providers_real=True,
     )
     payload = await rig.tool(include_frames=True)
-    assert payload["error"] == envelope.ERR_PROVIDER_CAPABILITY_MISMATCH
+    assert payload["error"] == envelope.ERR_VISION_UNAVAILABLE
 
 
 # --------------------------------------------------------------------------- #
@@ -1368,7 +1467,7 @@ async def test_provider_resolver_leaking_raw_exception_is_internal_error(
     def _boom(*_args, **_kwargs):
         raise RuntimeError("resolver blew up")
 
-    monkeypatch.setattr(providers, "resolve_stt_provider", _boom)
+    monkeypatch.setattr(providers, "resolve_audio_provider", _boom)
     payload = await rig.tool()
     assert payload == {
         "ok": False,
@@ -1456,6 +1555,7 @@ async def test_frames_truncated_kept_matches_frames_length(
         focus="",
         deadline=100.0,
         notes=notes,
+        settings=settings.Settings(),
     )
 
     assert len(described) == 1
@@ -1473,7 +1573,7 @@ async def test_budget_exhausted_before_first_frame_keeps_transcript(
 ) -> None:
     """评审 F4：**首帧前**预算就到期 ⇒ `ok:true`、转写仍在、`frames=[]`、有 `frames_truncated`。
 
-    与 t13 那条（慢 STT 吃掉预算、抽帧层就截断）互补：这条走的是**描述层**截断
+    与 t13 那条（慢音频调用吃掉预算、抽帧层就截断）互补：这条走的是**描述层**截断
     （抽帧已完成、第一帧描述前预算就没了）。两者都不许把整次调用判死。
     """
     rig = build_rig(
@@ -1481,10 +1581,12 @@ async def test_budget_exhausted_before_first_frame_keeps_transcript(
         tmp_path,
         kind="video",
         frames=[(2.5, "unused")],
-        stt=FakeSTTProvider(text="描述层截断也要保住转写"),
+        audio=audio_chat(text="描述层截断也要保住转写"),
         chat=FakeChatProvider(text="这段描述不该被调用"),
     )
-    clock = _ScriptedClock(0.0, 0.0, 100.0)  # started；抽帧预算判定；首帧描述时已到 deadline(100)
+    # 三次 `monotonic()` 依次是：`started` / 音频阶段的剩余预算 / 抽帧预算判定 —— 都还没到期；
+    # 第 4 次（首帧描述前）正好等于 deadline=100 ⇒ 描述层截断。
+    clock = _ScriptedClock(0.0, 0.0, 0.0, 100.0)
     monkeypatch.setattr(analyze_mod, "time", SimpleNamespace(monotonic=clock.monotonic))
 
     payload = await rig.run(include_frames=True)
@@ -1493,6 +1595,7 @@ async def test_budget_exhausted_before_first_frame_keeps_transcript(
     assert list(payload) == list(envelope.OK_KEYS)
     assert payload["transcript"][0]["text"] == "描述层截断也要保住转写"
     assert payload["frames"] == []
+    # 描述层的 `want` 是**已抽出的帧数**（1），不是配置里的 `max_frames` —— 两种截断的计数口径不同
     assert "frames_truncated:0/1" in payload["notes"]
     assert rig.prov_calls["vision"] == 1, "抽帧成功时视觉 provider 会被解析（截断发生在描述阶段）"
     assert not rig.chat.images_seen(), "首帧前就没预算了，不该发起任何描述调用"
@@ -1511,7 +1614,7 @@ async def test_six_failed_descriptions_with_full_budget_still_vision_failed(
         tmp_path,
         kind="video",
         frames=[(float(index * 5 + 5), "unused") for index in range(6)],
-        stt=FakeSTTProvider(text="转写仍在，但画面一帧没拿到"),
+        audio=audio_chat(text="转写仍在，但画面一帧没拿到"),
         chat=FakeChatProvider(fail_with=RuntimeError("upstream 500")),
     )
     payload = await rig.tool(include_frames=True)
@@ -1524,7 +1627,7 @@ async def test_six_failed_descriptions_with_full_budget_still_vision_failed(
 # --------------------------------------------------------------------------- #
 # 评审 F6：`include_frames` 的模型入参归一（字符串/数字都要能理解）
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("value", ["false", "no", "0", "  FALSE  ", 0, False])
+@pytest.mark.parametrize("value", ["false", "no", "0", "  FALSE  ", "False", 0, False])
 @pytest.mark.asyncio
 async def test_include_frames_false_like_values_skip_vision(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: object
@@ -1544,7 +1647,7 @@ async def test_include_frames_false_like_values_skip_vision(
     assert rig.media_calls["extract_frames"] == 0
 
 
-@pytest.mark.parametrize("value", ["true", "yes", "1", "  True  ", 1, True])
+@pytest.mark.parametrize("value", ["true", "yes", "1", "  True  ", "TRUE", 1, True])
 @pytest.mark.asyncio
 async def test_include_frames_true_like_values_trigger_vision(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: object
@@ -1559,23 +1662,147 @@ async def test_include_frames_true_like_values_trigger_vision(
     assert len(rig.chat.images_seen()) == 1
 
 
+@pytest.mark.parametrize("value", ["maybe", 2.5, 1.0, 2, -1, None])
 @pytest.mark.asyncio
 async def test_include_frames_invalid_value_falls_back_to_false_with_one_warning(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: object
 ) -> None:
-    """评审 F6：`"maybe"` 这种既非真值也非假值的串 ⇒ 按默认 False 处理 + **恰好一条**告警。
+    """评审 F6（t5-F6 收口）：白名单之外的一切 ⇒ 按默认 False + **恰好一条**告警。
 
-    不抛异常（工具的入参来自模型，不该因为一个词把整次调用判死），但要让管理员在日志里
-    看得见"模型给了个怪值"，否则成本异常时无从解释。
+    白名单只有三种形态：`bool`、整数 `0/1`、大小写不敏感的
+    `"true/yes/on/1"` 与 `"false/no/off/0/\"\""`。
+
+    **数值不再"非零即真"**（v0.1 的 O2 缺陷）：`2.5` / `1.0` 说明"模型没按 schema 发值"，
+    此时按真处理会把误发值变成真实开销（多抽 `max_frames` 帧、多花同样次数的视觉调用），
+    按默认 False 只可能少抽帧、不会多花钱。`2`、`-1` 同理（不是 0/1 就不算布尔）。
+    不抛异常（入参来自模型，不该因为一个词把整次调用判死），但要让管理员在日志里看得见。
     """
     log = RecordingLogger()
     monkeypatch.setattr(main, "LOG", log)
     rig = build_rig(monkeypatch, tmp_path, kind="video", frames=[(2.5, "unused")])
 
-    payload = await rig.tool(include_frames="maybe")  # type: ignore[arg-type]
+    payload = await rig.tool(include_frames=value)  # type: ignore[arg-type]
 
     assert payload["ok"] is True
     assert payload["frames"] == []
     assert rig.prov_calls["vision"] == 0
     warnings = [message for level, message in log.records if level == "WARNING" and "include_frames" in message]
     assert len(warnings) == 1, warnings
+
+
+# --------------------------------------------------------------------------- #
+# SPEC-v0.2 §2.1：音频阶段的**调用形状**（多模态 chat，不是 STTProvider）
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_transcribe_call_shape_is_text_chat_with_one_audio_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """冻结形状：`text_chat(prompt=…, audio_urls=[本地 wav])`，**不传** image/system/contexts。
+
+    这是 v0.2 的产品裁决 ①：音频不再依赖 `STTProvider`，而是让多模态对话模型"听"。
+    调用形状本身就是契约 —— `image_urls` 一并传会让模型看到空图像列表，
+    `contexts` / `system_prompt` 则会把"一次独立转写请求"变成一段对话。
+    """
+    rig = build_rig(monkeypatch, tmp_path, kind="audio")
+    await rig.run()
+
+    calls = rig.audio.calls.named("text_chat")
+    assert len(calls) == 1, f"音轨阶段只该调一次：{calls}"
+    kwargs = calls[0].kwargs
+    assert list(kwargs.get("audio_urls") or []) == [str(rig.media_path)], "必须是本地 wav 路径"
+    assert kwargs.get("image_urls") == [], "音轨阶段不许带图像"
+    assert kwargs.get("session_id") is None
+    for forbidden in ("contexts", "system_prompt", "func_tool", "tools"):
+        assert forbidden not in kwargs, f"不该传 {forbidden}"
+    assert kwargs.get("prompt")
+
+
+@pytest.mark.asyncio
+async def test_video_audio_urls_point_at_the_extracted_wav(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """视频音轨：交给模型的是**抽出来的 16k wav**，不是原始 mp4（v0.1 的 `extract_wav` 语义）。"""
+    rig = build_rig(monkeypatch, tmp_path, kind="video")
+    await rig.run()
+
+    audio_urls = rig.audio.audios_seen()
+    assert len(audio_urls) == 1
+    assert audio_urls[0].endswith("audio.wav"), audio_urls
+    assert audio_urls[0] != str(rig.media_path)
+
+
+@pytest.mark.asyncio
+async def test_only_the_audio_provider_is_used_for_transcription(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """转写只走音频 provider；摘要走对话 provider —— 两个角色不许混用同一个解析入口。"""
+    rig = build_rig(monkeypatch, tmp_path, kind="audio")
+    await rig.run()
+
+    assert rig.prov_calls["audio"] == 1
+    assert rig.prov_calls["chat"] == 1, "摘要阶段单独解析对话 provider"
+    assert len(rig.audio.calls.named("text_chat")) == 1
+    assert len(rig.chat.calls.named("text_chat")) == 1
+    assert rig.audio.audios_seen() and not rig.chat.audios_seen(), "摘要不许带音频"
+
+
+def test_stt_provider_symbols_are_gone_from_the_provider_layer() -> None:
+    """静态半条：`providers` 不再导出 STT 面（`resolve_stt_provider` / `STTProvider`）。
+
+    行为半条在 `tests/test_providers.py`（`test_stt_resolver_is_gone_in_v02`）；这里再钉一次
+    是因为**主链路测试**也在 import `providers` —— 谁把 STT 链路加回来都会两处同红。
+    """
+    assert not hasattr(providers, "resolve_stt_provider")
+    assert not hasattr(providers, "STTProvider")
+    assert hasattr(providers, "resolve_audio_provider")
+
+
+@pytest.mark.asyncio
+async def test_configured_text_only_audio_provider_is_capability_mismatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """真实解析器（不注入错误）：配了 id 但那个 provider 没有 audio 模态 ⇒ 能力不匹配。
+
+    这是"降级错误码"的正面证据：走真 `providers.resolve_audio_provider` + `FakeContext`，
+    拿到的是 `PROVIDER_CAPABILITY_MISMATCH`（配错了），而不是 `AUDIO_UNAVAILABLE`（没配）。
+    """
+    text_only = FakeChatProvider(modalities=["text"], model_name="text-only")
+    ctx = FakeContext(by_id={"text-only": text_only}, using_provider=audio_chat())
+    rig = build_rig(
+        monkeypatch,
+        tmp_path,
+        context=ctx,
+        cfg=settings.Settings(audio_provider_id="text-only"),
+        providers_real=True,
+    )
+    payload = await rig.tool()
+    assert payload == {
+        "ok": False,
+        "error": envelope.ERR_PROVIDER_CAPABILITY_MISMATCH,
+        "hint": envelope.HINTS[envelope.ERR_PROVIDER_CAPABILITY_MISMATCH],
+    }
+    assert not text_only.calls.named("text_chat"), "能力不符就不许发请求（零 token）"
+
+
+@pytest.mark.asyncio
+async def test_configured_stt_provider_id_in_audio_slot_is_capability_mismatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """v0.1 的旧配置形态（音频位存的是 STT provider id）⇒ 明确的能力不匹配。
+
+    这条是迁移脚本"搬值必须带能力校验"的行为依据：搬过去只会让每次调用都撞这个错。
+    """
+    from _fakes import FakeSTTProvider
+
+    stt = FakeSTTProvider(provider_id="mimo_stt")
+    ctx = FakeContext(by_id={"mimo_stt": stt}, using_provider=audio_chat())
+    rig = build_rig(
+        monkeypatch,
+        tmp_path,
+        context=ctx,
+        cfg=settings.Settings(audio_provider_id="mimo_stt"),
+        providers_real=True,
+    )
+    payload = await rig.tool()
+    assert payload["error"] == envelope.ERR_PROVIDER_CAPABILITY_MISMATCH
+    assert not stt.calls.named("get_text"), "STT 面一次都不该被调用"

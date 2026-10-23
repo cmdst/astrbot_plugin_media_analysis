@@ -154,7 +154,8 @@ def test_plugin_construction_is_side_effect_free_whitebox() -> None:
     plugin = main.MediaAnalysisPlugin(context=None, config=None)
     assert plugin.config == {}
     assert plugin._settings_cache is None
-    assert len(plugin._cache) == 0
+    # v0.2：缓存实例在 `initialize()` 里建（TTL 来自配置）；构造期**不建目录、不读盘**
+    assert plugin._cache is None
 
 
 def test_settings_read_point_is_not_duplicated_whitebox() -> None:
@@ -274,40 +275,52 @@ def test_envelope_exports_the_frozen_key_orders() -> None:
 #: 抄自 `envelope.py` 的 `HINTS`；这不是"再抄一遍实现"，而是**契约文本**——
 #: 之前用 `envelope.HINTS[...]` 自证，改错文案全套仍绿，等于没人守。
 HINTS_SNAPSHOT: dict[str, str] = {
-    "BAD_TARGET": "target 只接受 current 或 quoted。",
-    "MEDIA_NOT_FOUND": "这条消息或它引用的消息里没有语音/视频；请用户直接发送或引用一条语音/视频。",
+    "BAD_TARGET": "target 只接受 current 或 quoted；不要传文件路径。群文件形式的视频/语音也用 current 或 quoted 取。",
+    "MEDIA_NOT_FOUND": "这条消息或它引用的消息里没有语音/视频/可解析的文件；请用户直接发送或引用一条语音、视频，或作为群文件发送。",
     "MEDIA_UNRESOLVABLE": "媒体组件在，但取不到本地文件（可能已被清理，或平台没给可用地址）。",
     "PROBE_FAILED": "读不出媒体时长（ffprobe 失败），无法判定上限也无法抽帧。",
     "MEDIA_TOO_LONG": "媒体时长超过配置上限；请用户发更短的片段，或让管理员调高 limits.max_media_seconds。",
+    "MEDIA_TOO_LARGE": "文件体积超过上限；请用户发更短的片段，或让管理员调高 limits.max_media_bytes。",
+    "UNSUPPORTED_MEDIA_TYPE": "这个文件不是可解析的音频或视频；请用户改发语音条，或发 mp4/mov/m4a/mp3/wav/amr 之类的媒体文件。",
     "NO_AUDIO_TRACK": "这条视频没有音轨；把 include_frames 设为 true 改走抽帧。",
     "NO_VIDEO_TRACK": "这条视频没有视频流；把 include_frames 设为 false 只做转写。",
-    "AUDIO_EXTRACT_FAILED": "从视频抽音轨失败（转码错误）；请重试或让用户换一条媒体。",
+    "AUDIO_EXTRACT_FAILED": "音频转码失败；请重试或让用户换一条媒体。",
     "FRAME_EXTRACT_FAILED": "抽帧全部失败；请重试或让用户换一条媒体。",
-    "STT_UNAVAILABLE": "没有可用的语音识别 provider；请在插件配置里指定 stt_provider_id，或在后台添加 speech_to_text 类型的 provider。",
-    "STT_FAILED": "语音识别调用失败或超时；请稍后重试。",
+    "AUDIO_UNAVAILABLE": "没有可用的音频对话模型；请让管理员在插件配置里指定「音频模型」（模型能力需勾上「音频」）。",
+    "AUDIO_FAILED": "音频模型调用失败或超时；请稍后重试。",
     "PROVIDER_NOT_FOUND": "配置里的 provider id 在 AstrBot 中不存在；请让管理员在插件配置里重新选择。",
-    "PROVIDER_CAPABILITY_MISMATCH": "所选 provider 不支持该能力（语音识别 / 图像输入）；请让管理员改选，或在后台给该 provider 的「模型能力」勾上「图像」。",
-    "VISION_UNAVAILABLE": "没有可用的对话 provider 来读图；请配置 vision_provider_id。",
+    "PROVIDER_CAPABILITY_MISMATCH": "所选 provider 不具备该能力（音频输入 / 图像输入）；请让管理员改选，或在后台给该 provider 的「模型能力」勾上「音频」/「图像」。",
+    "VISION_UNAVAILABLE": "没有可用的对话 provider 来读图；请让管理员在插件配置里指定「视觉模型」。",
     "VISION_FAILED": "视觉模型调用全部失败或超时；请稍后重试。",
     "INTERNAL_ERROR": "插件内部错误；已记录日志，请让管理员查看插件日志。",
 }
 
 
-def test_envelope_hints_cover_all_sixteen_codes() -> None:
+def test_envelope_hints_cover_all_eighteen_codes() -> None:
+    """v0.2 是 **18** 码（删 `STT_UNAVAILABLE`/`STT_FAILED`，增 4 条：体积 / 非媒体 /
+    音频不可用 / 音频调用失败）。码集合与 `HINTS` 键集合必须逐字相等。"""
     codes = {
         value
         for name, value in vars(envelope).items()
         if name.startswith("ERR_") and isinstance(value, str)
     }
-    assert len(codes) == 16, sorted(codes)
+    assert len(codes) == 18, sorted(codes)
     assert set(envelope.HINTS) == codes
     assert envelope.OK_KEYS + envelope.FAIL_KEYS  # 常量存在性（顺序由上面两条钉）
 
 
-def test_envelope_hints_match_the_frozen_snapshot_verbatim() -> None:
-    """评审 F3：16 条 `hint` 逐字快照（dict 全等，不只看键集合）。
+def test_removed_stt_codes_are_really_gone() -> None:
+    """v0.2 删掉的两个码不许"留着备用"：它们会让模型以为还有 STT 链路可调。"""
+    assert not hasattr(envelope, "ERR_STT_UNAVAILABLE")
+    assert not hasattr(envelope, "ERR_STT_FAILED")
+    assert "STT_UNAVAILABLE" not in envelope.HINTS
+    assert "STT_FAILED" not in envelope.HINTS
 
-    这是本仓库唯一的"文案级"契约：模型看到的就是这 16 句，错一个字就等于给模型
+
+def test_envelope_hints_match_the_frozen_snapshot_verbatim() -> None:
+    """评审 F3：18 条 `hint` 逐字快照（dict 全等，不只看键集合）。
+
+    这是本仓库唯一的"文案级"契约：模型看到的就是这 18 句，错一个字就等于给模型
     错误的操作指令（"换一条视频"vs"去看日志"指错方向）。要改文案：先改 SPEC §5 表，
     再改 `envelope.HINTS`，最后改这里 —— 三处一起动才算契约变更。
     """

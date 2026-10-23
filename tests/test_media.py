@@ -38,6 +38,11 @@ from _fakes import (
 # --------------------------------------------------------------------------- #
 # 工具
 # --------------------------------------------------------------------------- #
+#: `resolve_media_path` / `classify` 的必填关键字（v0.2 起 `workdir` 与 `max_media_bytes` 不再是
+#: 默认值：前者必须由 caller 负责清理，后者唯一事实源是配置 `settings`，本模块不 import settings）。
+_RESOLVE_KWARGS = {"workdir": "/tmp", "max_media_bytes": 67108864}
+
+
 def _code(exc_info: pytest.ExceptionInfo) -> str:
     assert isinstance(exc_info.value, envelope.ToolError), type(exc_info.value)
     return exc_info.value.code
@@ -175,7 +180,7 @@ def test_find_media_rejects_any_other_target(target: str) -> None:
 async def test_resolve_media_path_prefers_existing_path(media_fixtures: dict[str, Path]) -> None:
     video = make_video(media_fixtures["video_5s"])
     handle = media.MediaHandle(comp=video, quoted=False)
-    resolved = await media.resolve_media_path(handle)
+    resolved = await media.resolve_media_path(handle, **_RESOLVE_KWARGS)
     assert Path(resolved) == media_fixtures["video_5s"].resolve()
 
     # 真组件上再挂一个会炸的 convert，证明 path 优先时根本没走到它
@@ -186,7 +191,7 @@ async def test_resolve_media_path_prefers_existing_path(media_fixtures: dict[str
     handle = media.MediaHandle(
         comp=_Boom(path=str(media_fixtures["video_5s"])), quoted=False
     )
-    assert Path(await media.resolve_media_path(handle)) == media_fixtures["video_5s"].resolve()
+    assert Path(await media.resolve_media_path(handle, **_RESOLVE_KWARGS)) == media_fixtures["video_5s"].resolve()
 
 
 @pytest.mark.asyncio
@@ -194,7 +199,7 @@ async def test_resolve_media_path_falls_back_to_convert(tmp_path: Path) -> None:
     target = tmp_path / "downloaded.wav"
     target.write_bytes(b"RIFF")
     handle = media.MediaHandle(comp=_dead_component(target), quoted=False)
-    assert await media.resolve_media_path(handle) == str(target)
+    assert await media.resolve_media_path(handle, **_RESOLVE_KWARGS) == str(target)
 
 
 @pytest.mark.asyncio
@@ -202,19 +207,19 @@ async def test_resolve_media_path_unresolvable_variants(tmp_path: Path) -> None:
     # convert 抛错（真 URL 下载失败的样子；用 UnresolvableRecord 不联网）
     handle = media.MediaHandle(comp=UnresolvableRecord(file="http://example.invalid/a.wav"), quoted=False)
     with pytest.raises(envelope.ToolError) as exc_info:
-        await media.resolve_media_path(handle)
+        await media.resolve_media_path(handle, **_RESOLVE_KWARGS)
     assert _code(exc_info) == envelope.ERR_MEDIA_UNRESOLVABLE
 
     # convert 返回不存在的路径
     handle = media.MediaHandle(comp=_dead_component(tmp_path / "missing.wav"), quoted=False)
     with pytest.raises(envelope.ToolError) as exc_info:
-        await media.resolve_media_path(handle)
+        await media.resolve_media_path(handle, **_RESOLVE_KWARGS)
     assert _code(exc_info) == envelope.ERR_MEDIA_UNRESOLVABLE
 
     # 连 convert 都没有
     handle = media.MediaHandle(comp=SimpleNamespace(path=None, file="http://x"), quoted=False)
     with pytest.raises(envelope.ToolError) as exc_info:
-        await media.resolve_media_path(handle)
+        await media.resolve_media_path(handle, **_RESOLVE_KWARGS)
     assert _code(exc_info) == envelope.ERR_MEDIA_UNRESOLVABLE
 
 
@@ -230,7 +235,9 @@ async def test_resolve_media_path_times_out(monkeypatch: pytest.MonkeyPatch) -> 
 
     monkeypatch.setattr(media, "RESOLVE_TIMEOUT_S", 0.01)
     with pytest.raises(envelope.ToolError) as exc_info:
-        await media.resolve_media_path(media.MediaHandle(comp=_Slow(), quoted=False))
+        await media.resolve_media_path(
+            media.MediaHandle(comp=_Slow(), quoted=False), **_RESOLVE_KWARGS
+        )
     assert _code(exc_info) == envelope.ERR_MEDIA_UNRESOLVABLE
 
 

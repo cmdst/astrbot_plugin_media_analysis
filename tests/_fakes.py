@@ -4,8 +4,10 @@
 
 - **假 provider 继承真 ABC**：`FakeChatProvider(Provider)` / `FakeSTTProvider(STTProvider)`
   继承的是 `astrbot.core.provider.provider` 里那两个类（经 `astrbot.api.provider` 再导出）。
-  这样插件里的 `isinstance(prov, STTProvider)`（SPEC §2.3：STT 的能力判定**靠类型**、
-  不是 `modalities`）在测试里走的是**同一套类**，而不是"因为桩长得像所以过"。
+  这样插件里的 `isinstance(prov, Provider)`（v0.2：音频位与视觉位都要求是**对话** provider）
+  在测试里走的是**同一套类**，而不是"因为桩长得像所以过"。
+  `FakeSTTProvider` 在 v0.2 里只用于**反例**：把 STT provider 填进音频位必须判
+  `PROVIDER_CAPABILITY_MISMATCH`（`STTProvider` 不是 `Provider`）。
 - **`provider.provider_config` 是能力判定的唯一读点**：`supports_modality()` 读
   `provider.provider_config.get("modalities")`（SPEC §2.2）。所以假 provider 的构造参数
   就是 `modalities`，三态（缺省 / `[]` / `["text"]`）都能表达。
@@ -20,9 +22,9 @@
 
 用法：
 
-    from _fakes import FakeContext, FakeChatProvider, FakeSTTProvider, make_event, make_record
+    from _fakes import FakeContext, audio_chat, make_event, make_record
 
-    ctx = FakeContext(by_id={"fake_stt": stt})
+    ctx = FakeContext(by_id={"fake-audio": audio_chat()})
     event = make_event(current=[make_record(path)])
 """
 
@@ -34,7 +36,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from astrbot.api.message_components import Plain, Record, Reply, Video
+from astrbot.api.message_components import File, Plain, Record, Reply, Video
 from astrbot.api.provider import Provider, STTProvider
 
 try:  # 真核心（默认路径）：返回真的 LLMResponse，插件读的就是 `.completion_text`
@@ -60,7 +62,9 @@ __all__ = [
     "TrackingFakeEvent",
     "UnresolvableRecord",
     "UnresolvableVideo",
+    "audio_chat",
     "make_event",
+    "make_file",
     "make_record",
     "make_video",
 ]
@@ -182,8 +186,35 @@ class FakeChatProvider(Provider):
         """每次 `text_chat` 的 `image_urls` 摊平（抽帧阶段应逐帧看到本地 jpg 路径）。"""
         return [img for call in self.calls.named("text_chat") for img in call.kwargs.get("image_urls", [])]
 
+    def audios_seen(self) -> list[str]:
+        """每次 `text_chat` 的 `audio_urls` 摊平（v0.2 音轨阶段只放 1 个本地 wav 路径）。"""
+        return [url for call in self.calls.named("text_chat") for url in call.kwargs.get("audio_urls", [])]
+
     def prompts(self) -> list[str]:
         return [call.kwargs.get("prompt") or "" for call in self.calls.named("text_chat")]
+
+
+def audio_chat(
+    *,
+    text: str = "这是一段合成测试音轨的转写结果。",
+    delay: float = 0.0,
+    fail_with: BaseException | None = None,
+    model_name: str = "fake-audio",
+) -> FakeChatProvider:
+    """v0.2 的"音频 provider"：**多模态对话模型**（`modalities` 含 `audio`）。
+
+    v0.2 删掉了 STT 链路（`resolve_stt_provider` / `STTProvider`）⇒ 音频阶段的假身必须是一个
+    `Provider` 且 `modalities` 明确含 `audio`，否则严格口径下会被判 `AUDIO_UNAVAILABLE`。
+    `FakeSTTProvider` 仍保留在 `_fakes` 里：它现在只用于**反例**（把 STT provider
+    填进音频位 ⇒ `PROVIDER_CAPABILITY_MISMATCH`，见 `tests/test_providers.py`）。
+    """
+    return FakeChatProvider(
+        text=text,
+        delay=delay,
+        fail_with=fail_with,
+        modalities=["text", "audio"],
+        model_name=model_name,
+    )
 
 
 class FakeSTTProvider(STTProvider):
@@ -273,6 +304,18 @@ def make_video(path: str | Path | None = None, *, file: str | None = None) -> Vi
         return comp
     assert file is not None, "make_video 需要 path 或 file 之一"
     return Video(file=file)
+
+
+def make_file(name: str, *, file: str = "", url: str = "") -> File:
+    """造一条 `File`（群文件投递）。
+
+    核心 `File.__init__(name, file="", url="")` 的 `file` 走**属性 setter**：
+    `http(s)://` 开头的写进 `url`，其余写进 `file_`。所以：
+    - `make_file("a.mp4", file=str(path))` ⇒ `file_` 是本地路径（零 IO 取件那条）；
+    - `make_file("a.mp4", url="http://…")` ⇒ `file_=""` + `url` 非空（有界下载那条）；
+    - `make_file("a.pdf")` ⇒ 两者都空（`MEDIA_UNRESOLVABLE` 那条）。
+    """
+    return File(name=name, file=file, url=url)
 
 
 class _UnresolvableMixin:

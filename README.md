@@ -184,6 +184,8 @@ python3 tools/migrate_config_v02.py --root /root/AstrBot --report-legacy   # 旧
   只有"该 id 是 chat 类且 `modalities` 明确含 `audio`"才搬到 `audio_provider_id`，否则
   **原样留在旧键**并给原因码（`not_found` / `not_chat` / `no_audio`，退出码 2 等人工）。
 - 任何模式都**不打印配置值**（只有键名/动作/类型/长度）。
+- **落盘不改权限**：备份固定 0600；**目标配置文件保留原权限位**（生产是 0600 ⇒ 迁移后仍是
+  0600，不会被放宽成默认的 644）；目标不存在时才按 0600 新建。
 - **回滚成对**：回代码 → `--rollback <备份>` → 重启（`v0.1` 的 schema 不认识新键，
   先回配置会被旧 schema 删；`v0.2` 的 schema 认识旧键，所以两个方向都不丢值）。
 

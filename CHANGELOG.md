@@ -90,6 +90,24 @@
   `prompt_trimmed:<key>` / `material_trimmed` / `source:file` / `file_downloaded` /
   `cache_hit` / `cache_age_s:<n>`；`stt_provider:` → `audio_provider:`、`stt_empty` → `audio_empty`）。
 
+### 评审 t5 修复（同版本内，v0.2.1 之前的必要项）
+
+- **迁移落盘保持原配置权限**：`--apply` 原先用默认 0644 写目标文件（`os.replace` 换 inode），
+  把生产 `cmd_config.json` 同款的 **0600 放宽成 644**（配置里有 provider id 与提示词）。
+  现在先取原文件 `st_mode` 再原样复制，目标不存在才按 0600 新建；备份仍是 0600。
+  回归守卫：`tests/test_migrate_config.py` 的 600/640/444 三档 + "目标不存在"一条。
+- **版本守卫落地**（SPEC-v0.2 §11 C9 原先没有实现）：新增 `tests/test_version.py` ——
+  `settings.PLUGIN_VERSION` == `metadata.yaml:version`（去 `v` 前缀）== `0.2.0`；
+  `name` 一致且是合法标识符；`repo` 逐字 `cmdst/astrbot_plugin_media_analysis`；
+  `astrbot_version` 用真 `SpecifierSet` 判含 `4.29.1`（不含即拒载）；CHANGELOG 顶部条目提到本版本。
+  自证：只改 version / repo / CHANGELOG 任一，该文件即红。
+- **`include_frames` 布尔收口**（v0.1 O2 未关的口径矛盾）：`2.5` / `1.0` 这类数值原先按
+  "非零即真"且**不告警**。现在白名单只有 `bool`、整数 `0/1`、大小写不敏感的
+  `"true/yes/on/1"` 与 `"false/no/off/0/\"\""`；其余（含 float、越界 int、未知类型）
+  一律告警一次并按默认 `False` —— 误发值只会少抽帧，不会多花钱。
+- **文案**：缓存键的"11 分量"更正为 **10 个分量**（公式没动，数错的是数词），涉及
+  `cache.py` 模块/函数 docstring、`analyze.py` 模块 docstring、`SPEC-v0.2.md` §6.1 标题、两处测试注释。
+
 ### 已知状态（下一单处理）
 
 - **库内 `tests/` 仍是 v0.1 契约**（`resolve_stt_provider` / 4 键 / 16 码 / `ResultCache` /

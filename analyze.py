@@ -5,7 +5,7 @@ v0.1 → v0.2 的四处结构性变化：
    （不再有 `STTProvider` 链路），异常一律映射 `AUDIO_FAILED`（§2.3 冻结表）；
 2. **提示词可配置**：4 份（audio / video / frame / summary），空串回退内置默认，
    坏值回退 + 告警，超长截断（§7.1）；
-3. **结果落盘缓存带 TTL**：`cache.build_key` 的 11 分量键 + `singleflight` 同键串行化，
+3. **结果落盘缓存带 TTL**：`cache.build_key` 的 10 个分量键 + `singleflight` 同键串行化，
    命中回 `cached=true` + **本次**真实耗时 + `cache_hit` / `cache_age_s:<n>`（§6.3）；
 4. **`File` 段进主流程**：`media.classify` 一次拿 `(kind, duration, has_audio, has_video)`
    （`File` 走三段梯子），音轨阶段不再重复 ffprobe。

@@ -23,13 +23,23 @@ from astrbot_plugin_media_analysis import main, settings
 
 _PLUGIN_DIR = Path(__file__).resolve().parents[1]
 
-#: SPEC §4.2 冻结的 4 个点号键（写死在这里 = 契约快照；要加键必须先改 SPEC）。
+#: SPEC-v0.2 §5.2 冻结的 **11** 个点号键（写死在这里 = 契约快照；要加键必须先改 SPEC）。
+#: 其中 `provider_settings.stt_provider_id` 是**弃用键**：它必须继续留在 schema 里，
+#: 否则核心 `check_config_integrity()` 会把用户配置里的旧值当 stale 键删掉并落盘
+#: （`astrbot_config.py:252-266` + `:113-121`）。代码只读不生效，迁移脚本负责搬值。
 EXPECTED_LEAVES: frozenset[str] = frozenset(
     {
-        "provider_settings.stt_provider_id",
+        "provider_settings.audio_provider_id",
         "provider_settings.vision_provider_id",
+        "provider_settings.stt_provider_id",
+        "prompts.audio",
+        "prompts.video",
+        "prompts.frame",
+        "prompts.summary",
         "limits.max_media_seconds",
         "limits.max_frames",
+        "limits.max_media_bytes",
+        "cache.ttl_seconds",
     }
 )
 
@@ -91,17 +101,19 @@ def _three_way_diff(
 # --------------------------------------------------------------------------- #
 # C1：schema 叶子 ⇄ KEY_MAP 键 ⇄ main._settings() 读取点（三处 4 条，双射）
 # --------------------------------------------------------------------------- #
-def test_schema_has_exactly_the_frozen_four_leaves() -> None:
-    """契约：SPEC §4.2 的 4 个键；多一个少一个都红（要加键先改 SPEC）。"""
+def test_schema_has_exactly_the_frozen_eleven_leaves() -> None:
+    """契约：SPEC-v0.2 §5.2 的 11 个键；多一个少一个都红（要加键先改 SPEC）。"""
     leaves = _schema_leaves(_schema())
     assert set(leaves) == EXPECTED_LEAVES, f"schema 叶子漂了：{sorted(leaves)}"
-    assert len(leaves) == 4
+    assert len(leaves) == 11
 
 
 def test_schema_groups_are_object_with_description_and_hint() -> None:
     """WebUI 渲染前提：分组必须是 object，且带 description / hint。"""
     schema = _schema()
-    assert list(schema) == ["provider_settings", "limits"], "分组顺序即渲染顺序"
+    assert list(schema) == ["provider_settings", "prompts", "limits", "cache"], (
+        "分组顺序即渲染顺序"
+    )
     for group, spec in schema.items():
         assert spec["type"] == "object", f"{group} 必须是 object"
         assert spec.get("description"), f"{group} 缺 description"
@@ -118,7 +130,7 @@ def test_main_read_points_match_key_map_exactly() -> None:
     """C1：`main._settings()` 里出现的 `settings.KEY_*` == KEY_MAP 键集合（漏读＝生产静默丢键）。"""
     read_points = _read_points(_main_src())
     assert read_points == set(settings.KEY_MAP), f"读取点漂了：{sorted(read_points)}"
-    assert len(read_points) == 4
+    assert len(read_points) == 11
 
 
 def test_three_way_diff_is_empty_for_the_real_tree() -> None:
@@ -160,12 +172,23 @@ def test_guard_bites_when_a_key_is_added_in_only_one_place() -> None:
     assert diff["schema_not_read"] == [settings.KEY_MAX_FRAMES]
     assert diff["key_map_not_read"] == [settings.KEY_MAX_FRAMES]
 
+    # ⑤ 弃用键也不能漏读：`stt_provider_id` 若从白名单消失，旧值就再也没人读得到
+    #    （它的唯一用途就是"读出来打一次弃用告警"与迁移脚本对照）
+    diff = _three_way_diff(schema, key_map, read - {settings.KEY_LEGACY_STT_PROVIDER_ID})
+    assert diff["schema_not_read"] == [settings.KEY_LEGACY_STT_PROVIDER_ID]
+
 
 def test_key_map_values_are_exactly_the_settings_fields() -> None:
-    """C2：`KEY_MAP` 的值集合 == `Settings` 的字段集合（4 个，双射）。"""
+    """C2：`KEY_MAP` 的值集合 == `Settings` 的字段集合（11 个，双射）。
+
+    派生量（`prompts` / `prompts_trimmed` / `prompts_fp`）走 `property`，**不是**字段 ——
+    它们不是配置键，不该出现在 `KEY_MAP` 里。
+    """
     fields = {field.name for field in dataclasses.fields(settings.Settings)}
     assert fields == set(settings.KEY_MAP.values())
-    assert len(fields) == 4
+    assert len(fields) == 11
+    derived = {"prompts", "prompts_trimmed", "prompts_fp"}
+    assert derived & fields == set(), "派生量混进了 dataclass 字段"
 
 
 def test_settings_dataclass_is_frozen_and_defaults_match_schema() -> None:
@@ -173,13 +196,29 @@ def test_settings_dataclass_is_frozen_and_defaults_match_schema() -> None:
     leaves = _schema_leaves(_schema())
     assert leaves[settings.KEY_MAX_MEDIA_SECONDS]["default"] == settings.DEFAULT_MAX_MEDIA_SECONDS
     assert leaves[settings.KEY_MAX_FRAMES]["default"] == settings.DEFAULT_MAX_FRAMES
-    assert leaves[settings.KEY_STT_PROVIDER_ID]["default"] == ""
-    assert leaves[settings.KEY_VISION_PROVIDER_ID]["default"] == ""
+    assert leaves[settings.KEY_MAX_MEDIA_BYTES]["default"] == settings.DEFAULT_MAX_MEDIA_BYTES
+    assert leaves[settings.KEY_CACHE_TTL_SECONDS]["default"] == settings.DEFAULT_CACHE_TTL_SECONDS
+    for key in (
+        settings.KEY_AUDIO_PROVIDER_ID,
+        settings.KEY_VISION_PROVIDER_ID,
+        settings.KEY_LEGACY_STT_PROVIDER_ID,
+    ):
+        assert leaves[key]["default"] == "", f"{key} 的默认值该是空串"
+    # 四份提示词的 schema 默认值 == 内置默认模板（逐字）：WebUI 里看到的就是会发出去的那份
+    for name in settings.PROMPT_KEYS:
+        leaf = leaves[f"prompts.{name}"]
+        assert leaf["default"] == settings.DEFAULT_PROMPTS[name], f"prompts.{name} 默认值漂了"
+        assert leaf["default"].strip(), f"prompts.{name} 默认值不能是空串"
 
     defaults = settings.Settings()
     assert defaults.max_media_seconds == settings.DEFAULT_MAX_MEDIA_SECONDS
     assert defaults.max_frames == settings.DEFAULT_MAX_FRAMES
-    assert defaults.stt_provider_id == "" and defaults.vision_provider_id == ""
+    assert defaults.max_media_bytes == settings.DEFAULT_MAX_MEDIA_BYTES
+    assert defaults.cache_ttl_seconds == settings.DEFAULT_CACHE_TTL_SECONDS
+    assert defaults.audio_provider_id == "" and defaults.vision_provider_id == ""
+    assert defaults.legacy_stt_provider_id == ""
+    assert (defaults.prompt_audio, defaults.prompt_video) == ("", "")
+    assert (defaults.prompt_frame, defaults.prompt_summary) == ("", "")
 
     with pytest.raises(dataclasses.FrozenInstanceError):
         defaults.max_frames = 3  # type: ignore[misc]
@@ -196,10 +235,16 @@ def test_schema_leaf_types_are_renderable_by_core() -> None:
 
 
 def test_provider_id_leaves_declare_webui_special() -> None:
-    """两个 provider id 必须带 `_special`，否则 WebUI 只给一个裸输入框（SPEC §2.7）。"""
+    """三个 provider id 必须带 `_special`，否则 WebUI 只给一个裸输入框（SPEC §5.2）。
+
+    弃用键保留 `select_provider_stt`：它与真实类型一致（那个位置历史上存的就是 STT id），
+    改成 `select_provider` 会让 WebUI 只列出 chat provider —— 用户改不了旧值，
+    却会把旧值误读成"合法的音频模型"。
+    """
     leaves = _schema_leaves(_schema())
-    assert leaves[settings.KEY_STT_PROVIDER_ID]["_special"] == "select_provider_stt"
+    assert leaves[settings.KEY_AUDIO_PROVIDER_ID]["_special"] == "select_provider"
     assert leaves[settings.KEY_VISION_PROVIDER_ID]["_special"] == "select_provider"
+    assert leaves[settings.KEY_LEGACY_STT_PROVIDER_ID]["_special"] == "select_provider_stt"
 
 
 def test_only_settings_module_reads_config_keys() -> None:
@@ -236,9 +281,16 @@ def _view(raw):
 
 
 def test_configview_reads_dotted_paths() -> None:
-    view = _view({"limits": {"max_frames": 4}, "provider_settings": {"stt_provider_id": "x"}})
+    view = _view(
+        {
+            "limits": {"max_frames": 4},
+            "provider_settings": {"stt_provider_id": "x"},
+            "cache": {"ttl_seconds": 0},
+        }
+    )
     assert view.get("limits.max_frames") == 4
     assert view.get("provider_settings.stt_provider_id") == "x"
+    assert view.get("cache.ttl_seconds") == 0, "0 是合法值（＝关闭缓存），不能回 default"
     assert view.get("limits.missing", "fallback") == "fallback"
 
 
@@ -289,22 +341,35 @@ def test_configview_bounded_int_clamps_and_falls_back() -> None:
     assert view.bounded_int("limits.missing", default=6, lo=1, hi=12) == 6
 
 
-def test_main_settings_assembles_all_four_keys() -> None:
-    """`main._settings()` 的四个字段都能从一份配置里取到（含钳位）。"""
+def test_main_settings_assembles_all_eleven_keys() -> None:
+    """`main._settings()` 的 11 个字段都能从一份配置里取到（含钳位与去空白）。"""
     plugin = main.MediaAnalysisPlugin(
         context=None,
         config={
-            "provider_settings": {"stt_provider_id": "  s1 ", "vision_provider_id": "v1"},
-            "limits": {"max_media_seconds": 1, "max_frames": 99},
+            "provider_settings": {
+                "audio_provider_id": "  a1 ",
+                "vision_provider_id": "v1",
+                "stt_provider_id": "  old_stt ",
+            },
+            "prompts": {"audio": "  A{focus_clause}  ", "summary": "S{material}"},
+            "limits": {"max_media_seconds": 1, "max_frames": 99, "max_media_bytes": 1},
+            "cache": {"ttl_seconds": -5},
         },
     )
     snapshot = plugin._settings()
     assert snapshot == settings.Settings(
-        stt_provider_id="s1",
+        audio_provider_id="a1",
         vision_provider_id="v1",
+        legacy_stt_provider_id="old_stt",
         max_media_seconds=settings.MIN_MAX_MEDIA_SECONDS,
         max_frames=settings.MAX_MAX_FRAMES,
+        max_media_bytes=settings.MIN_MAX_MEDIA_BYTES,
+        prompt_audio="A{focus_clause}",
+        prompt_summary="S{material}",
+        cache_ttl_seconds=settings.MIN_CACHE_TTL_SECONDS,
     )
+    # 未给的键回空串（`prompts.video` / `prompts.frame` 没配）
+    assert snapshot.prompt_video == "" and snapshot.prompt_frame == ""
 
 
 def test_main_settings_on_empty_config_returns_defaults() -> None:

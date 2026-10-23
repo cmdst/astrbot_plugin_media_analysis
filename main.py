@@ -54,22 +54,28 @@ except Exception:  # noqa: BLE001 —— 拿不到就退化为本地兜底，绝
 
 
 # --------------------------------------------------------------------------- #
-# 参数类型防御（评审 F6）：核心**不校验**工具参数类型，模型完全可能发
+# 参数类型防御（评审 F6 / t5-F6）：核心**不校验**工具参数类型，模型完全可能发
 # `"include_frames": "false"`（字符串）。字符串 `"false"` 是**真值** ⇒ 会静默多抽
 # `max_frames` 帧 + 同样次数的视觉调用（真金白银，且用户看不出为什么）。
-# 这里只把"真/假"归一，非法类型告警一次并按 schema 默认 `False`。
+#
+# 白名单只放三种形态：`bool`；整数 `0`/`1`；大小写不敏感的
+# `"1"/"true"/"yes"/"on"` 与 `"0"/"false"/"no"/"off"/""`。
+# **其它数值（含 `1.0`/`2.5` 这类 float）与未知类型一律算非法** ⇒ 告警一次并按 schema
+# 默认 `False`。为什么连 `1.0` 也不收：参数是布尔，`2.5` 与 `1.0` 都说明"模型没按 schema
+# 发值"，此时按"非零即真"猜会让误发值变成真实开销；按默认 False 只会少抽帧，不会多花钱。
 # --------------------------------------------------------------------------- #
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
 _FALSE_LITERALS = frozenset({"", "0", "false", "no", "off"})
 
 
 def _as_bool(value: object) -> bool:
-    """把模型给的 `include_frames` 归一成 `bool`（纯函数，无副作用，只可能告警）。"""
+    """把模型给的 `include_frames` 归一成 `bool`（纯函数；非法值告警一次并回 `False`）。"""
     if isinstance(value, bool):
         return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    if isinstance(value, str):
+    if isinstance(value, int):  # 注意：`bool` 是 `int` 的子类，已在上一行拦掉
+        if value in (0, 1):
+            return bool(value)
+    elif isinstance(value, str):
         text = value.strip().lower()
         if text in _TRUE_LITERALS:
             return True

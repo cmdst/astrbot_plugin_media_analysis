@@ -24,6 +24,10 @@
 **任何模式都不打印配置值**：只打印点号键、动作、类型、长度（`len` 是长度不是内容）。
 stdout 里不出现 provider id 字面量，stderr 只打异常类名。
 
+**落盘不改权限**：目标文件原来的权限位会被**原样保留**（核心自己写 `cmd_config.json` 用
+0600，生产那份也是 0600）；`os.replace` 换的是 inode，不显式复制 mode 就会把 600 放宽成
+默认的 644 —— 那是把配置权限降级。原文件不存在时才用 0600。
+
 用法：
 
     python3 tools/migrate_config_v02.py --root <AstrBot 根>            # 干跑（默认）
@@ -44,6 +48,7 @@ import argparse
 import json
 import os
 import secrets
+import stat
 import sys
 import time
 from typing import NamedTuple
@@ -55,6 +60,9 @@ CMD_CONFIG_REL = os.path.join("data", "cmd_config.json")
 
 AUDIO_KEY = "provider_settings.audio_provider_id"
 LEGACY_KEY = "provider_settings.stt_provider_id"
+
+#: 目标文件不存在时的兜底权限（配置里有 provider id 与提示词，默认不给同机他人读）
+DEFAULT_CONFIG_MODE = 0o600
 
 # 11 个键的**书写顺序**（与 `_conf_schema.json` 一致）与展示用类型。
 # 只有前两条是本脚本"拥有"的（会改值）；其余仅报告 keep/skip。
@@ -269,17 +277,34 @@ def _load_json(path: str):
     return json.loads(raw.decode("utf-8-sig"))
 
 
+def _existing_mode(path: str) -> int | None:
+    """目标文件当前的权限位（`0o600` 这类）；不存在或取不到 ⇒ `None`。"""
+    try:
+        return stat.S_IMODE(os.stat(path).st_mode)
+    except OSError:
+        return None
+
+
 def _atomic_write(path: str, data: bytes) -> None:
-    """同目录 `.tmp-<pid>-<rand>` → `os.replace`（任一步失败 ⇒ 目标文件保持原样）。"""
+    """同目录 `.tmp-<pid>-<rand>` → `os.replace`；**原文件权限位原样保留**。
+
+    任一步失败 ⇒ 目标文件保持原样。`os.replace` 换的是 inode，不显式 `chmod` 的话新文件
+    会拿到默认 0644 ⇒ 把核心写的 0600 配置**降级**成同机可读（provider id 与提示词都在里面）。
+    原文件不存在（首次创建）⇒ 用 `DEFAULT_CONFIG_MODE`（0600）。
+    """
     directory = os.path.dirname(os.path.abspath(path))
+    mode = _existing_mode(path)
     tmp_path = os.path.join(
         directory, f".tmp-{os.getpid()}-{secrets.token_hex(4)}"
     )
     try:
-        with open(tmp_path, "wb") as handle:
+        # 先按 0600 建（`os.open` 的 mode 会被 umask 削，所以下面再 `chmod` 精确落位）
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, DEFAULT_CONFIG_MODE)
+        with os.fdopen(fd, "wb") as handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+        os.chmod(tmp_path, DEFAULT_CONFIG_MODE if mode is None else mode)
         os.replace(tmp_path, path)
     except BaseException:
         try:
