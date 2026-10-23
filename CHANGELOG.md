@@ -1,9 +1,14 @@
 # CHANGELOG
 
-## v0.2.0 — 2026-10-23（**待评审 / 待部署**）
+## v0.2.0 — 2026-10-23（**已评审通过；待推送 `main` / 待部署**）
 
 修掉 ops 查出的**上线后零成功**缺陷，并落四项产品优化。规格：`SPEC-v0.2.md`（dev lane 工作区，
 1220 行，冻结增量）。
+
+> 评审链：`t5` 全量双轴 → **NEEDS-WORK**（0 blocker / 1 high / 3 medium / 6 low）⇒ `e9ad82b`
+> 逐条修复 ⇒ `t10` 增量复核 **PASS**（F1 blocker / F2 权限 / F3 版本守卫全关，含变异检验）。
+> 门禁 **442 passed / 0 failed / 0 skipped / 0 xfail**，工作树与 `git archive e9ad82b` 的干净树
+> 两处一致。
 
 ### ① 群文件（`File` 段）—— 缺陷根因与修法
 
@@ -75,8 +80,44 @@
   `--report-legacy`；**任何模式都不打印配置值**（只有键名/动作/类型/长度）。
   搬值**带能力校验**：只有"该 id 是 chat 类且 `modalities` 明确含 `audio`"才搬，否则原样
   留在旧键并给原因码（`not_found` / `not_chat` / `no_audio`，退出码 2）。
-- **顺序不可换**：先上代码+schema → 重启 → 再跑迁移；反序时旧 schema 会把新键当 stale 删掉。
-  回滚成对（先回代码、再回配置、最后重启）。
+- **顺序不可换**：先上代码+schema → 重载 → 再跑迁移 → **再重载一次**（运行中的插件持有的是
+  内存里的配置快照）；反序时旧 schema 会把新键当 stale 删掉并 `save_config()`。
+  回滚成对且反向（先回代码、再回配置、最后重启）。细节见 `README.md`「v0.1 → v0.2 的顺序」。
+
+### 迁移要求（部署前读完这五条）
+
+1. **先备份，再动手**：插件目录 `cp -a` + 插件配置 `cp -a`（生产配置是 0600，备份也保持 0600）。
+   迁移脚本在本机（旧 `stt_provider_id` 为空）**预判 `changed=0`：不写盘、不产生 `.bak`**
+   ⇒ 回滚锚点只能来自这次手工备份。
+2. **先上代码，后迁移**：v0.2 的 schema 是**超集**（保留旧键 `stt_provider_id`）⇒ 代码先行安全；
+   反序会让 v0.1 的 schema 把新键当 stale 删掉并落盘。
+3. **迁移前后各重载一次**：第 ① 次重载让新 schema 补齐 7 个缺省键并落盘；迁移 `--apply` 之后
+   必须再重载，运行中的实例才会重新装配设置（`main._settings_cache`）。迁移完成到重载之间
+   **不要在面板上保存本插件配置**。
+4. **必配音频位**：`provider_settings.audio_provider_id` 需要选一个**模型能力勾了「音频」**的
+   对话 provider；留空会回落到核心当前对话 provider，它不支持音频时工具返回
+   `AUDIO_UNAVAILABLE`（明确错误码，不花钱）。
+5. **部署后必须真机复验 File 段视频**：群里发一条视频（本平台是以**群文件**投递的），
+   工具返回 `ok:true` + `kind:"video"`；同一视频第二次引用 ⇒ `cached:true` + `cache_age_s:<n>`。
+   这正是 v0.1 零成功的那个形态，不复验等于没修。
+
+### 状态与已知限制
+
+- **库内门禁**：`e9ad82b` 起 **442 passed / 0 failed / 0 skipped / 0 xfail**；`tests/` 18 个文件
+  已入库（含 `test_version.py` 的版本/仓库守卫、`MAPPING-v02.md` 的 113 条旧用例逐条映射）。
+- **上游仓库**：`https://github.com/cmdst/astrbot_plugin_media_analysis` **已存在**（2026-10-21 建，
+  公开、空仓、默认分支 `main`）；本库 `git remote -v` 仍为 **0 行** ⇒ 推送属下一单
+  （`git remote add origin git@github.com:cmdst/astrbot_plugin_media_analysis` + `push -u origin main`）。
+- **生产当前仍是 v0.1.0**（2026-10-23 00:58 安装，34 个文件、配置 191 B / 4 键）。
+  v0.2 **未部署** ⇒ 下面的"真 provider 调用"仍未在线上量过。
+- **未跑过真实多模态 provider 调用**（不花运营方额度）：`t4` 用真 `Provider` ABC 的假身验到协议
+  形状（`text_chat(prompt=…, audio_urls=[16 kHz/mono/s16 wav])`），真调用等上线后按
+  `SPEC-v0.2.md` §14 补量。
+- **已知遗留（v0.2.1，不是缺陷）**：迁移 `--apply` 丢 BOM（功能无影响，字节审计要留神）；
+  视频的 `audio_extracted` 与 `audio_normalized` 两条 note 语义重复（噪声）；`.file` / `get_file()`
+  的禁令只有运行时探针、无静态 AST 守卫；迁移器双入口名（实现 + shim）会让文档慢慢漂；
+  `file_download_needed` 与 `_resolve_file_path` 双份分支判定（只影响 note）；
+  `DiskCache.clear()` 目前没有生产调用者。
 
 ### 版本面
 
@@ -108,12 +149,16 @@
 - **文案**：缓存键的"11 分量"更正为 **10 个分量**（公式没动，数错的是数词），涉及
   `cache.py` 模块/函数 docstring、`analyze.py` 模块 docstring、`SPEC-v0.2.md` §6.1 标题、两处测试注释。
 
-### 已知状态（下一单处理）
+### 已被 v0.2 覆盖的 v0.1 事实（留档，别照抄）
 
-- **库内 `tests/` 仍是 v0.1 契约**（`resolve_stt_provider` / 4 键 / 16 码 / `ResultCache` /
-  `resolve_media_path(handle)` 旧签名）⇒ 现在跑门禁会红，属预期；`SPEC-v0.2.md` §12 的测试
-  计划由下一单（tester）落地。**本版未改任何测试文件**。
-- 未在真实 provider 上跑过（不花运营方额度）；真机验收按 `SPEC-v0.2.md` §14 的 6/7 两步补量。
+- v0.1 的"STT provider 五级回落阶梯"与 `STT_UNAVAILABLE` / `STT_FAILED` 两个码**整段删除**；
+  音频改由多模态 chat provider 的 `text_chat(audio_urls=…)` 承担（错误码换成
+  `AUDIO_UNAVAILABLE` / `AUDIO_FAILED` / `PROVIDER_CAPABILITY_MISMATCH`）。
+- v0.1 的进程内 `ResultCache`（LRU 32、不落盘）**已删**，换成带 TTL 的 `DiskCache`
+  （`data/plugin_data/<插件名>/cache/v1`，只存信封文本）。
+- v0.1 的"2 组 4 键"**已扩到 4 组 11 键**（`stt_provider_id` 保留但不生效）。
+- v0.1 记录的 `247 passed` / `26 个跟踪文件` / "生产未安装"**全部作废**：
+  现在是 **442 passed** / **34 个跟踪文件** / **生产已装 v0.1.0**（详见上一节）。
 
 ## v0.1.0 — 2026-10-22（**未发布 / 未安装**）
 
@@ -124,6 +169,8 @@
 > `/root/AstrBot/data/plugins/astrbot_plugin_media_analysis` **不存在**，`pin-check.sh` 无本插件条目
 > ⇒ 「未安装」是实测事实，不是"大概没装"。安装归 fix + 人，派单见
 > `/root/workspace/astrbot/handoff/lanes/dev/20261022-order-fix-deploy-media-analysis-v0.1.0.md`。
+> （**后话**：2026-10-23 00:58 该派单被执行，生产装上了 v0.1.0；上面这句只对 2026-10-22 成立。当前
+> 生产状态与 v0.2 待部署情况见本文件顶部的「状态与已知限制」。）
 
 ### 能力
 

@@ -40,9 +40,18 @@
 这类隐式分支：隐式分支＝不可预测的成本）。
 
 `include_frames` 收的是布尔，但**模型经常发字符串**（`"false"` 在 Python 里是真值）。
-门面按真值表归一：真＝`"1"/"true"/"yes"/"on"/非零数`，假＝`""/"0"/"false"/"no"/"off"/0`，
-其余非法值**告警一次并按默认 `False`**（`main._as_bool`）—— 不会因为模型手滑就静默多抽
-`max_frames` 帧、多花 `max_frames` 次视觉调用。
+门面按白名单归一（`main._as_bool`；字符串先 `strip`、再按**大小写不敏感**比对）：
+
+| 输入 | 判为 | 说明 |
+|---|---|---|
+| `bool` | 原值 | — |
+| 整数 `0` / `1` | `False` / `True` | **只认这两个整数** |
+| `"1" "true" "yes" "on"` | `True` | 大小写不敏感 |
+| `"" "0" "false" "no" "off"` | `False` | 大小写不敏感 |
+| 其它：`1.0` / `2.5` / `2` / `-1` / `None` / `"maybe"` / 未知类型 | **`False`（＝schema 默认值）** | 每次调用打一条 `WARNING`（带类型名，不带值） |
+
+保守方向是刻意的：**误发值只该少抽帧，不该多花钱** —— 按"非零即真"猜会让一次误发变成
+`max_frames` 次视觉调用；按默认 `False` 最坏只是这次没抽帧。
 
 成功信封（9 键，顺序固定）：
 
@@ -102,16 +111,21 @@
 
 ## 配置（4 组 / 11 键）
 
-| 键 | 类型 | 默认 | 说明 |
-|---|---|---|---|
-| `provider_settings.audio_provider_id` | string | `""` | 音频（多模态对话）provider，模型能力必须勾了「音频」；空＝回落核心当前对话 provider（不支持音频 ⇒ `AUDIO_UNAVAILABLE`） |
-| `provider_settings.vision_provider_id` | string | `""` | 读图的对话 provider；空＝核心当前对话 provider |
-| `provider_settings.stt_provider_id` | string | `""` | **【已弃用】** v0.2 起不生效，只为保留历史设置而留在 schema 里（删了会被核心静默删除并落盘） |
-| `prompts.audio` / `prompts.video` / `prompts.frame` / `prompts.summary` | text | 内置模板 | 见上一节 |
-| `limits.max_media_seconds` | int | `60` | 超过即 `MEDIA_TOO_LONG`；允许 5–300（越界钳位 + 告警） |
-| `limits.max_frames` | int | `6` | `include_frames=true` 时最多抽几帧；允许 1–12 |
-| `limits.max_media_bytes` | int | `67108864`（64 MiB） | 群文件取件的硬闸，超限 `MEDIA_TOO_LARGE`；允许 1 MiB–512 MiB |
-| `cache.ttl_seconds` | int | `86400`（1 天） | 缓存 TTL；`0`＝关闭缓存；允许 0–2592000（30 天） |
+v0.2 新增或改动的三组是 **`provider_settings`**（模型位：音频 / 视觉各一个多模态 chat
+provider）、**`prompts`**（4 份提示词）、**`cache`**（TTL）；`limits` 是 v0.1 就有的组，
+v0.2 只加了一个 `max_media_bytes`。键表（**11 个叶子键**，与 `settings.KEY_MAP`、
+`main._settings()`、迁移脚本 `KEY_ORDER` 四处互钉）：
+
+| 组 | 键 | 类型 | 默认 | 说明 |
+|---|---|---|---|---|
+| `provider_settings` | `audio_provider_id` | string | `""` | **v0.2 新增**。音频（多模态对话）provider，模型能力必须勾了「音频」；空＝回落核心当前对话 provider（不支持音频 ⇒ `AUDIO_UNAVAILABLE`） |
+| `provider_settings` | `vision_provider_id` | string | `""` | 读图的对话 provider；空＝核心当前对话 provider |
+| `provider_settings` | `stt_provider_id` | string | `""` | **【已弃用】** v0.2 起不生效，只为保留历史设置而留在 schema 里（删了会被核心静默删除并落盘）；值非空时打一条弃用 `WARNING`（不打值） |
+| `prompts` | `audio` / `video` / `frame` / `summary` | text | 内置模板 | **v0.2 新增**，见「提示词」节 |
+| `limits` | `max_media_seconds` | int | `60` | 超过即 `MEDIA_TOO_LONG`；允许 5–300（越界钳位 + 告警） |
+| `limits` | `max_frames` | int | `6` | `include_frames=true` 时最多抽几帧；允许 1–12 |
+| `limits` | `max_media_bytes` | int | `67108864`（64 MiB） | **v0.2 新增**。群文件取件的硬闸，超限 `MEDIA_TOO_LARGE`；允许 1 MiB–512 MiB |
+| `cache` | `ttl_seconds` | int | `86400`（1 天） | **v0.2 新增**。缓存 TTL；`0`＝关闭缓存；允许 0–2592000（30 天） |
 
 插件内**没有** API key 字段：模型一律走 AstrBot 的 provider 引用。
 `modalities` 取**严格口径**（`None`/缺省 ⇒ 不支持）：核心在两处按"未配置＝全支持"兜底，
@@ -168,29 +182,44 @@
 ### v0.1 → v0.2 的顺序（**不可换**）
 
 ```
-① 覆盖插件目录（新代码 + 新 schema） → ② 重启/重载 → ③ 跑迁移脚本 → ④ 验证
+① 备份（插件目录 + 插件配置） → ② 覆盖插件目录（新代码 + 新 schema） → ③ 重载（让新 schema 生效）
+   → ④ 迁移脚本（干跑 → --apply） → ⑤ 再重载一次（运行中的插件持有的是内存配置） → ⑥ 验证
 ```
 
 ```bash
-python3 tools/migrate_config_v02.py --root /root/AstrBot              # 干跑：逐键 + summary
-python3 tools/migrate_config_v02.py --root /root/AstrBot --apply      # 备份(0600)+原子落盘
-python3 tools/migrate_config_v02.py --root /root/AstrBot --report-legacy   # 旧键何时可删
+python3 tools/migrate_config_v02.py --root /root/AstrBot                    # 干跑（默认；逐键 + summary）
+python3 tools/migrate_config_v02.py --root /root/AstrBot --apply            # 备份(0600)+原子落盘
+python3 tools/migrate_config_v02.py --root /root/AstrBot --report-legacy    # 旧键何时可删（只读）
 ```
 
+> 脚本有两个名字：**实现是 `tools/migrate_config_v02.py`**（`v02` 带前导零，SPEC 与测试都指它），
+> `tools/migrate_config_v2.py` 是等价的转发 shim（派单文字里出现过这个名字）。两者输出与退出码一致。
+> 没有 `--dry-run` 开关：**不带 `--apply` 就是干跑**。
+
 - **反序会丢设置**：先迁移、后上代码时，**旧 schema** 不认识新键，下次加载会把
-  `provider_settings.audio_provider_id` 当 stale 键**删掉并落盘**。
-- 脚本**不造新键**（缺失的新键由核心 `check_config_integrity` 在加载时补默认），它负责
-  **备份 + 搬值 + 回滚锚点**。搬值**带能力校验**：旧 `stt_provider_id` 语义上是 STT id，
-  只有"该 id 是 chat 类且 `modalities` 明确含 `audio`"才搬到 `audio_provider_id`，否则
-  **原样留在旧键**并给原因码（`not_found` / `not_chat` / `no_audio`，退出码 2 等人工）。
+  `provider_settings.audio_provider_id` 当 stale 键**删掉并落盘**（核心
+  `check_config_integrity()` + `save_config()`，已用真核心复现，不是推测）。
+- **第 ⑤ 步不能省**：插件把配置快照存在内存里（`main._settings_cache`，`initialize()` 时装配），
+  迁移改了磁盘文件但**运行中的实例看不到**。同理，**迁移后到重载前不要在面板上保存本插件配置**
+  —— 核心会把内存里的旧 dict 写回，覆盖迁移结果。
+- 脚本**不造新键**（缺失的新键由核心 `check_config_integrity` 在加载时补默认并落盘），它负责
+  **备份 + 搬值 + 回滚锚点**。所以正常现场（旧值为空）**预判 `changed=0`：不写盘、不产生备份**
+  ⇒ 回滚锚点必须来自第 ① 步的手工 `cp -a`，不能指望脚本的 `.bak`。
+- 搬值**带能力校验**：旧 `stt_provider_id` 语义上是 STT id，只有"该 id 是 chat 类且
+  `modalities` 明确含 `audio`"才搬到 `audio_provider_id`，否则**原样留在旧键**并给原因码
+  （`not_found` / `not_chat` / `no_audio`，退出码 2 等人工）。
 - 任何模式都**不打印配置值**（只有键名/动作/类型/长度）。
 - **落盘不改权限**：备份固定 0600；**目标配置文件保留原权限位**（生产是 0600 ⇒ 迁移后仍是
   0600，不会被放宽成默认的 644）；目标不存在时才按 0600 新建。
-- **回滚成对**：回代码 → `--rollback <备份>` → 重启（`v0.1` 的 schema 不认识新键，
-  先回配置会被旧 schema 删；`v0.2` 的 schema 认识旧键，所以两个方向都不丢值）。
+- **落盘丢 BOM**（`--apply` 用 `json.dumps(...)` + `utf-8` 重写；核心自己读 `utf-8-sig`
+  ⇒ 功能无影响）。做**字节级**审计时注意：`--apply` 之后文件不再以 `EF BB BF` 开头。
+- **回滚成对且反向**：先回代码 → 再回配置（`--rollback <备份>` 或直接覆盖） → 重启
+  （`v0.1` 的 schema 不认识新键，先回配置会被旧 schema 删；`v0.2` 的 schema 认识旧键，
+  所以"先进可退、后缀可回"，两个方向都不丢值）。缓存可顺手清掉
+  （`rm -rf data/plugin_data/astrbot_plugin_media_analysis/cache`，无副作用）。
 
 完整派单（含备份/回滚/校验命令）在 dev lane 的交接地
-`/root/workspace/astrbot/handoff/lanes/dev/`。
+`/root/workspace/astrbot/handoff/lanes/dev/20261023-order-fix-deploy-media-analysis-v0.2.0.md`。
 
 ## 隐私与日志
 
