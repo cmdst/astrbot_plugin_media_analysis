@@ -1,5 +1,77 @@
 # CHANGELOG
 
+## v0.3.0 — 2026-10-24（**实现完成；待评审 / 待测试 / 待部署**）
+
+把**视频主路径**改成「原生视频直送多模态模型」，抽帧降级为**回退**；v0.2 的音频多模态、
+5 份提示词与结果缓存全部保留。规格：`SPEC-v0.3.md`（dev lane 工作区，706 行，冻结增量）；
+前置实测：`MEASURE-v0.3.md`（t8）。
+
+### ① 原生视频直送（核心内部面 + 三条护栏）
+
+- 形状冻结：`{"type":"video_url","video_url":{"url":"data:video/mp4;base64,…"}}`，发往
+  `{api_base}/chat/completions`（实测 Gemini 3.2 s / mimo 18.4 s 均 200 **且答对画面事实**）。
+- **核心 4.29.1 自己的 `text_chat` 放不进 video 块**：`ContentPart` 无 video 变体，
+  `assemble_context` 对未知块 `raise ValueError`（`openai_source.py:1424`，实跑复现）⇒
+  只能走 provider 底层 `client.chat.completions.create`（`openai_source.py:382`）。
+- 三条护栏：① `max_tokens` 硬下限 **1024**（有模型在 64 时 200 但正文为空）；② 空 `content` /
+  哨兵 `[无可用内容]`/`[无语音]` 判失败并回退；③ 自建 `asyncio.wait_for`
+  （`min(native_timeout_seconds, 剩余预算−15 s)`，底层调用绕过核心超时/重试）。
+- 整块 `try/except Exception`：缺失 `client`/适配器类型不符/调用抛错 ⇒
+  `video_native_unavailable`/`video_native_failed` ⇒ **回退**，绝不成为新的"静默拒载"点。
+
+### ② 抽帧降级为回退 + `include_frames` 三态
+
+- 链路固定为：原生 → （超门槛）压缩 → 抽帧（`vision_provider_id`）→ 错误信封。
+- `include_frames` 类型 `bool` → **`str`**：`auto`（默认）/`true`/`false`；旧布尔值仍接受。
+- **`false` + 原生失败 ⇒ 绝不静默抽帧**（用户的显式成本约束）；有音轨则只交转写。
+- 新增 3 个终态码：`VIDEO_UNAVAILABLE` / `VIDEO_FAILED` / `VIDEO_TOO_LARGE`（共 21 条，既有
+  18 条逐字未动）；新增 19 条 `video_*` note（词表总 39 条）。
+
+### ③ 压缩（超直送门槛时）
+
+- `scale=-2:480` + libx264 `veryfast` + ABR 双向钳制 + `aac 64k -ac 1`，最多 **2 趟**
+  （第二趟 ×0.95 修正），两趟共享 `compress_timeout_seconds`（默认 30）。
+- 预算 = `min(compress_target_bytes, max_direct_bytes)`；源已在预算内 ⇒ **0 次转码**。
+- 产物只落 `/tmp`（`media_analysis_*` 工作目录，`finally` 整目录删）；源文件**只读**。
+- 实测基线（生产样本只读）：48.9 s / 5.64 MB → 4 MiB 档 **3,939,056 B / 4,810 ms** 一次命中。
+
+### ④ L1 可见性探测（只做这一层）
+
+- 4 s / 1280x720 / ~150 KB 合成样片（画面正中 4 位白色数字 + 右下角黄色单词），固定提问，
+  **两条都命中才算过**（数字按字符串、单词大小写不敏感）。
+- 缓存 `data/plugin_data/<插件>/probe/v1/`，键含 `provider_id + model + PLUGIN_VERSION`，
+  TTL 默认 7 天、`0` = 关闭；每个 TTL 窗口**最多自动跑 1 次**（失败也写占位，防打爆）；
+  落盘失败静默降级为进程内记忆。
+- **不做体积阶梯探测**：实测两条通道到 47.2 MiB / 36.5 MiB 都 200（0 次拒绝）⇒ "体积上限"
+  不是事实，真正先撞的是延迟（9.4 MB≈43 s、18.6 MB≈91 s、38.3 MB≈193 s）。
+  `tools/probe_video_capability.py` 因此是**延迟校准工具**（输出 p50≤45 s 的最大档）。
+- **直送门槛建议表**（`settings.VIDEO_DIRECT_BYTES_SUGGESTIONS`：gemini-3*flash* ⇒ 8 MiB、
+  mimo ⇒ 4 MiB、其它 ⇒ 4 MiB）**只用于** ready 日志提示与校准工具的建议值，
+  **不参与运行期判定**（运行期只认 `video.max_direct_bytes`，避免"表与配置打架"）。
+
+### ⑤ 配置 11 → 21 键（5 组，四处互钉）
+
+- 新增 `provider_settings.video_provider_id` + `video` 组 8 键 + `prompts.video_native`；
+  v0.2 的 11 键**名字/类型/默认值一个都没动**（新 schema 是超集 ⇒ 代码先行）。
+- 新 `tools/migrate_config_v03.py`（干跑默认 / `--apply` 保留权限位 + 0600 备份 / `--report` /
+  `--rollback` / **不打印值**）；v0.2 的迁移器保留不动。
+- 布尔读取统一走 `ConfigView.flag()`（非 `bool` ⇒ 告警回默认）。
+
+### ⑥ 缓存键 `v2` → `v3`（10 → 12 分量）
+
+`v3 | digest | kind | mode | max_frames | prompts_fp | focus | audio_provider_id |
+video_provider_id | vision_provider_id | video_fp | PLUGIN_VERSION`；`mode` 与 `video_fp`
+是新增分量（三种模式不许互相命中；改门槛/开关即失效）。目录仍是 `cache/v1`，旧条目自然不命中。
+
+### 已知限制 / 未定（照 `MEASURE-v0.3.md` §7 原样登记）
+
+- 形状 B（`input_video`）未测；>47.2 MiB 未测；视频 URL 引用与非 mp4 容器不支持。
+- 代理（容器内 CLIProxyAPI）的 body 上限不可读 ⇒ 不区分"代理拒"与"上游拒"，任何失败都当
+  "原生不可用"回退。
+- 真实群媒体 / 真实群延迟未测 ⇒ 上线后用 `tools/probe_video_capability.py` 校准。
+- `NO_AUDIO_TRACK` / `NO_VIDEO_TRACK` 仍在码表里：前者在视频路径已被 `VIDEO_UNAVAILABLE`
+  取代（§7.4 表），后者仍是 `mode=true` 且无视频流时的判据。
+
 ## v0.2.0 — 2026-10-23（**已评审通过；待推送 `main` / 待部署**）
 
 修掉 ops 查出的**上线后零成功**缺陷，并落四项产品优化。规格：`SPEC-v0.2.md`（dev lane 工作区，

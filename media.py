@@ -26,6 +26,7 @@ import contextlib
 import hashlib
 import json
 import os
+import time
 from dataclasses import dataclass
 from urllib.parse import unquote
 
@@ -129,10 +130,35 @@ AUDIO_EXTS = frozenset(
     }
 )
 
+# v0.3 视频压缩的冻结参数（SPEC-v0.3 §6.2，取自 t8 实测）
+COMPRESS_HEIGHT_PX = 480  # `scale=-2:480`：720p→480p，竖屏 720x1280 同样落到高 480
+COMPRESS_VIDEO_PRESET = "veryfast"
+COMPRESS_AUDIO_KBPS = 64  # AAC 64 kbps 单声道
+COMPRESS_MIN_VIDEO_KBPS = 64  # 低于它就判"不可行"，不硬转（§6.1）
+COMPRESS_SECOND_PASS_FACTOR = 0.95  # 第二趟的修正系数（t8：285k→269k 命中）
+COMPRESS_MAX_PASSES = 2  # 硬上限：第 3 次起收益趋零（§6.3）
+
 # `ensure_provider_wav` 的目标形态（交给多模态 provider 的一律是这个）
 PROVIDER_WAV_CODEC = "pcm_s16le"
 PROVIDER_WAV_SAMPLE_RATE = "16000"
 PROVIDER_WAV_CHANNELS = "1"
+
+
+@dataclass(frozen=True)
+class CompressResult:
+    """一次压缩尝试的结果（`ok=False` 时 `reason` 只用于 note 与日志）。
+
+    `reason` ∈ `ok` / `infeasible`（码率低于下限）/ `timeout` / `ffmpeg_failed` /
+    `empty`（产物为空）/ `budget_exceeded`（两趟仍超预算）/ `not_smaller`（压了反而更大）。
+    """
+
+    ok: bool
+    path: str | None
+    size: int | None
+    source_size: int
+    reason: str
+    passes: int
+    no_audio: bool
 
 
 @dataclass(frozen=True)
@@ -716,6 +742,141 @@ async def extract_frames(
     return frames
 
 
+def compress_target_kbps(budget_bytes: int, duration_s: float) -> int:
+    """目标**视频**码率（SPEC-v0.3 §6.1 冻结公式）：`floor(budget*8/duration/1000) - 64`。
+
+    减掉的 64 是音频轨的固定开销（AAC 64 kbps 单声道）。返回值可能 < 64 ⇒ 调用方判
+    `video_compress_infeasible`（不硬转：那只会得到一段看不清的糊片）。
+    """
+    if budget_bytes <= 0 or duration_s <= 0:
+        return 0
+    total_kbps = int(budget_bytes * 8 / float(duration_s) / 1000)
+    return total_kbps - COMPRESS_AUDIO_KBPS
+
+
+def compress_argv(
+    source: str, out_path: str, *, video_kbps: int, has_audio: bool
+) -> list[str]:
+    """§6.2 冻结的 ffmpeg argv（ABR 双向钳制 + 480p + AAC 64k 单声道）。
+
+    源**没有音轨**时去掉 `-c:a …` 三参（否则 ffmpeg 会因为"没有音频输入"报错或产出
+    纯视频却带空音轨）—— 调用方据此加 `video_compressed_noaudio` note。
+    """
+    argv = [
+        "ffmpeg",
+        "-nostdin",
+        "-y",
+        "-v",
+        "error",
+        "-i",
+        source,
+        "-vf",
+        f"scale=-2:{COMPRESS_HEIGHT_PX}:flags=bicubic",
+        "-c:v",
+        "libx264",
+        "-preset",
+        COMPRESS_VIDEO_PRESET,
+        "-b:v",
+        f"{int(video_kbps)}k",
+        "-maxrate",
+        f"{int(video_kbps)}k",
+        "-bufsize",
+        f"{int(video_kbps) * 2}k",
+        "-pix_fmt",
+        "yuv420p",
+    ]
+    if has_audio:
+        argv += ["-c:a", "aac", "-b:a", f"{COMPRESS_AUDIO_KBPS}k", "-ac", "1"]
+    argv += ["-movflags", "+faststart", out_path]
+    return argv
+
+
+async def compress_video(
+    source_path: str,
+    *,
+    budget_bytes: int,
+    duration_s: float,
+    workdir: str,
+    has_audio: bool,
+    timeout_s: float,
+) -> "CompressResult":
+    """把视频压到 `budget_bytes` 以内（**最多 2 趟**，§6.3），失败只是一种"原因"，不抛。
+
+    为什么返回原因而不是抛 `ToolError`：压缩失败**不是**终态 —— 回退链还有"抽帧"这一跳
+    （§7.3-[5]）。把它抛成错误码就等于把"能看画面"的路径也弄丢了。
+
+    三条硬约束：
+    - 产物只落 `workdir`（调用方给的是 `/tmp/media_analysis_*`，`finally` 里整目录删）；
+    - 源文件**只读**：绝不覆盖 `path`、绝不写回 `data/`（§6.4）；
+    - 两次 pass 共享一个 `timeout_s` 预算（不是每次各一份）。
+    """
+    source_size = _size_of(source_path) or 0
+    no_audio = not has_audio
+    if source_size <= 0:
+        return CompressResult(False, None, None, source_size, "ffmpeg_failed", 0, no_audio)
+    if source_size <= budget_bytes:
+        # 源已在预算内 ⇒ **0 次转码**（t8：8 MiB 档 SKIP，0 ms）
+        return CompressResult(True, source_path, source_size, source_size, "ok", 0, no_audio)
+
+    kbps = compress_target_kbps(budget_bytes, duration_s)
+    if kbps < COMPRESS_MIN_VIDEO_KBPS:
+        return CompressResult(False, None, None, source_size, "infeasible", 0, no_audio)
+
+    deadline = time.monotonic() + max(1.0, float(timeout_s))
+    out_path = os.path.join(workdir, f"video_{int(budget_bytes)}.mp4")
+    passes = 0
+    size: int | None = None
+    reason = "ffmpeg_failed"
+    while passes < COMPRESS_MAX_PASSES:
+        passes += 1
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.2:
+            return CompressResult(False, None, size, source_size, "timeout", passes, no_audio)
+        argv = compress_argv(
+            source_path, out_path, video_kbps=kbps, has_audio=has_audio
+        )
+        rc, err, timed_out = await _run_capture(argv, timeout=remaining)
+        if timed_out:
+            return CompressResult(False, None, size, source_size, "timeout", passes, no_audio)
+        if rc != 0:
+            LOG.warning(
+                "media_analysis: 视频压缩失败（rc=%s, %s）",
+                rc,
+                err.decode("utf-8", "replace")[:160],
+            )
+            return CompressResult(
+                False, None, size, source_size, "ffmpeg_failed", passes, no_audio
+            )
+        size = _size_of(out_path)
+        if not size:
+            return CompressResult(False, None, None, source_size, "empty", passes, no_audio)
+        if size <= budget_bytes:
+            reason = "ok"
+            break
+        if passes >= COMPRESS_MAX_PASSES:
+            # 两趟仍超预算 ⇒ 判失败（不第 3 次：收益趋零、时间锯齿状上涨）
+            return CompressResult(
+                False, None, size, source_size, "budget_exceeded", passes, no_audio
+            )
+        # 第二趟：按实测体积等比修正（t8：285k ⇒ 2,098,819 B ⇒ 269k ⇒ 命中）
+        kbps = max(
+            COMPRESS_MIN_VIDEO_KBPS,
+            int(kbps * budget_bytes / size * COMPRESS_SECOND_PASS_FACTOR),
+        )
+    if reason != "ok" or size is None:
+        return CompressResult(False, None, size, source_size, reason, passes, no_audio)
+    if size >= source_size:
+        return CompressResult(False, None, size, source_size, "not_smaller", passes, no_audio)
+    LOG.info(
+        "media_analysis: 视频压缩 %d B → %d B（预算 %d B，%d 趟）",
+        source_size,
+        size,
+        budget_bytes,
+        passes,
+    )
+    return CompressResult(True, out_path, size, source_size, "ok", passes, no_audio)
+
+
 async def content_digest(path: str) -> str:
     """内容哈希：`sha256(文件字节).hexdigest()[:16]`（实测 5.3 MB → 0.01 s）。"""
     try:
@@ -821,6 +982,37 @@ async def _ffmpeg_to_wav(source: str, out_wav: str) -> str:
             log_detail=f"rc={rc} stderr={err.decode('utf-8', 'replace')[:160]!r}",
         )
     return out_wav
+
+
+def read_bytes(path: str) -> bytes:
+    """一次读入整个文件（**已过 stat 闸**之后才允许调；`video_native` 在 base64 后立刻释放）。
+
+    单独成函数的两条理由：① 让"有没有先读再判"变成可测的形状（monkeypatch 它即可
+    断言"超标时根本没读"）；② 同步实现交给 `asyncio.to_thread`，不阻塞事件循环。
+    """
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+async def _run_capture(argv: list[str], *, timeout: float) -> tuple[int, bytes, bool]:
+    """跑一次 argv 并返回 `(rc, stderr, timed_out)`；**不抛**（压缩要自己决定怎么降级）。"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except (FileNotFoundError, OSError):
+        return -1, b"spawn failed", False
+    try:
+        _out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (asyncio.TimeoutError, TimeoutError):
+        with contextlib.suppress(Exception):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await proc.wait()
+        return -1, b"timeout", True
+    return (proc.returncode if proc.returncode is not None else -1), err, False
 
 
 def _size_of(path: str) -> int | None:

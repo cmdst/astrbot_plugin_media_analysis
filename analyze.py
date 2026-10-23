@@ -1,21 +1,24 @@
-"""主链路编排（SPEC-v0.2 §9 冻结顺序）：缓存 → 音轨转写 → 按需抽帧+描述 → 摘要 → 信封。
+"""主链路编排（SPEC-v0.2 §9 + SPEC-v0.3 §7 冻结顺序）。
 
-v0.1 → v0.2 的四处结构性变化：
-1. **音频改走多模态 chat**：`text_chat(prompt=<提示词>, audio_urls=[16k/mono wav])`
-   （不再有 `STTProvider` 链路），异常一律映射 `AUDIO_FAILED`（§2.3 冻结表）；
-2. **提示词可配置**：4 份（audio / video / frame / summary），空串回退内置默认，
-   坏值回退 + 告警，超长截断（§7.1）；
-3. **结果落盘缓存带 TTL**：`cache.build_key` 的 10 个分量键 + `singleflight` 同键串行化，
-   命中回 `cached=true` + **本次**真实耗时 + `cache_hit` / `cache_age_s:<n>`（§6.3）；
-4. **`File` 段进主流程**：`media.classify` 一次拿 `(kind, duration, has_audio, has_video)`
-   （`File` 走三段梯子），音轨阶段不再重复 ffprobe。
+v0.2 → v0.3 的结构性变化（一句话：**视频主路径改成"原生视频直送"，抽帧降级为回退**）：
 
-三个阶段都可能降级，但**降级的形状是固定的**：
-- 用户主诉求（转写 / 看画面）无法满足 ⇒ `ToolError`（错误码见 `envelope`）；
-- 附加项失败（某帧描述、摘要）⇒ 成功信封 + `notes` 词表里的一条（§8.2，20 条）。
+1. **视频原生直送**：`provider.client.chat.completions.create(messages=[…video_url…])`
+   （核心 `text_chat` 放不进 video 块，`openai_source.py:1424` 硬抛 `ValueError`）；
+   形状与三条护栏在 `video_native`，这里只管编排。
+2. **压缩在直送之前**：超 `video.max_direct_bytes` 先用 ffmpeg 压到预算（最多 2 趟），
+   压不动才轮到抽帧 —— 顺序**不许反**（§6.5：压缩 4.8 s / 0 token，抽帧是 6 次视觉调用）。
+3. **抽帧只是回退**：原生不可用 / 超门槛且压不动 / 调用失败时，才按 `include_frames`
+   三态决定要不要抽帧（`vision_provider_id` 是**仅回退**用的图片模型位）。
+4. **`include_frames` 变三态字符串** `auto|true|false`（旧布尔值仍接受）：
+   `false` + 原生失败 ⇒ **绝不静默抽帧**（那是偷偷花两份钱）。
+5. **L1 可见性探测**（首次，缓存 7 天）+ **100 s 预算的 `remaining` 递减**。
+
+三个阶段的降级形状仍然固定：
+- 用户主诉求（转写 / 看画面）无法满足 ⇒ `ToolError`（错误码见 `envelope`，21 条）；
+- 附加项失败（某帧描述、摘要、压缩、探测）⇒ 成功信封 + `notes` 里的一条（39 条词表）。
 
 本模块**自己建/删工作目录**（`tempfile.mkdtemp(prefix="media_analysis_")`，落在 `/tmp`），
-调用方不需要关心临时目录；中间产物（wav / 抽帧 jpg / 群文件下载物）用完即删，
+调用方不需要关心临时目录；中间产物（wav / 抽帧 jpg / 压缩产物 / 群文件下载物）用完即删，
 不落库、不落工作区、不落生产 `data/`。
 """
 
@@ -30,10 +33,10 @@ from astrbot.api import logger as LOG
 
 # 别名：冻结签名里 `settings` / `cache` 是**形参名**，模块名直接 import 会被遮住。
 from . import cache as cache_mod
-from . import envelope, media, providers
+from . import envelope, media, probe, providers, video_native
 from . import settings as settings_mod
 
-# ---- 预算（SPEC-v0.2 §2.2 / SPEC.md §7.1）----
+# ---- 预算（SPEC-v0.2 §2.2 / SPEC-v0.3 §5.2）----
 DEADLINE_S = 100.0  # 全局预算；框架 tool_call_timeout=120 s，留 20 s 余量
 PROBE_TIMEOUT_S = 10.0  # 单次 ffprobe（实测 0.019 s，只防病态文件）
 AUDIO_TIMEOUT_S = 60.0  # 单次多模态调用（含上传：60 s 音频 2.44 MiB base64）
@@ -43,6 +46,27 @@ SUMMARY_TIMEOUT_S = 15.0  # 摘要 text_chat；剩余预算少于它就不做摘
 FRAME_WIDTH_PX = 768  # 与 media.FRAME_WIDTH_PX 同值（SPEC.md §3.2 冻结常量）
 FOCUS_MAX_CHARS = 200
 WORKDIR_PREFIX = "media_analysis_"  # 中间产物只落 /tmp（SPEC.md §9-4）
+
+# ---- v0.3 预算护栏（§5.2 推论 2/3、§7.2 护栏③）----
+NATIVE_RESERVE_S = 15.0  # 原生调用之后必须留出的余量（`min(上限, remaining - 15)`）
+PROBE_BUDGET_RESERVE_S = 30.0  # 跑 L1 还要留的量（`remaining < L1_TIMEOUT + 30` ⇒ 不跑）
+FRAMES_MIN_BUDGET_S = 25.0  # 任一跳之后剩余 < 25 s ⇒ 不再起抽帧回退（推论 3）
+
+# ---- `include_frames` 三态（SPEC-v0.3 §7.1）----
+MODE_AUTO = "auto"
+MODE_TRUE = "true"
+MODE_FALSE = "false"
+MODES: frozenset[str] = frozenset({MODE_AUTO, MODE_TRUE, MODE_FALSE})
+
+_TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
+_FALSE_LITERALS = frozenset({"", "0", "false", "no", "off"})
+
+# ---- 原生通道的四种状态（只用于"没有回退时该报哪个码"，§7.4）----
+NATIVE_OK = "ok"
+NATIVE_UNAVAILABLE = "unavailable"  # 键空 / 非 openai 适配器 / 无 client / L1 未过 / 预算不足
+NATIVE_FAILED = "failed"  # 调用失败或超时
+NATIVE_EMPTY = "empty"  # 200 但空文本（或哨兵）
+NATIVE_TOO_LARGE = "too_large"  # 门槛超限且压缩没成功/被关
 
 # ---- 提示词的**固定片段**（模板本身可配置，见 settings.DEFAULT_PROMPTS）----
 FRAME_FOCUS_CLAUSE = (
@@ -56,10 +80,78 @@ SUMMARY_TASK_FOCUS = (
 )
 SUMMARY_MATERIAL_PREFIX = "\n\n材料：\n"
 NO_SPEECH_SENTINEL = "[无语音]"
+NO_CONTENT_SENTINEL = "[无可用内容]"
+EMPTY_SENTINELS: frozenset[str] = frozenset({NO_SPEECH_SENTINEL, NO_CONTENT_SENTINEL})
 
 _KIND_CN = {"audio": "语音", "video": "视频"}
-# 提示词在 `settings.prompts` 4 元组里的下标（顺序冻结：audio, video, frame, summary）
-_PROMPT_INDEX = {"audio": 0, "video": 1, "frame": 2, "summary": 3}
+# 提示词在 `settings.prompts` 5 元组里的下标（顺序冻结：audio, video, frame, summary,
+# video_native —— 前四位沿用 v0.2，新键在末位）
+_PROMPT_INDEX = {
+    "audio": 0,
+    "video": 1,
+    "frame": 2,
+    "summary": 3,
+    "video_native": 4,
+}
+
+# 终态码映射（§7.4）：**没有可用回退**时，按"为什么没直送"给码
+_TERMINAL_CODE = {
+    NATIVE_UNAVAILABLE: envelope.ERR_VIDEO_UNAVAILABLE,
+    NATIVE_FAILED: envelope.ERR_VIDEO_FAILED,
+    NATIVE_EMPTY: envelope.ERR_VIDEO_FAILED,
+    NATIVE_TOO_LARGE: envelope.ERR_VIDEO_TOO_LARGE,
+}
+
+_PROBE_STORE: probe.ProbeStore | None = None
+
+
+def is_valid_mode_value(value: object) -> bool:
+    """这个值本身是否合法（决定工具门面要不要打一条 WARNING）。
+
+    与 `normalize_mode` 分开的两个理由：① 归一函数保持**纯函数**（多次调用不产生日志噪声）；
+    ② 告警是**门面**的职责（唯一的生产入口是 `main._as_mode`），不该埋在链路深处。
+    """
+    if isinstance(value, bool) or value is None:
+        return True
+    if isinstance(value, str):
+        text = value.strip().lower()
+        return text in MODES or text in _TRUE_LITERALS or text in _FALSE_LITERALS
+    return False
+
+
+def normalize_mode(value: object) -> str:
+    """把模型/调用方给的 `include_frames` 归一成 `"auto" | "true" | "false"`（§13.1）。
+
+    | 输入 | 输出 |
+    | --- | --- |
+    | `bool` | `true` / `false`（旧客户端兼容） |
+    | `"auto"/"true"/"false"`（去空白、大小写不敏感） | 原样 |
+    | `"1"/"yes"/"on"` | `true` |
+    | `"0"/"no"/"off"/""` | `false` |
+    | `None` | `auto` |
+    | 其它（`2.5`、`{}`、未知字符串…） | **`auto`** + 一条 WARNING |
+
+    为什么非法值默认 `auto` 而**不再**默认 `false`（与 v0.2 相反）：v0.3 的主路径本身
+    就是"看视频"，误发值按 `auto` 走只多一次原生调用；按 `false` 会把它悄悄降级成
+    "只转写"，而用户以为画面也被看了。
+
+    **纯函数、不告警**：告警在门面（`main._as_mode`，配 `is_valid_mode_value` 判定）——
+    这样本函数可以在测试里被调 20 次而不制造日志噪声。
+    """
+    if isinstance(value, bool):  # 注意：bool 是 int 的子类，必须先判
+        return MODE_TRUE if value else MODE_FALSE
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in MODES:
+            return text
+        if text in _TRUE_LITERALS:
+            return MODE_TRUE
+        if text in _FALSE_LITERALS:
+            return MODE_FALSE
+        return MODE_AUTO
+    if value is None:
+        return MODE_AUTO
+    return MODE_AUTO
 
 
 async def analyze(
@@ -68,17 +160,18 @@ async def analyze(
     event,
     target: str,
     focus: str,
-    include_frames: bool,
+    include_frames: object,
     settings: settings_mod.Settings,
     cache: cache_mod.DiskCache,
 ) -> dict[str, object]:
     """跑完整条链路，返回**成功信封**（9 键）；受控失败抛 `envelope.ToolError`。
 
-    步骤号与 SPEC-v0.2 §9 一致（0–13），便于对着规格评审。
+    步骤号与 SPEC-v0.3 §7.3 的七跳一致（[0]–[7]），便于对着规格评审。
     """
-    started = time.monotonic()  # 0
+    started = time.monotonic()  # [0]
     deadline = started + DEADLINE_S
     notes: list[str] = []
+    mode = normalize_mode(include_frames)
     workdir = tempfile.mkdtemp(prefix=WORKDIR_PREFIX)
     try:
         # 1 —— focus 去空白 + 截断；配置里的上限已钳位
@@ -112,17 +205,19 @@ async def analyze(
                 log_detail=f"duration_s={duration_s} max_media_seconds={max_seconds}",
             )
 
-        # 5 —— 内容哈希 + 缓存键
+        # 5 —— 内容哈希 + 缓存键（v3：12 分量，含 mode 与 video_fp）
         digest = await media.content_digest(path)
         key = cache_mod.build_key(
             digest=digest,
             kind=kind,
-            include_frames=include_frames,
+            mode=mode,
             max_frames=max_frames,
             focus=focus_text,
             prompts_fp=settings.prompts_fp,
             audio_provider_id=settings.audio_provider_id,
+            video_provider_id=settings.video_provider_id,
             vision_provider_id=settings.vision_provider_id,
+            video_fp=settings.video_fp,
             plugin_version=settings_mod.PLUGIN_VERSION,
         )
 
@@ -132,129 +227,41 @@ async def analyze(
             if hit is not None:
                 return _replay(hit, started)
 
-            # 7 —— 音频 provider（仅当真要走音轨阶段才解析：无音轨 + 只抽帧时不该
-            #       被"没配音频模型"连累；这与 §9 第 10 步"视觉解析挪进抽帧阶段"同一口径）
-            needs_audio = not (kind == "video" and not has_audio)
-            audio_provider = None
-            if needs_audio:
-                audio_provider = await providers.resolve_audio_provider(
-                    context, settings.audio_provider_id, _umo(event)
+            if kind == "video":
+                transcript, frames, summary = await _video_stage(
+                    context=context,
+                    event=event,
+                    path=path,
+                    duration_s=duration_s,
+                    has_audio=has_audio,
+                    has_video=has_video,
+                    mode=mode,
+                    focus=focus_text,
+                    max_frames=max_frames,
+                    deadline=deadline,
+                    notes=notes,
+                    settings=settings,
+                    workdir=workdir,
                 )
-
-            # 8 —— 流标志已在第 4 步拿到（File 已在 classify 内探过，不重复 ffprobe）
-
-            # 9 —— 音轨阶段
-            transcript: list[dict[str, object]] = []
-            if not needs_audio:
-                if not include_frames:
-                    # 主诉求就是转写 ⇒ 无音轨是错误，不是降级（§8.1）
-                    raise envelope.ToolError(
-                        envelope.ERR_NO_AUDIO_TRACK,
-                        log_detail=f"duration_s={duration_s} include_frames=false",
-                    )
-                notes.append("no_audio_track")
             else:
-                wav_path = await media.ensure_provider_wav(
-                    path, workdir=workdir, extracted=(kind == "video")
-                )
-                if kind == "video":
-                    notes.append("audio_extracted")
-                    media.track_temporary_local_file(event, wav_path)
-                if wav_path != path:
-                    notes.append("audio_normalized")
-                prompt = _audio_prompt(kind, focus_text, settings, notes)
-                text = await transcribe(
-                    audio_provider, wav_path, prompt, deadline=deadline, notes=notes
-                )
-                if text:
-                    transcript.append({"t": 0.0, "text": text})
-                notes.append(
-                    f"audio_provider:{providers.provider_id_of(audio_provider)}"
+                transcript, frames, summary = await _audio_stage(
+                    context=context,
+                    event=event,
+                    path=path,
+                    mode=mode,
+                    focus=focus_text,
+                    deadline=deadline,
+                    notes=notes,
+                    settings=settings,
+                    workdir=workdir,
                 )
 
-            # 10 —— 抽帧阶段（仅 include_frames 且视频；§7 口径逐字沿用 v0.1）
-            frames: list[dict[str, object]] = []
-            vision = None
-            if include_frames and kind == "audio":
-                notes.append("frames_skipped_audio_only")
-            elif include_frames and kind == "video":
-                if not has_video:
-                    raise envelope.ToolError(
-                        envelope.ERR_NO_VIDEO_TRACK,
-                        log_detail=f"duration_s={duration_s} include_frames=true",
-                    )
-                extracted, truncated = await _extract_frames_budgeted(
-                    path, max_frames, duration_s, workdir, deadline, notes
-                )
-                if truncated:
-                    # 预算不足：抽帧降级为 0 帧，**不**判死整次调用（手上的转写照常交付）
-                    LOG.info(
-                        "media_analysis: 抽帧因预算不足被截断（0/%d），继续走摘要",
-                        max_frames,
-                    )
-                elif not extracted:
-                    raise envelope.ToolError(
-                        envelope.ERR_FRAME_EXTRACT_FAILED,
-                        log_detail=f"0/{max_frames} frames",
-                    )
-                else:
-                    vision = await providers.resolve_vision_provider(
-                        context, settings.vision_provider_id, _umo(event)
-                    )
-                    frames = await describe_frames(
-                        vision,
-                        extracted,
-                        focus=focus_text,
-                        deadline=deadline,
-                        notes=notes,
-                        settings=settings,
-                    )
-                    notes.append(f"vision_provider:{providers.provider_id_of(vision)}")
-
-            # 11 —— 摘要阶段（材料拼法不变 + §7.3 的尾部截断）
-            material = _build_material(transcript, frames)
-            if len(material) > settings_mod.MATERIAL_MAX_CHARS:
-                material = material[: settings_mod.MATERIAL_MAX_CHARS]
-                notes.append("material_trimmed")
-            summary = ""
-            if not material:
-                summary = ""
-            elif deadline - time.monotonic() < SUMMARY_TIMEOUT_S:
-                notes.append("summary_skipped_budget")
-            else:
-                chat = vision
-                if chat is None:
-                    try:
-                        chat = await providers.resolve_chat_provider(
-                            context,
-                            settings.vision_provider_id,
-                            _umo(event),
-                            require_image=False,
-                        )
-                    except envelope.ToolError as exc:
-                        # 摘要失败**不**把整次调用判死（§9 第 11 步）
-                        LOG.warning(
-                            "media_analysis: 摘要 provider 不可用（%s）", exc.code
-                        )
-                        chat = None
-                if chat is None:
-                    notes.append("summary_failed")
-                else:
-                    summary = await build_summary(
-                        chat,
-                        material=material,
-                        focus=focus_text,
-                        notes=notes,
-                        kind=kind,
-                        settings=settings,
-                    )
-
-            # 12 —— 信封 + 入缓存 + 结构化日志（只打结构/计数/耗时）
-            if include_frames and kind == "video" and not transcript and not frames:
-                # 诚实兜底：要画面却一帧没拿到、转写也没有 ⇒ 别给模型一个空成功
+            # 7 —— 信封 + 入缓存 + 结构化日志（只打结构/计数/耗时）
+            if kind == "video" and not transcript and not frames and not summary:
+                # 诚实兜底：什么都没拿到 ⇒ 别给模型一个空成功
                 raise envelope.ToolError(
                     envelope.ERR_FRAME_EXTRACT_FAILED,
-                    log_detail="include_frames=true 但 transcript 与 frames 都为空",
+                    log_detail=f"mode={mode} 但 transcript 与 frames 都为空",
                 )
             payload = envelope.ok_envelope(
                 kind=kind,
@@ -268,9 +275,10 @@ async def analyze(
             )
             await cache.put(key, payload)
             LOG.info(
-                "media_analysis: ok kind=%s duration_s=%.2f frames=%d "
+                "media_analysis: ok kind=%s mode=%s duration_s=%.2f frames=%d "
                 "transcript_chars=%d notes=%d elapsed_ms=%d",
                 kind,
+                mode,
                 duration_s,
                 len(frames),
                 len(transcript[0]["text"]) if transcript else 0,
@@ -279,8 +287,483 @@ async def analyze(
             )
             return payload
     finally:
-        # 13 —— 中间产物只落 /tmp，用完即删（SPEC.md §9-4）
+        # 8 —— 中间产物（含压缩产物）只落 /tmp，用完即删
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
+# 语音消息：v0.2 链路原样（转写 → 摘要）
+# --------------------------------------------------------------------------- #
+async def _audio_stage(
+    *,
+    context,
+    event,
+    path: str,
+    mode: str,
+    focus: str,
+    deadline: float,
+    notes: list[str],
+    settings: settings_mod.Settings,
+    workdir: str,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], str]:
+    """纯语音消息：只做音轨转写 + 摘要（v0.2 语义不变；`mode` 只多一条 note）。"""
+    if mode != MODE_FALSE:
+        notes.append("frames_skipped_audio_only")
+    transcript = await _transcribe_path(
+        context,
+        event,
+        path=path,
+        kind="audio",
+        focus=focus,
+        deadline=deadline,
+        notes=notes,
+        settings=settings,
+        workdir=workdir,
+    )
+    summary = await _summary_stage(
+        context,
+        event,
+        transcript=transcript,
+        frames=[],
+        focus=focus,
+        kind="audio",
+        deadline=deadline,
+        notes=notes,
+        settings=settings,
+    )
+    return transcript, [], summary
+
+
+# --------------------------------------------------------------------------- #
+# 视频：原生 → 压缩 → 抽帧（SPEC-v0.3 §7.3 七跳）
+# --------------------------------------------------------------------------- #
+async def _video_stage(
+    *,
+    context,
+    event,
+    path: str,
+    duration_s: float,
+    has_audio: bool,
+    has_video: bool,
+    mode: str,
+    focus: str,
+    max_frames: int,
+    deadline: float,
+    notes: list[str],
+    settings: settings_mod.Settings,
+    workdir: str,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], str]:
+    """视频七跳：[1] 视频位 → [2] L1 → [3] 直送闸/压缩 → [4] 原生 → [5] 回退 → [6] 摘要。
+
+    返回 `(transcript, frames, summary)`：原生成功时前两项是 `[]`、`summary` 是模型整段回答
+    （`transcript=[]` 是**显式取舍**：不做"原生 + 音轨"双跑，§16.2-7）。
+    """
+    # [1]-[4] 原生通道 + 直送闸 + 原生调用
+    native_state = NATIVE_UNAVAILABLE
+    if has_video:
+        provider = await _native_channel(
+            context, settings, deadline, notes, workdir=workdir
+        )
+        if provider is not None:
+            text, native_state = await _native_attempt(
+                provider,
+                path=path,
+                duration_s=duration_s,
+                has_audio=has_audio,
+                focus=focus,
+                settings=settings,
+                deadline=deadline,
+                notes=notes,
+                workdir=workdir,
+            )
+            if native_state == NATIVE_OK:
+                return [], [], text
+    elif mode == MODE_TRUE:
+        # 没有视频流却点名要画面 ⇒ v0.2 的判据逐字沿用
+        raise envelope.ToolError(
+            envelope.ERR_NO_VIDEO_TRACK,
+            log_detail=f"duration_s={duration_s} include_frames=true",
+        )
+
+    # [5] 回退：音轨（v0.2 链路）+ 按三态决定是否抽帧
+    transcript: list[dict[str, object]] = []
+    if has_audio:
+        transcript = await _transcribe_path(
+            context,
+            event,
+            path=path,
+            kind="video",
+            focus=focus,
+            deadline=deadline,
+            notes=notes,
+            settings=settings,
+            workdir=workdir,
+        )
+    else:
+        notes.append("no_audio_track")
+
+    frames = await _frames_fallback(
+        context,
+        event,
+        path=path,
+        duration_s=duration_s,
+        has_audio=has_audio,
+        has_video=has_video,
+        mode=mode,
+        focus=focus,
+        max_frames=max_frames,
+        native_state=native_state,
+        deadline=deadline,
+        notes=notes,
+        settings=settings,
+        workdir=workdir,
+    )
+
+    # [6] 摘要（v0.2 逻辑；原生成功时上面已 return）
+    summary = await _summary_stage(
+        context,
+        event,
+        transcript=transcript,
+        frames=frames,
+        focus=focus,
+        kind="video",
+        deadline=deadline,
+        notes=notes,
+        settings=settings,
+    )
+    return transcript, frames, summary
+
+
+async def _frames_fallback(
+    context,
+    event,
+    *,
+    path: str,
+    duration_s: float,
+    has_audio: bool,
+    has_video: bool,
+    mode: str,
+    focus: str,
+    max_frames: int,
+    native_state: str,
+    deadline: float,
+    notes: list[str],
+    settings: settings_mod.Settings,
+    workdir: str,
+) -> list[dict[str, object]]:
+    """抽帧回退（§7.3-[5]）。**`mode=false` 任何组合都不许走到这里抽帧**。
+
+    四种不抽帧的情形要分清（每一种都只降级，不判死整次调用）：
+    - `mode=false`：用户的显式成本约束 ⇒ note `video_frames_forbidden`；
+    - `mode=auto` 且 `vision_provider_id` 空：不猜、不回落核心对话 provider
+      （§7.1 表格：auto 的"允许"以 `vision_provider_id` 非空为前提）⇒ note
+      `video_no_vision_provider`；`mode=true` 同情形 ⇒ `VISION_UNAVAILABLE`；
+    - 容器里没有视频流 ⇒ 抽帧无从谈起（`mode=true` 已在 `_video_stage` 判 `NO_VIDEO_TRACK`）；
+    - 剩余预算 < 25 s ⇒ note `video_skip_budget`（预算优先于功能）。
+
+    这些都只降级；只有**没有音轨**时（既没转写也没画面）才按 §7.4 给终态码。
+    """
+    if mode == MODE_FALSE:
+        notes.append("video_frames_forbidden")
+        return _terminal_or_empty(native_state, has_audio, "mode=false")
+
+    if not settings.vision_provider_id:
+        if mode == MODE_TRUE:
+            raise envelope.ToolError(
+                envelope.ERR_VISION_UNAVAILABLE,
+                log_detail="mode=true 但 vision_provider_id 为空",
+            )
+        notes.append("video_no_vision_provider")
+        return _terminal_or_empty(native_state, has_audio, "mode=auto no vision id")
+
+    if not has_video:
+        return _terminal_or_empty(native_state, has_audio, "no video stream")
+
+    if deadline - time.monotonic() < FRAMES_MIN_BUDGET_S:
+        notes.append("video_skip_budget")
+        return _terminal_or_empty(native_state, has_audio, "frames budget")
+
+    vision = await providers.resolve_vision_provider(
+        context, settings.vision_provider_id, _umo(event)
+    )
+    extracted, truncated = await _extract_frames_budgeted(
+        path, max_frames, duration_s, workdir, deadline, notes
+    )
+    if truncated:
+        # 预算不足：抽帧降级为 0 帧，**不**判死整次调用（手上的转写照常交付）
+        LOG.info(
+            "media_analysis: 抽帧因预算不足被截断（0/%d），继续走摘要", max_frames
+        )
+        return []
+    if not extracted:
+        raise envelope.ToolError(
+            envelope.ERR_FRAME_EXTRACT_FAILED,
+            log_detail=f"0/{max_frames} frames",
+        )
+    notes.append("video_fallback_frames")
+    frames = await describe_frames(
+        vision,
+        extracted,
+        focus=focus,
+        deadline=deadline,
+        notes=notes,
+        settings=settings,
+    )
+    notes.append(f"vision_provider:{providers.provider_id_of(vision)}")
+    return frames
+
+
+def _terminal_or_empty(
+    native_state: str, has_audio: bool, why: str
+) -> list[dict[str, object]]:
+    """没抽帧时：有音轨 ⇒ 空帧列表（只交转写）；无音轨 ⇒ 按 `native_state` 给终态码。"""
+    if has_audio:
+        return []
+    code = _TERMINAL_CODE.get(native_state, envelope.ERR_VIDEO_UNAVAILABLE)
+    raise envelope.ToolError(code, log_detail=f"no audio track; {why}")
+
+
+async def _native_channel(
+    context,
+    settings: settings_mod.Settings,
+    deadline: float,
+    notes: list[str],
+    *,
+    workdir: str,
+) -> object | None:
+    """§7.3-[1]/[2]：解析视频位 + （首次）跑 L1 可见性探测。
+
+    返回可用的 provider，或 `None`（没有原生通道）。**不抛**"没有通道"这类软失败
+    —— 那是回退链的入口，不是错误；只有"配置写错"（id 不存在 / 不是 Provider）才抛。
+    """
+    if settings.video_provider_id:
+        notes.append("video_asserted")
+    provider, _reason = await providers.resolve_video_provider(
+        context, settings.video_provider_id
+    )
+    if provider is None:
+        notes.append("video_native_unavailable")
+        return None
+    notes.append(f"video_provider:{providers.provider_id_of(provider)}")
+
+    ttl = int(settings.video_probe_ttl_seconds)
+    if not settings.video_probe_enabled or ttl <= 0:
+        # 运营方的逃生门：信任"显式声明"直接直送（§3.4；不推荐长期关，§16.1-R5）
+        notes.append("video_probe_disabled")
+        return provider
+
+    if deadline - time.monotonic() < probe.L1_TIMEOUT_S + PROBE_BUDGET_RESERVE_S:
+        notes.append("video_skip_budget")
+        return None
+
+    outcome = await probe.ensure_l1(
+        provider,
+        provider_id=providers.provider_id_of(provider),
+        model=video_native.model_of(provider),
+        plugin_version=settings_mod.PLUGIN_VERSION,
+        ttl_seconds=ttl,
+        workdir=workdir,
+        store=_probe_store(),
+    )
+    # 注记口径（§11.2 的"本次实跑"限定 + §2.2-⑥ 的缓存未通过）：
+    #   缓存命中且通过   ⇒ 只有 video_probe_cached（没有实跑，就不该说"本次 L1 通过"）
+    #   缓存命中且未通过 ⇒ video_probe_cached + video_probe_l1_failed（§2.2-⑥ 明写这一条）
+    #   实跑            ⇒ video_probe_l1_ok / video_probe_l1_failed
+    if outcome.source == "cache":
+        notes.append("video_probe_cached")
+        if not outcome.ok:
+            notes.append("video_probe_l1_failed")
+    else:
+        notes.append("video_probe_l1_ok" if outcome.ok else "video_probe_l1_failed")
+    if not outcome.ok:
+        LOG.info("media_analysis: L1 未通过（%s），本次走回退链", outcome.reason)
+        return None
+    return provider
+
+
+async def _native_attempt(
+    provider,
+    *,
+    path: str,
+    duration_s: float,
+    has_audio: bool,
+    focus: str,
+    settings: settings_mod.Settings,
+    deadline: float,
+    notes: list[str],
+    workdir: str,
+) -> tuple[str, str]:
+    """§7.3-[3]/[4]：直送闸（`stat` 先判）→ 压缩 → 原生调用。返回 `(text, state)`。"""
+    size = media._size_of(path) or 0
+    direct_limit = min(
+        int(settings.video_max_direct_bytes), video_native.HARD_MAX_DIRECT_BYTES
+    )
+    send_path = path
+    if size > direct_limit:
+        remaining = deadline - time.monotonic()
+        min_actionable = (
+            float(settings.video_compress_timeout_seconds)
+            + float(settings.video_native_timeout_seconds) * 0.5
+        )
+        if remaining < min_actionable:
+            notes.append("video_skip_budget")
+            return "", NATIVE_FAILED
+        if not settings.video_compress_enabled:
+            notes.append("video_compress_skipped")
+            return "", NATIVE_TOO_LARGE
+        result = await media.compress_video(
+            path,
+            budget_bytes=settings.compress_budget_bytes,
+            duration_s=duration_s,
+            workdir=workdir,
+            has_audio=has_audio,
+            timeout_s=float(settings.video_compress_timeout_seconds),
+        )
+        if not result.ok:
+            notes.append(
+                "video_compress_infeasible"
+                if result.reason == "infeasible"
+                else "video_compress_failed"
+            )
+            LOG.info(
+                "media_analysis: 压缩未成功（reason=%s passes=%d）",
+                result.reason,
+                result.passes,
+            )
+            return "", NATIVE_TOO_LARGE
+        notes.append(f"video_compressed:{size}->{int(result.size or 0)}")
+        if result.no_audio:
+            notes.append("video_compressed_noaudio")
+        send_path = result.path or path
+        size = int(result.size or size)
+
+    remaining = deadline - time.monotonic()
+    timeout = min(
+        float(settings.video_native_timeout_seconds), remaining - NATIVE_RESERVE_S
+    )
+    if timeout <= 0:
+        notes.append("video_skip_budget")
+        return "", NATIVE_FAILED
+
+    prompt = _native_prompt(focus, settings, notes)
+    outcome = await video_native.call_native(
+        provider,
+        prompt=prompt,
+        video_path=send_path,
+        max_tokens=settings.video_native_max_tokens,
+        timeout=timeout,
+    )
+    if not outcome.ok:
+        note = outcome.note or video_native.NOTE_FAILED
+        if note == video_native.NOTE_UNAVAILABLE:
+            # 解析之后 client 又没了（核心热重载）⇒ 仍然只是"没有通道"
+            notes.append("video_native_unavailable")
+            return "", NATIVE_UNAVAILABLE
+        notes.append(note)
+        LOG.info(
+            "media_analysis: 原生视频未成功（chars=%d detail=%s）",
+            len(outcome.text),
+            outcome.detail,
+        )
+        return "", NATIVE_EMPTY if note == video_native.NOTE_EMPTY else NATIVE_FAILED
+
+    text = outcome.text
+    if _is_empty_sentinel(text):
+        # 哨兵（[无可用内容]/[无语音]）等同空文本 ⇒ 进回退链（§12.1）
+        notes.append("video_native_empty")
+        return "", NATIVE_EMPTY
+    notes.append("video_native")
+    LOG.info(
+        "media_analysis: 原生视频成功 chars=%d size=%d elapsed_ms=%d",
+        len(text),
+        size,
+        outcome.elapsed_ms,
+    )
+    return text, NATIVE_OK
+
+
+# --------------------------------------------------------------------------- #
+# 音轨阶段（v0.2 链路原样）
+# --------------------------------------------------------------------------- #
+async def _transcribe_path(
+    context,
+    event,
+    *,
+    path: str,
+    kind: str,
+    focus: str,
+    deadline: float,
+    notes: list[str],
+    settings: settings_mod.Settings,
+    workdir: str,
+) -> list[dict[str, object]]:
+    """取 provider wav → 多模态 `text_chat(audio_urls=[wav])` → 转写列表。"""
+    audio_provider = await providers.resolve_audio_provider(
+        context, settings.audio_provider_id, _umo(event)
+    )
+    wav_path = await media.ensure_provider_wav(
+        path, workdir=workdir, extracted=(kind == "video")
+    )
+    if kind == "video":
+        notes.append("audio_extracted")
+        media.track_temporary_local_file(event, wav_path)
+    if wav_path != path:
+        notes.append("audio_normalized")
+    prompt = _audio_prompt(kind, focus, settings, notes)
+    text = await transcribe(
+        audio_provider, wav_path, prompt, deadline=deadline, notes=notes
+    )
+    notes.append(f"audio_provider:{providers.provider_id_of(audio_provider)}")
+    if not text:
+        return []
+    return [{"t": 0.0, "text": text}]
+
+
+async def _summary_stage(
+    context,
+    event,
+    *,
+    transcript: list[dict[str, object]],
+    frames: list[dict[str, object]],
+    focus: str,
+    kind: str,
+    deadline: float,
+    notes: list[str],
+    settings: settings_mod.Settings,
+) -> str:
+    """摘要阶段（v0.2 语义不变；材料为空则不做，剩余预算不足也跳过）。"""
+    material = _build_material(transcript, frames)
+    if len(material) > settings_mod.MATERIAL_MAX_CHARS:
+        material = material[: settings_mod.MATERIAL_MAX_CHARS]
+        notes.append("material_trimmed")
+    if not material:
+        return ""
+    if deadline - time.monotonic() < SUMMARY_TIMEOUT_S:
+        notes.append("summary_skipped_budget")
+        return ""
+    chat = None
+    try:
+        chat = await providers.resolve_chat_provider(
+            context,
+            settings.vision_provider_id,
+            _umo(event),
+            require_image=False,
+        )
+    except envelope.ToolError as exc:
+        # 摘要失败**不**把整次调用判死（§9 第 11 步）
+        LOG.warning("media_analysis: 摘要 provider 不可用（%s）", exc.code)
+        chat = None
+    if chat is None:
+        notes.append("summary_failed")
+        return ""
+    return await build_summary(
+        chat,
+        material=material,
+        focus=focus,
+        notes=notes,
+        kind=kind,
+        settings=settings,
+    )
 
 
 async def transcribe(
@@ -395,7 +878,7 @@ async def build_summary(
 ) -> str:
     """1 次纯文本 `text_chat`（15 s）：`focus` 非空→回答该问题，空→通篇摘要。
 
-    模板来自 `settings.prompts.summary`（§5.1），`{task}` 是"通篇概括"或"定向回答"的
+    模板来自 `settings.prompts.summary`，`{task}` 是"通篇概括"或"定向回答"的
     固定指令（v0.1 的两套模板合成为一套）。失败/超时/空结果都返回 `""` 并记
     `summary_failed`，**不**影响 `ok`。
     """
@@ -424,6 +907,19 @@ async def build_summary(
 # --------------------------------------------------------------------------- #
 # 提示词渲染（§7.1 冻结规则）
 # --------------------------------------------------------------------------- #
+def _native_prompt(
+    focus: str, settings: settings_mod.Settings, notes: list[str]
+) -> str:
+    """原生视频的提示词（`prompts.video_native`：一次调用同时要"画面 + 声音"）。"""
+    template = settings.prompts[_PROMPT_INDEX["video_native"]]
+    if "video_native" in settings.prompts_trimmed:
+        notes.append("prompt_trimmed:video_native")
+    clause = settings_mod.FOCUS_CLAUSE.format(focus=focus) if focus else ""
+    return _render_prompt(
+        template, key="video_native", notes=notes, focus=focus, clause=clause
+    )
+
+
 def _audio_prompt(
     kind: str,
     focus: str,
@@ -488,7 +984,7 @@ def _summary_prompt(
 def _render_prompt(
     template: str, *, key: str, notes: list[str], focus: str, clause: str
 ) -> str:
-    """渲染 audio/video/frame 模板，并保证**焦点永不被静默丢弃**（§7.1 补偿规则）。"""
+    """渲染 audio/video/frame/video_native 模板，并保证**焦点永不被静默丢弃**。"""
     missing_clause = bool(focus) and "{focus_clause}" not in template
     if missing_clause:
         notes.append(f"focus_appended:{key}")
@@ -511,6 +1007,19 @@ def _safe_format(template: str, **values: str) -> str:
 # --------------------------------------------------------------------------- #
 # 内部工具
 # --------------------------------------------------------------------------- #
+def _probe_store() -> probe.ProbeStore:
+    """进程级 probe 缓存实例（`_broken` 熔断与"只告警一次"要跨调用生效）。"""
+    global _PROBE_STORE
+    if _PROBE_STORE is None:
+        _PROBE_STORE = probe.ProbeStore(plugin_name=settings_mod.PLUGIN_NAME)
+    return _PROBE_STORE
+
+
+def _is_empty_sentinel(text: str) -> bool:
+    """原生回答恰为哨兵（`[无可用内容]` / `[无语音]`）⇒ 等同空文本（§12.1）。"""
+    return text.strip() in EMPTY_SENTINELS
+
+
 async def _extract_frames_budgeted(
     video_path: str,
     want: int,

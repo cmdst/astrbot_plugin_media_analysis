@@ -2,7 +2,7 @@
 
 本模块是**叶子**：不 import 任何其它包内模块（谁都依赖它，它不依赖谁）。
 
-18 条错误码与 18 条 `hint` 是 SPEC-v0.2 §8.1 表的**唯一事实源**（表是它的视图）：
+21 条错误码与 21 条 `hint` 是 SPEC-v0.2 §8.1 + SPEC-v0.3 §11.1 表的**唯一事实源**：
 `hint` 必须是**常量字符串**，禁止拼接运行时数据（路径、异常文本、时长、provider id、文件名）
 —— 信封会被框架按 INFO 全量写进生产日志（`tool_loop_agent_runner.py:1439`），
 hint 是唯一可能夹带运行时数据的位置，钉成常量就整条链干净。
@@ -11,6 +11,10 @@ hint 是唯一可能夹带运行时数据的位置，钉成常量就整条链干
 - **删** `STT_UNAVAILABLE` / `STT_FAILED`（v0.2 不再有 STT 链路）；
 - **增** `MEDIA_TOO_LARGE` / `UNSUPPORTED_MEDIA_TYPE`（`File` 段取件与判型）/
   `AUDIO_UNAVAILABLE` / `AUDIO_FAILED`（音频改走多模态对话模型）。
+
+v0.3（SPEC-v0.3 §11.1）**只加不改**：既有 18 条逐字不变，新增 3 条视频链路的终态码
+`VIDEO_UNAVAILABLE` / `VIDEO_FAILED` / `VIDEO_TOO_LARGE` ⇒ 共 **21 条**。
+信封形状**完全不变**（成功 9 键 / 失败恰好 3 键）。
 """
 
 from __future__ import annotations
@@ -34,9 +38,12 @@ ERR_PROVIDER_NOT_FOUND = "PROVIDER_NOT_FOUND"
 ERR_PROVIDER_CAPABILITY_MISMATCH = "PROVIDER_CAPABILITY_MISMATCH"
 ERR_VISION_UNAVAILABLE = "VISION_UNAVAILABLE"
 ERR_VISION_FAILED = "VISION_FAILED"
+ERR_VIDEO_UNAVAILABLE = "VIDEO_UNAVAILABLE"
+ERR_VIDEO_FAILED = "VIDEO_FAILED"
+ERR_VIDEO_TOO_LARGE = "VIDEO_TOO_LARGE"
 ERR_INTERNAL_ERROR = "INTERNAL_ERROR"
 
-# 唯一事实源：18 条逐字静态文案（SPEC-v0.2 §8.1 是它的视图，逐字比对）。
+# 唯一事实源：21 条逐字静态文案（SPEC-v0.2 §8.1 + SPEC-v0.3 §11.1 是它的视图）。
 HINTS: dict[str, str] = {
     "BAD_TARGET": (
         "target 只接受 current 或 quoted；不要传文件路径。"
@@ -75,6 +82,17 @@ HINTS: dict[str, str] = {
         "没有可用的对话 provider 来读图；请让管理员在插件配置里指定「视觉模型」。"
     ),
     "VISION_FAILED": "视觉模型调用全部失败或超时；请稍后重试。",
+    "VIDEO_UNAVAILABLE": (
+        "没有可用的视频模型，也无法回退抽帧；请让管理员在插件配置里指定「视频模型」"
+        "（走原生视频），或把 include_frames 设为 auto 或 true 并配置「视觉模型」。"
+    ),
+    "VIDEO_FAILED": (
+        "视频模型调用失败或超时；请稍后重试，或让管理员调大 video.native_timeout_seconds。"
+    ),
+    "VIDEO_TOO_LARGE": (
+        "视频体积超过直送门槛且压不到门槛内；请让管理员调大 video.max_direct_bytes，"
+        "或把 include_frames 设为 auto 或 true 改走抽帧。"
+    ),
     "INTERNAL_ERROR": "插件内部错误；已记录日志，请让管理员查看插件日志。",
 }
 

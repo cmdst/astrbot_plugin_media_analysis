@@ -10,8 +10,9 @@
 2. `Star.__init__` **不保存** `config`（`star/base.py:26-29`）⇒ 自己存。
 3. 工具方法**只挂** `@filter.llm_tool`：叠加 `@filter.permission_type` 会让它被当成
    消息处理器，权限不符就丢用户消息（AGENTS §3 装饰器纪律）。
-4. `_settings()` 是**唯一配置读取点**，11 个键逐条显式读（`settings.KEY_MAP` ↔
-   `_conf_schema.json` ↔ 这里三方一致）。漏一个键 ＝ 生产链路上**静默丢弃**设置。
+4. `_settings()` 是**唯一配置读取点**，21 个键逐条显式读（`settings.KEY_MAP` ↔
+   `_conf_schema.json` ↔ 迁移器 `KEY_ORDER` ↔ 这里四方一致）。漏一个键 ＝ 生产链路上
+   **静默丢弃**设置。
 """
 
 from __future__ import annotations
@@ -54,38 +55,38 @@ except Exception:  # noqa: BLE001 —— 拿不到就退化为本地兜底，绝
 
 
 # --------------------------------------------------------------------------- #
-# 参数类型防御（评审 F6 / t5-F6）：核心**不校验**工具参数类型，模型完全可能发
-# `"include_frames": "false"`（字符串）。字符串 `"false"` 是**真值** ⇒ 会静默多抽
-# `max_frames` 帧 + 同样次数的视觉调用（真金白银，且用户看不出为什么）。
+# 参数归一（v0.3：`bool` → **三态字符串** `auto|true|false`，SPEC-v0.3 §13.1）
 #
-# 白名单只放三种形态：`bool`；整数 `0`/`1`；大小写不敏感的
-# `"1"/"true"/"yes"/"on"` 与 `"0"/"false"/"no"/"off"/""`。
-# **其它数值（含 `1.0`/`2.5` 这类 float）与未知类型一律算非法** ⇒ 告警一次并按 schema
-# 默认 `False`。为什么连 `1.0` 也不收：参数是布尔，`2.5` 与 `1.0` 都说明"模型没按 schema
-# 发值"，此时按"非零即真"猜会让误发值变成真实开销；按默认 False 只会少抽帧，不会多花钱。
+# 为什么还要防类型：核心**不校验**工具参数类型，模型完全可能发 `"include_frames": "false"`。
+# v0.3 的参数是**字符串枚举**（schema 类型从 boolean 变 string），归一逻辑的**唯一实现**
+# 在 `analyze.normalize_mode`（纯函数，测试与工具门面共用一份）：
+#
+# | 输入 | 输出 |
+# | --- | --- |
+# | `True/False` | `true/false`（旧客户端兼容） |
+# | `"auto"/"true"/"false"`（大小写不敏感） | 原样 |
+# | `"1"/"yes"/"on"` · `"0"/"no"/"off"/""` | `true` · `false` |
+# | `None` | `auto` |
+# | 其它（`2.5`、`{}`、未知串…） | **`auto`** + 一条 WARNING |
+#
+# 与 v0.2 相反的一处：非法值不再默认 `false`。v0.2 那样做是为了省 token，而 v0.3 的
+# 主路径本身就是"看视频"—— 默认 `auto` 只多一次原生调用，默认 `false` 会把"其实没看画面"
+# 悄悄记成成功。
 # --------------------------------------------------------------------------- #
-_TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
-_FALSE_LITERALS = frozenset({"", "0", "false", "no", "off"})
+def _as_mode(value: object) -> str:
+    """把模型给的 `include_frames` 归一成 `"auto" | "true" | "false"`（门面入口）。
 
-
-def _as_bool(value: object) -> bool:
-    """把模型给的 `include_frames` 归一成 `bool`（纯函数；非法值告警一次并回 `False`）。"""
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int):  # 注意：`bool` 是 `int` 的子类，已在上一行拦掉
-        if value in (0, 1):
-            return bool(value)
-    elif isinstance(value, str):
-        text = value.strip().lower()
-        if text in _TRUE_LITERALS:
-            return True
-        if text in _FALSE_LITERALS:
-            return False
-    LOG.warning(
-        "media_analyze: 参数 include_frames 收到非法值（类型 %s），按默认 False 处理",
-        type(value).__name__,
-    )
-    return False
+    归一本身在 `analyze.normalize_mode`（纯函数）；**告警在这里**：唯一的生产入口是工具
+    门面，非法值一条 WARNING（带类型名、不带值），与 v0.2 的 `_as_bool` 同口径。
+    """
+    mode = analyze.normalize_mode(value)
+    if not analyze.is_valid_mode_value(value):
+        LOG.warning(
+            "media_analyze: 参数 include_frames 收到非法值（类型 %s），按 %s 处理",
+            type(value).__name__,
+            mode,
+        )
+    return mode
 
 
 class MediaAnalysisPlugin(Star):
@@ -111,23 +112,65 @@ class MediaAnalysisPlugin(Star):
             plugin_name=settings.PLUGIN_NAME, ttl_seconds=current.cache_ttl_seconds
         )
         LOG.info(
-            "media_analysis ready: audio_provider_id=%r vision_provider_id=%r "
-            "max_media_seconds=%d max_frames=%d max_media_bytes=%d "
+            "media_analysis ready: audio_provider_id=%r video_provider_id=%r "
+            "vision_provider_id=%r max_media_seconds=%d max_frames=%d "
+            "max_media_bytes=%d video.max_direct_bytes=%d native_timeout_s=%d "
+            "native_max_tokens=%d compress=%s target=%d probe=%s ttl=%d "
             "cache_ttl_seconds=%d cache_dir=%s",
             current.audio_provider_id,
+            current.video_provider_id,
             current.vision_provider_id,
             current.max_media_seconds,
             current.max_frames,
             current.max_media_bytes,
+            current.video_max_direct_bytes,
+            current.video_native_timeout_seconds,
+            current.video_native_max_tokens,
+            "on" if current.video_compress_enabled else "off",
+            current.video_compress_target_bytes,
+            "on" if current.video_probe_enabled else "off",
+            current.video_probe_ttl_seconds,
             current.cache_ttl_seconds,
             self._cache.directory or "(disabled)",
         )
+        self._log_direct_bytes_hint(current)
         if current.legacy_stt_provider_id:
             LOG.warning(
                 "media_analysis: 配置项 provider_settings.stt_provider_id 已弃用且不生效"
                 "（检测到旧值非空，本行不打值）；请改用 provider_settings.audio_provider_id，"
                 "旧值可用 tools/migrate_config_v02.py 迁移"
             )
+
+    def _log_direct_bytes_hint(self, current: settings.Settings) -> None:
+        """按 §4 的建议表提示一句（**只打数字，不覆盖配置**）。
+
+        为什么要有：直送门槛是"按延迟"定的，配得比模型实测的舒服值高就会周期性超时；
+        但**不能**自动改（否决项 §16.2-6：第二事实源）。所以这里只打一行 INFO，
+        且整段 try/except —— 拿不到 provider/model 时静默跳过，绝不因为一句提示拒载。
+        """
+        try:
+            provider_id = current.video_provider_id
+            if not provider_id:
+                return
+            provider = self.context.get_provider_by_id(provider_id)
+            model = ""
+            config = getattr(provider, "provider_config", None)
+            if isinstance(config, dict):
+                model = str(config.get("model") or "")
+            if not model:
+                getter = getattr(provider, "get_model", None)
+                model = str(getter()) if callable(getter) else ""
+            suggested = settings.suggest_direct_bytes(model)
+            if current.video_max_direct_bytes > suggested:
+                LOG.info(
+                    "media_analysis: 提示 —— video.max_direct_bytes=%d 高于该模型的延迟建议值 %d"
+                    "（实测口径，见 README「视频能力探测」）；若经常超时请下调，或先用"
+                    "tools/probe_video_capability.py 校准",
+                    current.video_max_direct_bytes,
+                    suggested,
+                )
+        except Exception as exc:  # noqa: BLE001 —— 一句提示不许影响加载
+            LOG.debug("media_analysis: 直送门槛提示跳过（%s）", type(exc).__name__)
 
     async def terminate(self) -> None:
         """卸载：丢掉配置快照，关闭缓存（磁盘条目按 TTL 自然过期，可整目录删）。"""
@@ -137,16 +180,62 @@ class MediaAnalysisPlugin(Star):
             await store.close()
 
     def _settings(self) -> settings.Settings:
-        """唯一配置读取点：11 个键逐条显式读（SPEC-v0.2 §5.2 键表），禁止散落到别处。
+        """唯一配置读取点：21 个键逐条显式读（SPEC-v0.3 §8.1 键表），禁止散落到别处。
 
         漏一个键 ＝ 生产链路上**静默丢弃**设置（父手册 §3 第 8 条）；
-        `tests/test_config_map.py` 用三方一致守卫钉住这里。
+        `tests/test_config_map.py` 用四方一致守卫钉住这里。
+        布尔走 `ConfigView.flag()`（非 `bool` ⇒ 告警回默认），整数走 `bounded_int`（钳位）。
         """
         view = settings.ConfigView(self.config)
         return settings.Settings(
             audio_provider_id=view.text(settings.KEY_AUDIO_PROVIDER_ID),
+            video_provider_id=view.text(settings.KEY_VIDEO_PROVIDER_ID),
             vision_provider_id=view.text(settings.KEY_VISION_PROVIDER_ID),
             legacy_stt_provider_id=view.text(settings.KEY_LEGACY_STT_PROVIDER_ID),
+            video_probe_enabled=view.flag(
+                settings.KEY_VIDEO_PROBE_ENABLED,
+                default=settings.DEFAULT_VIDEO_PROBE_ENABLED,
+            ),
+            video_probe_ttl_seconds=view.bounded_int(
+                settings.KEY_VIDEO_PROBE_TTL_SECONDS,
+                default=settings.DEFAULT_VIDEO_PROBE_TTL_SECONDS,
+                lo=settings.MIN_VIDEO_PROBE_TTL_SECONDS,
+                hi=settings.MAX_VIDEO_PROBE_TTL_SECONDS,
+            ),
+            video_max_direct_bytes=view.bounded_int(
+                settings.KEY_VIDEO_MAX_DIRECT_BYTES,
+                default=settings.DEFAULT_VIDEO_MAX_DIRECT_BYTES,
+                lo=settings.MIN_VIDEO_MAX_DIRECT_BYTES,
+                hi=settings.MAX_VIDEO_MAX_DIRECT_BYTES,
+            ),
+            video_native_timeout_seconds=view.bounded_int(
+                settings.KEY_VIDEO_NATIVE_TIMEOUT_SECONDS,
+                default=settings.DEFAULT_VIDEO_NATIVE_TIMEOUT_SECONDS,
+                lo=settings.MIN_VIDEO_NATIVE_TIMEOUT_SECONDS,
+                hi=settings.MAX_VIDEO_NATIVE_TIMEOUT_SECONDS,
+            ),
+            video_native_max_tokens=view.bounded_int(
+                settings.KEY_VIDEO_NATIVE_MAX_TOKENS,
+                default=settings.DEFAULT_VIDEO_NATIVE_MAX_TOKENS,
+                lo=settings.MIN_VIDEO_NATIVE_MAX_TOKENS,
+                hi=settings.MAX_VIDEO_NATIVE_MAX_TOKENS,
+            ),
+            video_compress_enabled=view.flag(
+                settings.KEY_VIDEO_COMPRESS_ENABLED,
+                default=settings.DEFAULT_VIDEO_COMPRESS_ENABLED,
+            ),
+            video_compress_target_bytes=view.bounded_int(
+                settings.KEY_VIDEO_COMPRESS_TARGET_BYTES,
+                default=settings.DEFAULT_VIDEO_COMPRESS_TARGET_BYTES,
+                lo=settings.MIN_VIDEO_COMPRESS_TARGET_BYTES,
+                hi=settings.MAX_VIDEO_COMPRESS_TARGET_BYTES,
+            ),
+            video_compress_timeout_seconds=view.bounded_int(
+                settings.KEY_VIDEO_COMPRESS_TIMEOUT_SECONDS,
+                default=settings.DEFAULT_VIDEO_COMPRESS_TIMEOUT_SECONDS,
+                lo=settings.MIN_VIDEO_COMPRESS_TIMEOUT_SECONDS,
+                hi=settings.MAX_VIDEO_COMPRESS_TIMEOUT_SECONDS,
+            ),
             max_media_seconds=view.bounded_int(
                 settings.KEY_MAX_MEDIA_SECONDS,
                 default=settings.DEFAULT_MAX_MEDIA_SECONDS,
@@ -169,6 +258,7 @@ class MediaAnalysisPlugin(Star):
             prompt_video=view.text(settings.KEY_PROMPTS_VIDEO),
             prompt_frame=view.text(settings.KEY_PROMPTS_FRAME),
             prompt_summary=view.text(settings.KEY_PROMPTS_SUMMARY),
+            prompt_video_native=view.text(settings.KEY_PROMPTS_VIDEO_NATIVE),
             cache_ttl_seconds=view.bounded_int(
                 settings.KEY_CACHE_TTL_SECONDS,
                 default=settings.DEFAULT_CACHE_TTL_SECONDS,
@@ -193,29 +283,32 @@ class MediaAnalysisPlugin(Star):
         event: AstrMessageEvent,
         target: str = "current",
         focus: str = "",
-        include_frames: bool = False,
+        include_frames: str = "auto",
     ) -> str:
-        """分析当前消息或引用消息里的语音/视频（可只转写音轨，也可抽帧看画面）。
+        """分析当前消息或引用消息里的语音/视频（视频默认整段直送多模态模型，含画面与声音）。
 
         当用户发来语音、视频，或引用了一条语音/视频，并且想知道"里面说了什么 / 画面发生了
         什么"时调用本工具。**群里以「文件」形式发来的视频/语音也用 current 或 quoted 取，
         不要传文件路径**。返回 JSON：转写文本（transcript）、可选的分帧画面描述（frames）、
-        一句摘要（summary），失败时返回 {ok:false, error, hint}。
+        摘要（summary），失败时返回 {ok:false, error, hint}。
+
+        视频默认走"原生视频"（一次调用同时看画面和听声音，返回在 summary 里）。只有在视频
+        模型不可用/视频太大且压不下去/调用失败时，插件才按 include_frames 决定是否抽帧回退。
 
         Args:
             target (string): 分析哪条消息。current＝当前消息（默认），quoted＝被引用的那条消息。
             focus (string): 用户想了解的重点问题（如「他在说什么事」）。留空表示要一份通篇摘要。
-            include_frames (boolean): 只对视频有意义。true＝抽帧并描述画面；false（默认）＝只做音轨转写。
+            include_frames (string): 三态。auto（默认）＝要画面，插件自己选路（原生视频优先，失败时若配了视觉模型就抽帧）；true＝明确要画面，原生失败必须抽帧回退；false＝明确不要画面，原生失败时绝不抽帧（只交音轨转写）。
         """
         started = time.monotonic()
         try:
-            include_frames = _as_bool(include_frames)
+            mode = _as_mode(include_frames)
             payload = await analyze.analyze(
                 context=self.context,
                 event=event,
                 target=target,
                 focus=focus,
-                include_frames=include_frames,
+                include_frames=mode,
                 settings=self._settings_cache or self._settings(),
                 cache=self._cache_store(),
             )

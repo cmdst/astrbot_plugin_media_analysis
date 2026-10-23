@@ -1,4 +1,4 @@
-"""本地磁盘缓存（SPEC-v0.2 §6）：键 = 哈希(10 个分量)，值 = **成功信封文本**，带 TTL。
+"""本地磁盘缓存（SPEC-v0.2 §6 / SPEC-v0.3 §9.1）：键 = 哈希(12 个分量)，值 = **成功信封文本**，带 TTL。
 
 为什么从内存 LRU 换成落盘（v0.1 的 `ResultCache` 已删）：团队裁决 ③ 的诉求是
 "**同一媒体二次引用不再花 token**" —— 进程内 LRU 重启即失效，做不到。落盘换来这条能力，
@@ -49,7 +49,10 @@ except Exception:  # noqa: BLE001 —— 拿不到路径就禁用缓存，主链
     _core_plugin_data_path = None  # type: ignore[assignment]
 
 CACHE_SCHEMA_VERSION = "v1"  # 目录名；换布局就换它（老目录自然失效，无需迁移代码）
-KEY_SCHEMA_VERSION = "v2"  # 键公式版本（§6.1）；改公式就 +1
+KEY_SCHEMA_VERSION = "v3"  # 键公式版本（SPEC-v0.3 §9.1）；改公式就 +1
+# v2 → v3（v0.3）：`include_frames` 布尔变三态字符串 `mode`，并加 `video_provider_id`
+# 与 `video_fp` 两个分量 ⇒ 12 个分量。旧 v2 条目**不写迁移代码**：键变了自然不命中，
+# 按 TTL 老化淘汰（SPEC-v0.3 §9.1 冻结）。
 
 MAX_ENTRIES = 256  # 条目数上限（不做配置键）
 MAX_TOTAL_BYTES = 16 * 1024 * 1024  # 总字节上限
@@ -63,20 +66,33 @@ BUCKET_LEN = 2
 # 序列化文本里**禁止**出现的子串（§6.6-2）。`data:` 覆盖 base64 data URL。
 BANNED_SUBSTRINGS: tuple[str, ...] = ("/tmp/", "/root/", "data:")
 
+_WARNED_PATH = False  # 目录取不到只告警一次（probe 与 cache 共用这一条）
+
 
 def build_key(
     *,
     digest: str,
     kind: str,
-    include_frames: bool,
+    mode: str,
     max_frames: int,
     focus: str,
     prompts_fp: str,
     audio_provider_id: str,
+    video_provider_id: str,
     vision_provider_id: str,
+    video_fp: str,
     plugin_version: str,
 ) -> str:
-    """缓存键（§6.1 冻结公式）：**10 个分量**按固定顺序 `|` 连接后 sha256（64 hex）。
+    """缓存键（SPEC-v0.3 §9.1 冻结公式）：**12 个分量**按固定顺序 `|` 连接后 sha256。
+
+    分量为 `v3 | digest | kind | mode | max_frames | prompts_fp | focus |
+    audio_provider_id | video_provider_id | vision_provider_id | video_fp |
+    PLUGIN_VERSION`。两个 v0.3 的新分量各有明确理由：
+
+    - `mode`（`auto|true|false`）：**同一媒体**在三种模式下产物不同（原生/压缩/抽帧回退）
+      ⇒ 互相命中就是把"没看画面"的结果当"看过"返回。v0.2 的布尔值不够表达"auto"。
+    - `video_fp`：影响产物的**配置**（直送门槛 / 压缩开关 / 压缩预算）进键
+      ⇒ 改门槛或关压缩即让旧结果失效，不会拿旧压缩产物冒充新门槛下的结果。
 
     用**配置值**（可能为 `""`）而不是"解析出的 provider id"：解析发生在缓存查询之后，
     提前解析会把"provider 配置坏了"变成"连缓存命中都拿不到"（§6.1 已知残留已披露：
@@ -87,16 +103,42 @@ def build_key(
             KEY_SCHEMA_VERSION,
             str(digest),
             str(kind),
-            "1" if include_frames else "0",
+            str(mode),
             str(int(max_frames)),
             str(prompts_fp),
             str(focus),
             str(audio_provider_id),
+            str(video_provider_id),
             str(vision_provider_id),
+            str(video_fp),
             str(plugin_version),
         )
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def plugin_data_dir(plugin_name: str) -> str:
+    """`<root>/data/plugin_data/<插件名>` —— 结果缓存与 probe 缓存的共同根。
+
+    路径 API 不可用（核心内部面搬家）时回 `""`：调用方据此"本进程禁用落盘"，
+    **绝不**在 cwd 或库目录里造目录（v0.1 的教训）。
+    """
+    global _WARNED_PATH
+    if _core_plugin_data_path is None:
+        return ""
+    try:
+        base = _core_plugin_data_path()
+    except Exception as exc:  # noqa: BLE001 —— 拿不到就当禁用，不抛给主链路
+        if not _WARNED_PATH:
+            _WARNED_PATH = True
+            LOG.warning(
+                "media_analysis: 取插件数据目录失败（%s），本进程内缓存与探测记录均不落盘",
+                type(exc).__name__,
+            )
+        return ""
+    if not isinstance(base, str) or not base:
+        return ""
+    return os.path.join(base, str(plugin_name))
 
 
 def _clamp_ttl(ttl_seconds: object) -> int:
@@ -125,16 +167,10 @@ class DiskCache:
     @property
     def directory(self) -> str:
         """缓存根目录（`…/cache/v1`）；路径 API 不可用时回 `""`（= 禁用）。"""
-        if _core_plugin_data_path is None:
+        root = plugin_data_dir(self.plugin_name)
+        if not root:
             return ""
-        try:
-            base = _core_plugin_data_path()
-        except Exception as exc:  # noqa: BLE001 —— 拿不到就当禁用
-            self._break_cache(exc)
-            return ""
-        if not isinstance(base, str) or not base:
-            return ""
-        return os.path.join(base, self.plugin_name, "cache", CACHE_SCHEMA_VERSION)
+        return os.path.join(root, "cache", CACHE_SCHEMA_VERSION)
 
     @property
     def tmp_directory(self) -> str:

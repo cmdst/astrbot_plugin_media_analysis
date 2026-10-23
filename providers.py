@@ -19,10 +19,10 @@ from __future__ import annotations
 from astrbot.api import logger as LOG
 from astrbot.api.provider import Provider
 
-from . import envelope
+from . import envelope, video_native
 
 # `modalities` 的可选值由核心定义：["text","image","audio","tool_use"]
-# （`config/default.py:2246-2255`）。
+# （`config/default.py:2246-2255`）。**没有 `video`** ⇒ 视频位不读它（SPEC-v0.3 §2.2）。
 MODALITY_IMAGE = "image"
 MODALITY_AUDIO = "audio"
 
@@ -106,6 +106,45 @@ async def resolve_audio_provider(context, provider_id: str, umo: str) -> Provide
             ),
         )
     return prov
+
+
+async def resolve_video_provider(
+    context, provider_id: str
+) -> tuple[object | None, str]:
+    """视频位解析阶梯（SPEC-v0.3 §2.2 冻结七级，本函数覆盖 ①–⑤）。
+
+    返回 `(provider, "")` ＝可用；`(None, reason)` ＝**没有原生通道**（回退链继续走）：
+
+    | reason | 含义 | 处理 |
+    | --- | --- | --- |
+    | `"empty"` | `video_provider_id` 为空 | notes `video_native_unavailable` |
+    | `"adapter_not_openai"` | 适配器类型不是 `openai_chat_completion` | 同上（**不判错**） |
+    | `"no_client"` | 实例上没有 `client.chat.completions.create` | 同上 |
+
+    只有两种情形**抛** `ToolError`（那是"配置写错了"，不是"没有视频能力"）：
+    id 在 AstrBot 里不存在 ⇒ `PROVIDER_NOT_FOUND`；拿到的不是 `Provider` 实例
+    ⇒ `PROVIDER_CAPABILITY_MISMATCH`（沿用 v0.2 的两个码，不新增）。
+
+    为什么空串**不回落**核心当前对话 provider（与音频/视觉位不同）：视频是**声明式**能力，
+    没有声明就盲发 8 MiB 给一个未知模型，是拿钱和延迟赌（SPEC-v0.3 §2.1）。
+    """
+    if not provider_id:
+        return None, "empty"
+    prov = context.get_provider_by_id(provider_id)  # 同步，别 await
+    if prov is None:
+        raise envelope.ToolError(
+            envelope.ERR_PROVIDER_NOT_FOUND,
+            log_detail=f"video_provider_id={provider_id}",
+        )
+    if not isinstance(prov, Provider):
+        raise envelope.ToolError(
+            envelope.ERR_PROVIDER_CAPABILITY_MISMATCH,
+            log_detail=f"video_provider_id={provider_id} type={type(prov).__name__}",
+        )
+    reason = video_native.channel_reason(prov)
+    if reason:
+        return None, reason
+    return prov, ""
 
 
 async def resolve_chat_provider(
