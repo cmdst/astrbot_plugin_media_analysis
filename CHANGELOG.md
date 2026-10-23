@@ -1,10 +1,19 @@
 # CHANGELOG
 
-## v0.3.0 — 2026-10-24（**实现完成；待评审 / 待测试 / 待部署**）
+## v0.3.0 — 2026-10-24（**已评审通过（t14 PASS；t17 复核 R1/R2 PASS）；待推送 `main` / 待部署**）
 
 把**视频主路径**改成「原生视频直送多模态模型」，抽帧降级为**回退**；v0.2 的音频多模态、
 5 份提示词与结果缓存全部保留。规格：`SPEC-v0.3.md`（dev lane 工作区，706 行，冻结增量）；
-前置实测：`MEASURE-v0.3.md`（t8）。
+前置实测：`MEASURE-v0.3.md`（t8）；真机验证：`VERIFY-v0.3.md`（t4，427 行，六件必验全部实跑）。
+
+> 评审链：`t5` 全量双轴 **NEEDS-WORK**（0 blocker / 1 high / 3 medium / 6 low）⇒ 同版本内
+> 两批修复（F1–F7 / F2–F10）⇒ **`t14` 合并复核 PASS**（七条判据全过，每条都做"改错会红"的
+> 变异检验）⇒ `t16` 修 t14 的残留 **R1/R2（音轨预算接线 + 超时分流）**，落成 **`44aa2c8`**
+> ⇒ **`t17` 复核 PASS**（spy 证明接线：`reserve=25` 时音轨 timeout 39.998 → 14.997 s；两向分流；
+> 冻结面回归）。**代码/测试基线 = `44aa2c8`**，门禁 **695 passed / 0 failed /
+> 0 skipped / 0 xfail**（工作树、已提交树、`git archive` 归档树三处一致；`tests/` 27 个文件 /
+> 47 个跟踪文件）。**文档提交在其后**（只动 `README.md` + `CHANGELOG.md`，运行面与基线
+> 逐字节相同）；要引用文档 sha 用 `git log --oneline --grep '^docs:'`，不写"当前 HEAD"。
 
 ### ① 原生视频直送（核心内部面 + 三条护栏）
 
@@ -15,7 +24,7 @@
   只能走 provider 底层 `client.chat.completions.create`（`openai_source.py:382`）。
 - 三条护栏：① `max_tokens` 硬下限 **1024**（有模型在 64 时 200 但正文为空）；② 空 `content` /
   哨兵 `[无可用内容]`/`[无语音]` 判失败并回退；③ 自建 `asyncio.wait_for`
-  （`min(native_timeout_seconds, 剩余预算−15 s)`，底层调用绕过核心超时/重试）。
+  （`min(native_timeout_seconds, 剩余预算−35 s)`，底层调用绕过核心超时/重试）。
 - 整块 `try/except Exception`：缺失 `client`/适配器类型不符/调用抛错 ⇒
   `video_native_unavailable`/`video_native_failed` ⇒ **回退**，绝不成为新的"静默拒载"点。
 
@@ -25,23 +34,31 @@
 - `include_frames` 类型 `bool` → **`str`**：`auto`（默认）/`true`/`false`；旧布尔值仍接受。
 - **`false` + 原生失败 ⇒ 绝不静默抽帧**（用户的显式成本约束）；有音轨则只交转写。
 - 新增 3 个终态码：`VIDEO_UNAVAILABLE` / `VIDEO_FAILED` / `VIDEO_TOO_LARGE`（共 21 条，既有
-  18 条逐字未动）；新增 19 条 `video_*` note（词表总 39 条）。
+  18 条逐字未动）；新增 19 条 `video_*` note（词表 39 条；评审 F7 再加 1 条、R1 再加 1 条
+  ⇒ **41**，见下）。
 
 ### ③ 压缩（超直送门槛时）
 
 - `scale=-2:480` + libx264 `veryfast` + ABR 双向钳制 + `aac 64k -ac 1`，最多 **2 趟**
   （第二趟 ×0.95 修正），两趟共享 `compress_timeout_seconds`（默认 30）。
 - 预算 = `min(compress_target_bytes, max_direct_bytes)`；源已在预算内 ⇒ **0 次转码**。
+- 码率 = `floor(预算×8 / 时长 / 1000) − 64`；`< 64 kbps` ⇒ `video_compress_infeasible`（不硬转）。
 - 产物只落 `/tmp`（`media_analysis_*` 工作目录，`finally` 整目录删）；源文件**只读**。
-- 实测基线（生产样本只读）：48.9 s / 5.64 MB → 4 MiB 档 **3,939,056 B / 4,810 ms** 一次命中。
+- **实测基线**（生产样本只读：5,640,723 B / 48.901 s / 720x1280）：
+  **4 MiB 档 3,873,915 B / 4,207 ms / 1 趟 / 270x480 / 音轨保留**（t4 复测；t8 首测
+  3,939,056 B / 4,810 ms，码率按 48 s 整数算得 635k，实现按 48.901 s 算得 622k）；
+  8 MiB 档源已在预算内 ⇒ **0 趟**；1 MiB 档 **2 趟 → 1,031,801 B**。
 
 ### ④ L1 可见性探测（只做这一层）
 
 - 4 s / 1280x720 / ~150 KB 合成样片（画面正中 4 位白色数字 + 右下角黄色单词），固定提问，
   **两条都命中才算过**（数字按字符串、单词大小写不敏感）。
 - 缓存 `data/plugin_data/<插件>/probe/v1/`，键含 `provider_id + model + PLUGIN_VERSION`，
-  TTL 默认 7 天、`0` = 关闭；每个 TTL 窗口**最多自动跑 1 次**（失败也写占位，防打爆）；
+  TTL 默认 **7 天**、`0` = 关闭；每个 TTL 窗口**最多自动跑 1 次**（失败也写占位，防打爆）；
   落盘失败静默降级为进程内记忆。
+- **通道类失败不缓存**（F1）：4xx/5xx/DNS/超时只做 60 s 进程内冷却，读到通道类条目视同 miss；
+  **`--clear` / `rm -rf probe/` 对运行中插件最多 5 分钟生效**（内存 memo 上限
+  `MEMO_MAX_AGE_S=300`）。
 - **不做体积阶梯探测**：实测两条通道到 47.2 MiB / 36.5 MiB 都 200（0 次拒绝）⇒ "体积上限"
   不是事实，真正先撞的是延迟（9.4 MB≈43 s、18.6 MB≈91 s、38.3 MB≈193 s）。
   `tools/probe_video_capability.py` 因此是**延迟校准工具**（输出 p50≤45 s 的最大档）。
@@ -63,6 +80,124 @@
 video_provider_id | vision_provider_id | video_fp | PLUGIN_VERSION`；`mode` 与 `video_fp`
 是新增分量（三种模式不许互相命中；改门槛/开关即失效）。目录仍是 `cache/v1`，旧条目自然不命中。
 
+### 评审修复批次二（`t5` 的 F2/F3/F4/F5/F6/F7/F10）
+
+- **F7（最重要，成本回归）**：`auto` 且**未配视频模型** ⇒ **不抽帧**，退化为"只转写"，
+  note 记 `video_unavailable_no_provider`（词表 39 → **40**）。此前"没配视频模型 + 早就配了
+  视觉模型"的部署会把每条视频从 v0.2 的 **0 次**视觉调用抬到 **6 次**；只有 `mode=true`
+  才强制抽帧。
+- **F4（静音视频）**：有音轨但转写为空 + 没抽帧（`mode=false` / `auto` 无视频模型 / 无视觉位）
+  ⇒ **`ok:true` + `audio_empty`**，不再抛 `FRAME_EXTRACT_FAILED`（那个码的 hint 会误导用户
+  去换媒体，而用户本来就没要画面）。
+- **F6（预算饿死）**：`NATIVE_RESERVE_S` 15 → **35**（= `FRAMES_MIN_BUDGET_S`(25) + 10）；
+  音轨阶段也按 `remaining − 预留` 取超时（`budgeted_timeout()`，纯函数）。此前原生超时后
+  只剩 15 s < 25 s ⇒ 抽帧几乎必然 `video_skip_budget`，**主打回退在最该生效时失效**。
+- **F5（max_tokens 默认）**：`native_max_tokens` 默认 **1024 → 2048**（下限仍 1024）；
+  ready 行同时打直送门槛与该值；README 写明 **mimo 场景建议 4096**。
+- **F3（瞬时失败 TTL）**：probe 结论按 reason 分流 —— 判据不过（`mismatch`/`empty`）按配置
+  TTL（7 天）；**本地环境类**（`no_font`/`ffmpeg_missing`/`build_failed`）**1 小时**；
+  **通道类**（4xx/5xx/timeout/dns）**不缓存**（与 F1 同一套口径，`cache_ttl_for()`）。
+- **F2（记忆穿透）**：`probe._MEMO` 命中改为**过两道时效**（条目 TTL + `MEMO_MAX_AGE_S`=5 min），
+  `ProbeStore.clear()` **连记忆一起清** —— 此前 `--clear` / `rm -rf probe/` 对运行中的插件无效。
+- **F10（不许抛给模型）**：`video_native` 的每一层属性访问改走兜底 `getattr`（`provider.client`
+  是会抛异常的 property 也只算"没有原生通道"）⇒ `video_native_unavailable`，不再落 `INTERNAL_ERROR`。
+- 用例：`tests/` +17（F7 成本不变式、F4 两种静音形态、F6 注入时钟 + `budgeted_timeout` 参数化（**该纯函数表已被批次三换成 spy 接线用例**）、
+  F5 默认值/ready 行、F3 分流表与 1 小时过期、F2 记忆过期与 clear、F10 两形态）。
+
+### 修复（推送前，`VERIFY-v0.3.md` F1）
+
+- **`tools/probe_video_capability.py` 不带 UA** ⇒ Cloudflare 前置回 403（`error code: 1010`）⇒
+  工具把 403 记成"模型看不见"并**写进插件共享的 probe 缓存** ⇒ 插件此后 1 ms、0 网络就记
+  `video_probe_l1_failed`，**7 天**不走原生视频（`--clear` 后插件自己的 L1 11.6 s 通过）。
+- 工具侧：请求带**与核心 HTTP 客户端同形状**的 `User-Agent`（`AsyncOpenAI/Python <SDK 版本>`，
+  版本取自 `importlib.metadata`，不硬编码）；响应分三类 —— `ok` / `rejected`（200 但正文空，
+  是裁决）/ `channel_error`（**任何 4xx/5xx、DNS、连接、超时、协议异常**）；
+  `channel_error` **不写缓存**且退出码 `2`，`--show` 会标出 `channel_class=yes`。
+- 插件侧（更重要）：**通道类 `reason` 的缓存条目不作为"不支持"证据** —— 读到即**视同 miss**
+  重新实测；写入侧通道类失败**绝不**写 `l1_ok=false`（只在进程内做 60 s 冷却，冷却过期即重测）。
+  只有"200 且内容被判为不可见/答错"（`mismatch`/`empty`）与本地环境类失败
+  （`no_font`/`ffmpeg_missing`/`build_failed`，§3.1 冻结口径）才是真正的裁决。
+- 用例：`tests/test_probe.py` +20（11 种通道 `reason` 的读侧视同 miss、3 种裁决仍命中、
+  写侧不落盘 + 冷却 + 冷却过期重测、分类纯函数、CLI 的 UA/三类响应/与插件同口径）。
+
+### 评审修复批次三（`t14` 的 R1/R2，`44aa2c8`）
+
+- **R1（预算接线，t14 残留 medium）**：`transcribe()` 现在真的走
+  `budgeted_timeout(remaining, AUDIO_TIMEOUT_S, reserve_s)`。**修复前**（`97d0104`）
+  `budgeted_timeout()` 是**生产零调用**的死函数（spy 实测 `calls=0`，只有纯函数单测），
+  慢音轨仍能把抽帧预算吃光；`44aa2c8` 起已接线（`t17` 复核 PASS）。
+  **音轨超时按是否要画面分流：要画面 ⇒ `audio_timeout` 继续；不要画面 ⇒ `AUDIO_FAILED`。**
+- **新增唯一判据 `frames_possible(mode, settings, has_video)`**：与 `_frames_fallback` 的三道门
+  （`has_video` → `mode=false` → 视觉位 → `auto` 且无视频模型）**逐条对齐**，只回答"要不要画面"，
+  不产生 note、不判终态码。要画面 ⇒ 音轨给抽帧留 **25 s** 预留；不要画面 ⇒ 不扣。
+- **R2（超时分流）**：音轨**超时**时，若本轮可能抽帧 ⇒ note `audio_timeout`、返回空串、
+  **继续走画面阶段**（不再 `AUDIO_FAILED` 连抽帧一起丢）；若不要画面（语音消息 / `mode=false` /
+  无回退画面）⇒ 仍 `AUDIO_FAILED`（主诉求是转写，不能假成功）。**provider 抛错（4xx/5xx/安全过滤）
+  仍一律 `AUDIO_FAILED`** —— 那说明模型侧真出问题，不是"预算不够"。
+- 用例：把"纯函数参数表"换成 **spy 接线用例**（断言 `calls ≥ 1` 与预留方向；`t17` 复核实测：
+  `reserve=25` 时音轨 `timeout` 从 **39.998 s 降到 14.997 s**）+ 音轨超时两向分流
+  + `frames_possible` 矩阵；`notes` 词表 **40 → 41**（新增 `audio_timeout`）。门禁仍
+  **695 passed**（替换了原来的纯函数参数化 cell）。
+
+### 真机验证（`VERIFY-v0.3.md`，t4；dev lane 工作区、未入库）
+
+对象 `main` @ `44f9afa` 的 `git archive` 副本（38 文件 / v0.3.0），全程 `ASTRBOT_ROOT=/tmp`。
+六件必验事项**全部实跑**（不是复述 t8）：
+
+| # | 事项 | 判定 | 关键数字 |
+|---|---|---|---|
+| ① | Gemini 体积阈值 | **无阈值，但有瞬时 400 窗口** | 1/4/8/16/32 MiB（raw 0.98–38.7 MB、请求体到 51.5 MB）**全 200**（13.6/36.6/49.0/93.2/208.4 s）；同批首次跑 **五档全 400（含 1 MiB）**，4 分钟后复现不了 |
+| ② | 原生**被看见** | **PASS** | Gemini 一次调用读出`数字=8093`+`单词=WINDOW`+声音`"eight zero nine three"`（151 KB / 24.5 s，frames=0/transcript=0）；抽帧 6 帧各自读出`1495`+`CAMERA`（43.1 s / 7 次调用） |
+| ③ | 压缩 + 三跳信封 | **PASS** | 生产样本 5,640,723 B → **3,873,915 B / 1 趟 / 4,207 ms / 270x480 / 音轨保留**；信封：原生直送 42.6 s、压缩后原生 24.4 s（压到 1,031,801 B / 2 趟）、抽帧回退 67.7 s（6 帧 + 转写 260 字） |
+| ④ | 内存护栏 | **PASS** | 38.9 MiB + 压缩关 ⇒ `VIDEO_TOO_LARGE`、`call_native=0`/`compress=0`、**RSS 增量 2.2 MiB**（整段 base64 需 ≈53.3 MiB）；`max_media_bytes=1 MiB` ⇒ `MEDIA_TOO_LARGE`、增量 0.0 MiB、0 调用；20.3 MiB → 压到 744,367 B → 原生，增量 7.6 MiB |
+| ⑤ | 线上现状 | **零流量** | 23:10:20 加载后 `ok kind=` **0**、`rejected` **0**、本插件 `[ERRO]` **0**；`Added llm tool` 2（两次重载）；全日志 2 次 rejected 在 v0.1 时代（02:56） |
+| ⑥ | 真机形态复跑 | **PASS** | `Added llm tool: media_analyze` **恰好 1 次**、`include_frames` 已是 **string**、无 `required`、`PLUGIN_VERSION=0.3.0`、`>=4.29,<5` 含 4.29.1 |
+
+**三条必读的实测风险**（运维口径，不是待办）：
+
+1. **代理存在瞬时 400 窗口（与尺寸无关）** ⇒ 不得把单次 400 当 SLA / 能力结论；链路已按规定
+   记 `video_native_failed` 并回退。
+2. **mimo 建议 `native_max_tokens=4096`**：8 MiB + 长提示词在 **1024 / 2048** 下会 200 但
+   正文为空（`video_native_empty`；护栏会回退，但等于白花一次调用钱）。默认 2048 只够
+   Gemini 类通道；**mimo 请设 4096**，或把直送门槛留在 **4 MiB**。
+3. **原生没有体积上限，但有延迟上限**：47.2 MiB 也能过，但 8 MiB ≈ 45.6–50.4 s、16 MiB 93.2 s、
+   32 MiB 208.4 s，而全局预算 100 s ⇒ **>8 MiB 直送不安全**（能过 ≠ 来得及）。默认
+   `video.max_direct_bytes = 8 MiB`（钳 **1–32 MiB**）是按延迟定的，不是 provider 上限。
+
+### 遗留（v0.3.1 候选；**只登记，本版未改**）
+
+- **F2（medium）mimo 空文本阈值**：8 MiB + 长提示词下 `max_tokens=1024`（实测 **2048 也会**）
+  返回 200 但正文为空。现有护栏判失败并回退（**没有假成功**）；**mimo 建议 4096**，
+  或把直送门槛留在 4 MiB。
+- **F3（medium，v0.2 既有，不是 v0.3 回归）**：48.9 s 音轨在 mimo 上 `AUDIO_FAILED`
+  （`text_chat timeout 60.0s`，同音轨换 Gemini 成功）；**旧行为（v0.2 / `t16` 前）音轨失败会
+  中止整条链、连本来能做的抽帧一起丢**。**`t16` 已修掉"连抽帧一起丢"那一半**：本轮可能抽帧时
+  音轨超时只记 `audio_timeout` 并继续画面阶段（R2 分流）。**仍保留的是"转写为主诉求"的失败**：
+  语音消息 / `mode=false` / 无画面回退时，60 s 超时仍 `AUDIO_FAILED` —— 那是正确判据（不能假成功）。
+  ⇒ 要彻底解（调大 `AUDIO_TIMEOUT_S`、音轨独立重试或换 provider）属**规格变更**，留 v0.3.1；
+  **改它要同时动 §2.3 音频链路、§7.3 回退链与 `tests/test_video_chain.py` / `test_analyze.py` 的链路用例**。
+- **F4（low，外部）**：代理瞬时 `http 400`（无需改代码，已回退）。
+- **F5（low）**：CLI 标称档位与实际字节差 **−7%~+16%**（工具用码率逼近体积）⇒ 引用一律用实测字节。
+- **F6 / F11（low）哨兵精确匹配**：空文本哨兵是**精确串**（`[无可用内容]`/`[无语音]`）；实测 mimo
+  回 `[无用内容]` ⇒ 被记成 `video_native` 成功。先裁决"是否加带方括号短句判据"（行为变更），本版不动。
+- **F8（low）非 mp4 容器一律按 `data:video/mp4` 直送**：原生路径的 MIME 是**硬编码** `video/mp4`；
+  `.mov` / `.webm` 等容器目前没有单独分支（压缩产物统一 mp4，回退路径不受影响）。要么在 v0.3.1
+  按容器探型映射 MIME，要么在文档/配置层面明确"只保证 mp4"（本版取后者）。
+- **F9（low）门槛建议表缺元数据**：`settings.VIDEO_DIRECT_BYTES_SUGGESTIONS` 是
+  `(pattern, bytes)` 二元组，**没有日期/置信字段**，且最后一行 `*` 会兜底所有未知模型（4 MiB）。
+  它**只用于 ready 提示与 CLI 建议**、不参与运行期判定，但表本身无法表达"这条建议有多新/多可信"
+  ⇒ v0.3.1 可加日期/置信（或把 `*` 拆成"未知模型"的显式行）。
+- **`tests/test_memory_guards.py` 的 `inspect.getsource` 静态断言**在**并发编辑窗口**会间歇红
+  （源码正在被改时读到半成品）；不是功能缺陷 ⇒ 文档冻结/提交后按最终 sha 复跑一次即可，
+  不要按"内存护栏回归"处理。
+- **R1（low，t3）**：`probe_ttl_seconds=0` 时 `ensure_l1` 若被**直接调用**仍会把条目写盘
+  （SPEC §3.3 要求"不读不写"）；生产路径由 `analyze` 的 `ttl<=0` 闸挡住 ⇒ 当前不可达。
+- **已关闭（原 t14 R1，medium；修复前状态＝`budgeted_timeout()` 生产零调用）**：`44aa2c8` 已接线，
+  `transcribe()` 真的按"要不要画面"扣预留；spy 用例断言 `calls ≥ 1`（见批次三）。
+- **SPEC 与实现的已知漂移（冻结文本未改，以实现为准）**：`SPEC-v0.3 §8.1` 仍写
+  `native_max_tokens` 默认 1024（实现/README 是 **2048**）；`§5.2` 的 `reserve=15` 与 `§7.4`
+  的 `include_frames 设为 auto/true` 文案分别落在 **35** 与 **`true`**（评审 F6/F7 的修复）。
+
 ### 已知限制 / 未定（照 `MEASURE-v0.3.md` §7 原样登记）
 
 - 形状 B（`input_video`）未测；>47.2 MiB 未测；视频 URL 引用与非 mp4 容器不支持。
@@ -72,7 +207,7 @@ video_provider_id | vision_provider_id | video_fp | PLUGIN_VERSION`；`mode` 与
 - `NO_AUDIO_TRACK` / `NO_VIDEO_TRACK` 仍在码表里：前者在视频路径已被 `VIDEO_UNAVAILABLE`
   取代（§7.4 表），后者仍是 `mode=true` 且无视频流时的判据。
 
-## v0.2.0 — 2026-10-23（**已评审通过；待推送 `main` / 待部署**）
+## v0.2.0 — 2026-10-23（**已评审通过；已推送 `main`（`d9628a4`，2026-10-23 09:39）/ 已部署（v0.2.0，23:10:20）**）
 
 修掉 ops 查出的**上线后零成功**缺陷，并落四项产品优化。规格：`SPEC-v0.2.md`（dev lane 工作区，
 1220 行，冻结增量）。
@@ -175,16 +310,19 @@ video_provider_id | vision_provider_id | video_fp | PLUGIN_VERSION`；`mode` 与
 
 ### 状态与已知限制
 
-- **库内门禁**：`e9ad82b` 起 **442 passed / 0 failed / 0 skipped / 0 xfail**；`tests/` 18 个文件
-  已入库（含 `test_version.py` 的版本/仓库守卫、`MAPPING-v02.md` 的 113 条旧用例逐条映射）。
-- **上游仓库**：`https://github.com/cmdst/astrbot_plugin_media_analysis` **已存在**（2026-10-21 建，
-  公开、空仓、默认分支 `main`）；本库 `git remote -v` 仍为 **0 行** ⇒ 推送属下一单
-  （`git remote add origin git@github.com:cmdst/astrbot_plugin_media_analysis` + `push -u origin main`）。
-- **生产当前仍是 v0.1.0**（2026-10-23 00:58 安装，34 个文件、配置 191 B / 4 键）。
-  v0.2 **未部署** ⇒ 下面的"真 provider 调用"仍未在线上量过。
-- **未跑过真实多模态 provider 调用**（不花运营方额度）：`t4` 用真 `Provider` ABC 的假身验到协议
-  形状（`text_chat(prompt=…, audio_urls=[16 kHz/mono/s16 wav])`），真调用等上线后按
-  `SPEC-v0.2.md` §14 补量。
+- **库内门禁（v0.2.0 交付面，历史）**：`e9ad82b` 起 **442 passed / 0 failed / 0 skipped / 0 xfail**；
+  `tests/` 18 个文件已入库（含 `test_version.py` 的版本/仓库守卫、`MAPPING-v02.md` 的 113 条旧用例
+  逐条映射）。**当前最新**是 v0.3.0 的 **695 passed @ `44aa2c8`**（代码/测试基线，见上文 v0.3.0 条目）。
+- **上游仓库**：`https://github.com/cmdst/astrbot_plugin_media_analysis` 公开、默认 `main`；
+  **`main` 已于 2026-10-23 09:39 推送到 `d9628a4`**（远端 sha == 本地，`git ls-remote` + 匿名
+  `clone` 双向复核）。v0.3.0 的推送**不在本版**，归下一单（推送目标见 v0.3.0 派单 §10）。
+- **生产已部署 v0.2.0**（2026-10-23 23:10:20 加载，23:59:02 再次重载）：42 个文件（含
+  `__pycache__`）、插件配置 **1,594 B / BOM / 11 键**，`max_media_seconds=300`、
+  `audio_provider_id` 与 `vision_provider_id` 均非空；`data/plugin_data/<插件>` **不存在**
+  ⇒ 上线至今**零成功、零缓存、零流量**（`ok kind=` 0 次；全日志 2 次 `rejected` 都在 v0.1 时代）。
+- **真 provider 调用**：v0.2 本身未跑；**v0.3 的 t4 验证实跑过**（Gemini / mimo）——
+  原生视频读出画面事实、48.9 s 音轨用 Gemini 转写 260 字、**同一音轨在 mimo 上 60 s 超时
+  `AUDIO_FAILED`**（`VERIFY-v0.3.md` §2 / §3.4）。mimo 当音频位时，48 s 级视频会稳定失败。
 - **已知遗留（v0.2.1，不是缺陷）**：迁移 `--apply` 丢 BOM（功能无影响，字节审计要留神）；
   视频的 `audio_extracted` 与 `audio_normalized` 两条 note 语义重复（噪声）；`.file` / `get_file()`
   的禁令只有运行时探针、无静态 AST 守卫；迁移器双入口名（实现 + shim）会让文档慢慢漂；
@@ -241,8 +379,8 @@ video_provider_id | vision_provider_id | video_fp | PLUGIN_VERSION`；`mode` 与
 > `/root/AstrBot/data/plugins/astrbot_plugin_media_analysis` **不存在**，`pin-check.sh` 无本插件条目
 > ⇒ 「未安装」是实测事实，不是"大概没装"。安装归 fix + 人，派单见
 > `/root/workspace/astrbot/handoff/lanes/dev/20261022-order-fix-deploy-media-analysis-v0.1.0.md`。
-> （**后话**：2026-10-23 00:58 该派单被执行，生产装上了 v0.1.0；上面这句只对 2026-10-22 成立。当前
-> 生产状态与 v0.2 待部署情况见本文件顶部的「状态与已知限制」。）
+> （**后话**：2026-10-23 00:58 该派单被执行，生产装上了 v0.1.0；2026-10-23 23:10:20 换到 v0.2.0。
+> 上面这句只对 2026-10-22 成立；当前生产状态见本文件顶部 v0.3.0 条目与 `AGENTS.md` §4。）
 
 ### 能力
 
