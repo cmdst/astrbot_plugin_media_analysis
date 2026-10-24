@@ -1,9 +1,10 @@
 # astrbot_plugin_media_analysis
 
-上游仓库：<https://github.com/cmdst/astrbot_plugin_media_analysis>（v0.3.0）
+上游仓库：<https://github.com/cmdst/astrbot_plugin_media_analysis>（v0.4.0）
 
-给 LLM 一个工具 `media_analyze`：把**当前消息或引用消息**里的语音/视频（**含以「群文件」
-形式投递的 mp4/m4a/silk…**）交给多模态模型。**视频的主路径是「原生视频直送」**——
+给 LLM 一个工具 `media_analyze`：把**当前消息或引用消息**里的语音/视频/GIF
+（**含以「群文件」形式投递的 mp4/m4a/silk/gif…**）交给多模态模型。**工具调用是异步的**：
+受理即返回，分析在后台跑完再**唯一投递**一条结果消息（v0.4）。**视频的主路径是「原生视频直送」**——
 整段 mp4 以内联 base64 一次调用同时拿画面与声音；只有**视频模型**不可用（没配 / 非
 `openai_chat_completion` 适配器 / L1 未通过）、超过直送门槛且压不下去、原生调用失败时，
 才**回退**到「抽帧 + 独立的图片模型」。返回固定形状的 JSON 信封；
@@ -13,6 +14,68 @@
 `video` 的 0 个），而 `Record` 到手已是本地 wav、`Video` 一行 `convert_to_file_path()`
 就是本地文件、群文件一行 `file_`/`url` 就能拿到 —— 硬件条件齐了，缺的只是
 "把视频降维成模型能吃的东西"这一段编排。
+
+## v0.4 改了什么
+
+| # | 变更 | 一句话 |
+|---|---|---|
+| ① | **GIF 以视频解析** | `Image` 与群文件里的 GIF 一律先用 ffmpeg **归一成 mp4**，再走完全不变的原生视频链；判据是**魔数** `GIF87a`/`GIF89a`，不是后缀、也不是"能解出视频流" |
+| ② | **工具调用后台异步** | `media_analyze` **受理即返回**（4 键受理信封），分析在后台跑完并**唯一投递**一条中文结果消息；视频 30 s–数分钟不再阻塞会话 |
+| ③ | **修复 v0.3 缺陷** | 群文件 `.gif` 曾被**原始 GIF 字节**贴 `data:video/mp4` 直送（MIME/容器双错）；`Image .gif` 曾被判成 `kind=audio` |
+| ④ | **配置 0 新键** | 21 键 / 5 组 / 3 参数**一个不动**；错误码 21 → **23**，notes 41 → **44**（只加不改） |
+| ⑤ | **版本 `0.4.0`** | 结果缓存与 L1 探测**双冷启动**一次（`PLUGIN_VERSION` 是两者的键分量）；部署＝覆盖代码 + 一次重载 |
+
+### GIF 链路（v0.4）
+
+```
+[2] find_media            Record → Video → Image(GIF) → File
+[3] resolve_media_path    Image 多数已是本地；远程只有 .gif 后缀才受理并下载
+[3.5] confirm_gif         魔数二次确认：File 在此转正或降回（降回即走 v0.3 三段梯子）
+[4-pre] GIF 分支           时长闸（源）→ normalize_gif() → path = gif.mp4
+                          kind="video" / has_audio=False / has_video=True
+                          notes += source:gif, gif_converted:<in>-><out>, (gif_static)
+                          ⚠ 跳过 classify（它会把 Image 判成 kind=audio）
+[5..] 视频七跳             原生 → L1 探测 → 直送闸/压缩 → 抽帧 → 摘要（逐条不变）
+```
+
+- **判据只有魔数**：文件前 6 字节 ∈ `{GIF87a, GIF89a}`。后缀只决定"要不要去证实"。
+  为什么不能靠"ffprobe 有视频流"——它对 **PNG/APNG/WebP 也报 `codec_type=video`**，
+  只有 GIF 带 `format.duration`；靠"时长缺失"当判据是个随时会塌的副作用。
+- **普通图片仍然不进链**：`Image` + JPEG/PNG/WebP/APNG 在**受理路径**就返回
+  `MEDIA_NOT_FOUND`（同步、不建任务）；改名党（`.gif` 后缀 + 非 GIF 内容）也过不了魔数。
+- **冻结的 ffmpeg 参数**（代码常量，不新增配置键）：
+  `-an` · `fps=12` · `scale='trunc(min(640,iw)/2)*2':-2` · `yuv420p` ·
+  libx264 `veryfast` / `crf 26` · `-threads 1` · `+faststart` · `-f mp4`。
+  **`trunc(.../2)*2` 必不可少**：奇数宽 + `yuv420p` + libx264 ⇒ `rc=187`、**0 字节产物**。
+- **四道闸**：源字节（`limits.max_media_bytes`）/ 源时长（`limits.max_media_seconds`，
+  复用 `probe_duration_s`）/ 整次 ffmpeg **≤ 10 s** / 产物非空且不超上限。
+  失败码：体积 `MEDIA_TOO_LARGE`、时长 `MEDIA_TOO_LONG`、转换 `GIF_CONVERT_FAILED`。
+- **失败不回退成"原始 GIF 直送"**：失败要**可见**（用户看到一条失败消息），
+  不要"看起来成功"——那正是 v0.3 的缺陷形态。
+- **缓存**：`digest` 取**源 GIF 字节**（不是产物 mp4）⇒ 同一张 GIF 无论以 `Image` 还是
+  群文件形态到达都是**同一个缓存键**（共享缓存）。
+- **不支持 APNG/WebP 动图**：它们没有时长，"以视频解析"的前提不成立。
+
+### 后台语义（v0.4）
+
+工具**受理即返回**，三种信封形状互斥（键名不重叠，除 `ok`）：
+
+| 形状 | 何时 | 键 | 模型能看到吗 |
+|---|---|---|---|
+| **受理** | 任务已登记 | `ok` / `state` / `task_id` / `hint`（**恰好 4**，`state ∈ {accepted, running}`） | 是 |
+| 成功 | 分析完成 | 9 键（`kind`/`duration_s`/`transcript`/`frames`/`summary`/`notes`/`elapsed_ms`/`cached`/`ok`） | **否**——渲染成一条中文消息发给**用户** |
+| 失败 | 受理前 / 任务内 | `ok` / `error` / `hint`（恰好 3） | 受理前的直接看到；任务内的**变成**一条失败消息 |
+
+- **去重**：同一条消息、同一组参数、同一个会话再调一次 ⇒ 返回**同一个 `task_id`**
+  （`state="running"`），不新建任务；拿不到 `message_id` 时去重关闭。
+- **并发闸**：单会话 **3** / 单实例 **6**，超限立刻 `TOO_MANY_TASKS`（失败 3 键，同步）。
+- **投递 = at-most-once**：一次 `context.send_message`；**只有**它返回 `False`
+  （＝没找到平台、什么都没发）时才 `event.send` 兜底**一次**；任何异常只记 WARNING、
+  **不重试**。**重复消息比缺一条消息更伤** ⇒ 宁可少一条，绝不重复。
+- **取消**：`terminate()` 取消全部任务并等它们收尾（不留持有 `event` 的孤儿 task）；
+  取消**不投递**任何消息。
+- **不持久化**：进程重启/插件重载丢掉进行中的任务（用户侧＝"没有结果消息"），重发媒体即可。
+- **`/reset` 或用户打断不取消**后台任务（工作已付费，静默丢弃更糟），结果照常投递。
 
 ## v0.3 改了什么
 
@@ -104,7 +167,23 @@
 保守方向是刻意的：**误发值只该少抽帧，不该多花钱** —— 按"非零即真"猜会让一次误发变成
 `max_frames` 次视觉调用；落到 `auto` 最坏只是这次没抽帧（原生路径仍会试）。
 
-成功信封（9 键，顺序固定）：
+**受理信封（v0.4；4 键、顺序固定）**——工具**立即**返回它，分析在后台继续：
+
+```json
+{
+  "ok": true,
+  "state": "accepted",
+  "task_id": "9f2c1d7a4b6e4c8f9a0b1c2d3e4f5061",
+  "hint": "已受理：分析在后台进行，完成后结果会自动发到本会话。…"
+}
+```
+
+`state ∈ {"accepted","running"}`（`running` ＝同一条消息同一组参数已在跑，`task_id` 与首次
+相同）；`hint` 是**常量**（不夹带 `task_id`/路径/时长）。模型只会看到"受理"或"失败"两种，
+**分析结果不会回到模型手里**——它被渲染成一条中文消息发给用户（`—— 媒体分析：视频｜时长
+58.32s｜画面帧 0 张｜转写 0 字｜耗时 42.1s`，正文上限 1200 字，超出截断加 `…`）。
+
+成功信封（9 键，顺序固定）——**v0.4 起它出现在那条用户消息里，不再回给模型**：
 
 ```json
 {
@@ -122,8 +201,8 @@
 ```
 
 失败信封**恰好 3 键**：`{"ok": false, "error": "MEDIA_TOO_LONG", "hint": "…"}`。
-`error` 取值是 **21 条**错误码的封闭集合（v0.3：既有 18 条逐字未动 + `VIDEO_UNAVAILABLE` /
-`VIDEO_FAILED` / `VIDEO_TOO_LARGE`；见 `envelope.py`），`hint` 是**常量**文案
+`error` 取值是 **23 条**错误码的封闭集合（v0.4：既有 21 条逐字未动 +
+`GIF_CONVERT_FAILED` / `TOO_MANY_TASKS`；见 `envelope.py`），`hint` 是**常量**文案
 （不夹带路径/异常文本/时长/provider id）。**任何分支都不会把异常抛给模型**；唯一例外是
 `asyncio.CancelledError`（任务被取消时向上传播，否则框架无法取消正在跑的工具）。
 
@@ -364,6 +443,24 @@ python3 tools/probe_video_capability.py --provider <id> --clear          # 清�
 
 ## 部署与迁移
 
+### v0.3 → v0.4（比 v0.3 简单一档：**没有迁移步骤、没有第二次重载**）
+
+| 步 | 动作 | 校验 |
+|---|---|---|
+| 1 | 整目录备份（插件目录 + 插件配置） | 两个 `cp -a` 都在 |
+| 2 | 覆盖代码（`v0.4.0`） | `grep -m1 '^version:' metadata.yaml` ⇒ `v0.4.0` |
+| 3 | **重载一次** | 日志 `media_analysis ready:` 行**与 v0.3 逐字同形**（21 项全等，因为 0 新键） |
+| 4 | 复验 | 工具调用返回**受理信封**（4 键）；稍后收到**一条**结果消息 |
+
+- **不要**跑 `tools/migrate_config_v03.py`：schema 一个键没变，跑了只是白跑（它会把 21 键当
+  `keep`、其余 `skip`，无害但没必要）。
+- 反向回滚：回代码到 v0.3 的提交（`metadata.yaml` 与 `settings.PLUGIN_VERSION` 一起回，
+  否则 `tests/test_version.py` 红）+ 重载一次，**配置无需回滚**。
+- 缓存：v0.4 写的条目键含 `0.4.0`，v0.3 不会命中（不污染）；回滚后 v0.3 的旧条目若未被
+  淘汰**仍可命中**。升级方向则相反：**v0.3 的条目全部冷启动**（连同 L1 探测缓存）。
+
+### 通用前置
+
 1. 目录名必须**逐字**等于 `metadata.yaml` 的 `name`（`astrbot_plugin_media_analysis`）。
 2. `astrbot_version` 是 PEP 440 range：`>=4.29,<5`（当前核心 4.29.1 在内）。
 3. **人格工具白名单**：`persona["tools"]` 是 JSON 文本 —— `null`＝不限制工具集（本插件
@@ -486,9 +583,14 @@ python3 tools/migrate_config_v02.py --root /root/AstrBot --report-legacy    # �
 - **不去扫 `data/temp` 猜文件**：只用本次组件的 `file_`，或自己按 `url` 有界下载
   —— 目录里是别的消息留下的残缺品，按名字匹配等于把别人的文件当成本次媒体。
 - 图片不进本插件（多数 provider 自带 `image`，主模型自己就能吃）。
+  唯一的例外是 **GIF**：它不是"当图片看"，而是**归一成 mp4 当视频解析**（v0.4）。
+  **APNG / WebP 动图不支持** —— 它们没有 `format.duration`，"以视频解析"的前提不成立。
+- **后台任务不持久化**：进程重启/插件重载丢任务、不补发结果（v0.4 明确接受）。
+- **不给后台/ GIF 加运行时开关**：那会造"第二事实源"（与 v0.3 拒绝 kill switch 同一理由）；
+  紧急处置只有版本回滚（回滚后工具退回**同步**，代价是会话重新被 30 s–100 s 阻塞）。
 - 不做消息监听自动分析（每条群消息都跑＝给每条消息上税），只做 LLM 工具向。
 - 不做权限闸门（成本由 `limits.*` 封顶）。
-- 一次工具调用只处理**一条**媒体（当前消息或引用消息里的第一条 `Record`/`Video`/`File`）。
+- 一次工具调用只处理**一条**媒体（当前消息或引用消息里的第一条 `Record`/`Video`/GIF/`File`）。
 
 ## 许可
 

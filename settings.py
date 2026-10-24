@@ -35,7 +35,7 @@ from astrbot.api import logger as LOG
 PLUGIN_NAME = "astrbot_plugin_media_analysis"
 """插件目录名（== `metadata.yaml:name`，也 == 缓存 / probe 目录名）。"""
 
-PLUGIN_VERSION = "0.3.0"
+PLUGIN_VERSION = "0.4.0"
 """与 `metadata.yaml:version` 去掉 `v` 前缀后逐字相等（缓存键与 probe 键成分）。"""
 
 # --------------------------------------------------------------------------- #

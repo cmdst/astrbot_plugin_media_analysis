@@ -19,14 +19,13 @@ from __future__ import annotations
 
 import asyncio
 import re
-import time
 import traceback
 
 from astrbot.api import AstrBotConfig, logger as LOG
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 
-from . import analyze, cache, envelope, settings
+from . import analyze, background, cache, envelope, media, settings
 
 # --------------------------------------------------------------------------- #
 # 核心**内部面**加固（`error_redaction` 不在 `astrbot.api.*` 的公开导出里）。
@@ -173,7 +172,17 @@ class MediaAnalysisPlugin(Star):
             LOG.debug("media_analysis: 直送门槛提示跳过（%s）", type(exc).__name__)
 
     async def terminate(self) -> None:
-        """卸载：丢掉配置快照，关闭缓存（磁盘条目按 TTL 自然过期，可整目录删）。"""
+        """卸载：取消全部后台任务 → 丢掉配置快照 → 关闭缓存（条目按 TTL 自然过期）。
+
+        顺序有讲究：先取消任务再关缓存 —— 反过来的话后台任务会在已关闭的缓存上继续跑
+        一段（`DiskCache` 的写盘是幂等的，但"先断粮再收工"更干净）。
+
+        取消也是**双保险**：`background.cancel_all()` 对任务表 `cancel()` 并等它们收尾，
+        因此插件卸载后不留"持有 event/context 的孤儿 task"（SPEC-v0.4 §2.6）。
+        `terminate` 由核心在卸载/重载时调用（`core/star/star_manager.py:1965`），
+        且必须是**本类自身** `__dict__` 里的方法（核心只在 `star_cls_type.__dict__` 里找）。
+        """
+        await background.cancel_all()
         self._settings_cache = None
         store, self._cache = self._cache, None
         if store is not None:
@@ -285,30 +294,44 @@ class MediaAnalysisPlugin(Star):
         focus: str = "",
         include_frames: str = "auto",
     ) -> str:
-        """分析当前消息或引用消息里的语音/视频（视频默认整段直送多模态模型，含画面与声音）。
+        """分析当前消息或引用消息里的语音/视频/GIF 动图（视频默认整段直送多模态模型）。
 
-        当用户发来语音、视频，或引用了一条语音/视频，并且想知道"里面说了什么 / 画面发生了
-        什么"时调用本工具。**群里以「文件」形式发来的视频/语音也用 current 或 quoted 取，
-        不要传文件路径**。返回 JSON：转写文本（transcript）、可选的分帧画面描述（frames）、
-        摘要（summary），失败时返回 {ok:false, error, hint}。
+        当用户发来语音、视频、GIF 动图，或引用了一条语音/视频/GIF，并且想知道"里面说了
+        什么 / 画面发生了什么"时调用本工具。**群里以「文件」形式发来的视频/语音/GIF 也用
+        current 或 quoted 取，不要传文件路径**。普通图片（JPEG/PNG/WebP/APNG）不在本工具
+        范围内。
 
-        视频默认走"原生视频"（一次调用同时看画面和听声音，返回在 summary 里）。只有在视频
-        模型不可用/视频太大且压不下去/调用失败时，插件才按 include_frames 决定是否抽帧回退。
+        **本工具立即返回，分析在后台进行**：返回的要么是受理回执
+        {"ok":true,"state":"accepted","task_id":"…","hint":"…"}（同一条消息同一组参数重复
+        调用时 state 为 "running"，task_id 不变），要么是失败信封
+        {"ok":false,"error":"…","hint":"…"}。**分析结果不会回到你手里**——它会在完成时
+        自动发送给用户（一条中文消息，含摘要与"转写 N 字 / 耗时 N 秒"等页脚）。
+        因此你只需要回一句"已受理，稍后把结果发来"；不要编造分析内容，不要复述 task_id，
+        也不要在后续回合重复调用本工具。
+
+        视频默认走"原生视频"（一次调用同时看画面和听声音）。只有在视频模型不可用/视频太大
+        且压不下去/调用失败时，插件才按 include_frames 决定是否抽帧回退。GIF 会先归一成
+        mp4 再走同一条视频链，失败时报 GIF_CONVERT_FAILED。
 
         Args:
             target (string): 分析哪条消息。current＝当前消息（默认），quoted＝被引用的那条消息。
             focus (string): 用户想了解的重点问题（如「他在说什么事」）。留空表示要一份通篇摘要。
             include_frames (string): 三态。auto（默认）＝要画面，插件自己选路（原生视频优先，失败时若配了视觉模型就抽帧）；true＝明确要画面，原生失败必须抽帧回退；false＝明确不要画面，原生失败时绝不抽帧（只交音轨转写）。
+
+        Returns:
+            str: 受理信封（4 键）或失败信封（3 键）的 JSON 文本；分析结果由后台任务
+            单独发送给用户，不经由本返回值。
         """
-        started = time.monotonic()
         try:
             mode = _as_mode(include_frames)
-            payload = await analyze.analyze(
+            # 受理路径：类型判定 + 至多 6 字节魔数读（0 下载、0 转换、0 ffmpeg、0 provider）
+            await media.find_media(event, target)
+            payload = await background.submit(
                 context=self.context,
                 event=event,
                 target=target,
                 focus=focus,
-                include_frames=mode,
+                mode=mode,
                 settings=self._settings_cache or self._settings(),
                 cache=self._cache_store(),
             )

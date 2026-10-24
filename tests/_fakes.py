@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from astrbot.api.message_components import File, Plain, Record, Reply, Video
+from astrbot.api.message_components import File, Image, Plain, Record, Reply, Video
 from astrbot.api.provider import Provider, STTProvider
 
 try:  # 真核心（默认路径）：返回真的 LLMResponse，插件读的就是 `.completion_text`
@@ -69,6 +69,7 @@ __all__ = [
     "audio_chat",
     "make_event",
     "make_file",
+    "make_image",
     "make_record",
     "make_video",
     "native_video",
@@ -481,6 +482,7 @@ class FakeEvent:
         sender_id: str = "10001",
         group_id: str = "1000",
         message_str: str = "",
+        message_id: str = "",
     ) -> None:
         self._chain: list[Any] = list(chain or [])
         if quoted is not None:
@@ -490,7 +492,11 @@ class FakeEvent:
         self.sender_id = sender_id
         self.group_id = group_id
         self.message_str = message_str
-        self.message_obj = types.SimpleNamespace(message=self._chain)
+        self.message_obj = types.SimpleNamespace(
+            message=self._chain, message_id=message_id
+        )
+        #: 兜底投递记录（`background._deliver` 在 `send_message` 返回 False 时才用它）
+        self.sent: list[Any] = []
 
     def get_messages(self) -> list[Any]:
         return list(self._chain)
@@ -512,6 +518,10 @@ class FakeEvent:
         self._chain.append(Plain(text))
         return self
 
+    async def send(self, message_chain: Any) -> None:
+        """事件级发送（**兜底路径**）：记录到 `sent`，供"恰好一次"的断言数。"""
+        self.sent.append(message_chain)
+
 
 class TrackingFakeEvent(FakeEvent):
     """带 `track_temporary_local_file` 的变体（SPEC §9-4 的另一条路）。"""
@@ -522,6 +532,20 @@ class TrackingFakeEvent(FakeEvent):
 
     def track_temporary_local_file(self, path: str) -> None:
         self.tracked_files.append(str(path))
+
+
+def make_image(path: str | Path, *, url: str = "", name: str = "") -> Image:
+    """一行造 `Image`：`path`/`file` 都指向本地文件（核心预处理后的形状，SPEC-v0.4 §5.3）。
+
+    `url` 非空时**只**给远程引用（`path` 为空）—— 用来测"远程 GIF 只凭 `.gif` 后缀受理、
+    任务内下载后再验魔数"那条路。`name` 只有测试需要伪造文件名时才传。
+    """
+    image = Image(file=Path(path).resolve().as_uri() if path else url)
+    image.path = str(Path(path).resolve()) if path else ""
+    image.url = url or ""
+    if name:
+        setattr(image, "name", name)
+    return image
 
 
 def make_event(
@@ -549,6 +573,8 @@ class FakeContext:
         all_stt: `get_all_stt_providers` 的返回（阶梯第 ④ 步）。
         curr_stt: `provider_manager.curr_stt_provider_inst`（阶梯第 ③ 步，默认"属性不存在"）。
         has_provider_manager: False ⇒ `provider_manager` 为 `None`（测第 ③ 步落空）。
+        send_ok: `send_message` 的返回值（`False` = "没找到平台，什么都没发"，v0.4 的兜底分支）。
+        raise_on_send: `send_message` 抛出的异常（投递失败只 WARNING、不重试）。
     """
 
     def __init__(
@@ -560,8 +586,12 @@ class FakeContext:
         all_stt: list[Any] | None = None,
         curr_stt: Any = _UNSET,
         has_provider_manager: bool = True,
+        send_ok: bool = True,
+        raise_on_send: BaseException | None = None,
     ) -> None:
         self._by_id = dict(by_id or {})
+        self._send_ok = send_ok
+        self._raise_on_send = raise_on_send
         self._using_provider = using_provider
         self._using_stt = using_stt
         self._all_stt = list(all_stt or [])
@@ -590,6 +620,18 @@ class FakeContext:
     def get_all_stt_providers(self) -> list[Any]:
         self.calls.record("get_all_stt_providers")
         return list(self._all_stt)
+
+    # -- v0.4 后台结果投递面（SPEC-v0.4 §2.6 的 primary 路径） ---------------- #
+    async def send_message(self, session: Any, message_chain: Any) -> bool:
+        """主动发送：**真核心语义**是"找到平台 ⇒ True，找不到 ⇒ False 且什么都没发"。
+
+        `send_ok=False` 用来模拟"找不到平台"（后台投递的兜底分支）；`raise_on_send`
+        用来模拟平台层抛错（后台只记 WARNING、**不重试**）。
+        """
+        self.calls.record("send_message", session, message_chain)
+        if self._raise_on_send is not None:
+            raise self._raise_on_send
+        return bool(self._send_ok)
 
     # -- 断言辅助 ----------------------------------------------------------- #
     def provider_ids_asked(self) -> list[str]:

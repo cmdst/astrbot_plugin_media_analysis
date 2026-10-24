@@ -22,4 +22,7 @@ __all__ = [
     "media",
     "cache",
     "analyze",
+    "probe",
+    "video_native",
+    "background",
 ]

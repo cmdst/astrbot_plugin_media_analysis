@@ -1,4 +1,4 @@
-"""`notes` 词表（SPEC-v0.3 §11.2 的 39 条 + 评审 F7 / R1 各 1 条 = **41** 条）—— 主链路测试共用的唯一副本。
+"""`notes` 词表（v0.3 的 41 条 + **v0.4 的 3 条** = **44** 条）—— 主链路测试共用的唯一副本。
 
 为什么单独一份：v0.3 把 notes 从 20 条扩到 39 条，而"词表是封闭的"这条守卫要在**两个**
 主链路测试文件里都成立（`test_analyze.py` 守 v0.2 语义骨架、`test_video_chain.py` 守
@@ -11,6 +11,13 @@ v0.3 的原生/压缩/回退链）。各抄一份的结果必然漂：一边加�
 41 条 = v0.2 的 20 条（逐字不变）+ v0.3 的 19 条 + 评审的 2 条：
 - F7 `video_unavailable_no_provider`（`auto` 且未配视频模型 ⇒ 不抽帧、只转写）；
 - R1 `audio_timeout`（要画面时音轨超时只降级：记这条、继续走画面）。
+
+v0.4 再加 3 条（SPEC-v0.4 §7.2，只加不改）⇒ **44** 条：`source:gif` /
+`gif_converted:<in>-><out>` / `gif_static`。
+
+**纪律（v0.4 起）：notes 必须"缓存中立"** —— 不得因"这次是后台任务/第几次调用"而变。
+理由：信封整体入缓存，一条"后台"标记会被缓存复用给别的调用；任务生命周期信息
+**只进日志**（SPEC-v0.4 §7.2 / §4）。
 """
 
 from __future__ import annotations
@@ -72,7 +79,12 @@ V03_NOTES: frozenset[str] = frozenset(
     }
 )
 
-NOTE_WORDS: frozenset[str] = V02_NOTES | V03_NOTES
+#: v0.4 新增 **2 个词**（`SPEC-v0.4.md` §7.2 新增 3 条 note 形态，其中 `source:gif` 是
+#: 既有词 `source` 的**带参形态**，与 `source:file` 同构 ⇒ 不需要新词）：
+#: `gif_converted:<in>-><out>`（归一字节）与 `gif_static`（源 GIF 单帧）。
+V04_NOTES: frozenset[str] = frozenset({"gif_converted", "gif_static"})
+
+NOTE_WORDS: frozenset[str] = V02_NOTES | V03_NOTES | V04_NOTES
 
 #: 带参形态：`<word>:<param>`（`audio_provider:<id>` / `video_compressed:<from>-><to>` /
 #: `cache_age_s:<n>` / `frames_truncated:<kept>/<want>` …）。参数里**不许**有空白或换行。

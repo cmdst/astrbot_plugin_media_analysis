@@ -1,4 +1,4 @@
-"""版本与仓库信息守卫（SPEC-v0.3 §14.1；v0.2 §11 C9 / §13 的同一套）。
+"""版本与仓库信息守卫（SPEC-v0.4 §6.2；v0.3 §14.1 / v0.2 §11 C9 的同一套）。
 
 **为什么必须存在这一条**：`settings.PLUGIN_VERSION` 是**缓存键成分**（升级即整体失效），
 而 `metadata.yaml` 的 `version` 是加载器、面板与运维（`pin-check.sh`）看到的版本面。
@@ -29,7 +29,7 @@ METADATA = REPO_DIR / "metadata.yaml"
 CHANGELOG = REPO_DIR / "CHANGELOG.md"
 
 #: 用户要求的版本面（与 `metadata.yaml` / `settings.PLUGIN_VERSION` 三方一致）
-EXPECTED_VERSION = "0.3.0"
+EXPECTED_VERSION = "0.4.0"
 #: 用户要求补齐的上游仓库（逐字）
 EXPECTED_REPO = "https://github.com/cmdst/astrbot_plugin_media_analysis"
 

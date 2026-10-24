@@ -80,72 +80,81 @@ def _dead_component(path: Path | None = None, *, error: Exception | None = None)
 # --------------------------------------------------------------------------- #
 # 1. find_media：四种情形 + target 精确匹配
 # --------------------------------------------------------------------------- #
-def test_find_media_current_audio(media_fixtures: dict[str, Path]) -> None:
+@pytest.mark.asyncio
+async def test_find_media_current_audio(media_fixtures: dict[str, Path]) -> None:
     record = make_record(media_fixtures["audio_30s"])
-    handle = media.find_media(make_event(current=[record]), "current")
+    handle = await media.find_media(make_event(current=[record]), "current")
     assert handle.comp is record
     assert handle.quoted is False
     assert handle.kind == "audio"
 
 
-def test_find_media_current_video(media_fixtures: dict[str, Path]) -> None:
+@pytest.mark.asyncio
+async def test_find_media_current_video(media_fixtures: dict[str, Path]) -> None:
     video = make_video(media_fixtures["video_30s"])
-    handle = media.find_media(make_event(current=[video]), "current")
+    handle = await media.find_media(make_event(current=[video]), "current")
     assert handle.comp is video
     assert handle.kind == "video"
 
 
-def test_find_media_current_picks_first_media(media_fixtures: dict[str, Path]) -> None:
+@pytest.mark.asyncio
+async def test_find_media_current_picks_first_media(media_fixtures: dict[str, Path]) -> None:
     """一条消息里有多个媒体时只取第一条（SPEC §13-7：单条信封）。"""
     first = make_record(media_fixtures["audio_30s"])
     second = make_video(media_fixtures["video_30s"])
-    handle = media.find_media(make_event(current=[first, second]), "current")
+    handle = await media.find_media(make_event(current=[first, second]), "current")
     assert handle.comp is first  # 当前消息链不复制，identity 成立
 
 
-def test_find_media_quoted(media_fixtures: dict[str, Path]) -> None:
+@pytest.mark.asyncio
+async def test_find_media_quoted(media_fixtures: dict[str, Path]) -> None:
     video = make_video(media_fixtures["video_30s"])
     event = make_event(current=[], quoted=[video])
-    handle = media.find_media(event, "quoted")
+    handle = await media.find_media(event, "quoted")
     # `Reply(chain=[...])` 会经 pydantic 校验复制组件 ⇒ 比字段，不比 identity
     assert isinstance(handle.comp, Video)
     assert handle.comp.file == video.file
     assert handle.quoted is True
 
 
-def test_find_media_quoted_needs_a_reply_component() -> None:
+@pytest.mark.asyncio
+async def test_find_media_quoted_needs_a_reply_component() -> None:
     """引用链只从 `Reply.chain` 取（`components.py:585-600`）；普通消息不参与 quoted。"""
     with pytest.raises(envelope.ToolError) as exc_info:
-        media.find_media(make_event(current=[], quoted=[]), "quoted")
+        await media.find_media(make_event(current=[], quoted=[]), "quoted")
     assert _code(exc_info) == envelope.ERR_MEDIA_NOT_FOUND
 
 
-def test_find_media_quoted_ignores_media_outside_reply(media_fixtures: dict[str, Path]) -> None:
+@pytest.mark.asyncio
+async def test_find_media_quoted_ignores_media_outside_reply(media_fixtures: dict[str, Path]) -> None:
     record = make_record(media_fixtures["audio_30s"])
     with pytest.raises(envelope.ToolError) as exc_info:
-        media.find_media(make_event(current=[record], quoted=[]), "quoted")
+        await media.find_media(make_event(current=[record], quoted=[]), "quoted")
     assert _code(exc_info) == envelope.ERR_MEDIA_NOT_FOUND
 
 
-def test_find_media_quoted_only_one_layer(media_fixtures: dict[str, Path]) -> None:
+@pytest.mark.asyncio
+async def test_find_media_quoted_only_one_layer(media_fixtures: dict[str, Path]) -> None:
     """引用里的引用取不到链（aiocqhttp 递归时 `get_reply=False`，`components.py:325`）。"""
     record = make_record(media_fixtures["audio_30s"])
     nested = Reply(id="nested", chain=[record])
     outer = Reply(id="outer", chain=[nested])
     event = FakeEvent(chain=[outer])
     with pytest.raises(envelope.ToolError) as exc_info:
-        media.find_media(event, "quoted")
+        await media.find_media(event, "quoted")
     assert _code(exc_info) == envelope.ERR_MEDIA_NOT_FOUND
 
 
-def test_find_media_without_get_messages_is_media_not_found() -> None:
+@pytest.mark.asyncio
+async def test_find_media_without_get_messages_is_media_not_found() -> None:
     """平台给了个没有 `get_messages` 的事件对象也不许抛裸异常。"""
     with pytest.raises(envelope.ToolError) as exc_info:
-        media.find_media(SimpleNamespace(), "current")
+        await media.find_media(SimpleNamespace(), "current")
     assert _code(exc_info) == envelope.ERR_MEDIA_NOT_FOUND
 
 
-def test_broken_message_chain_is_media_unresolvable() -> None:
+@pytest.mark.asyncio
+async def test_broken_message_chain_is_media_unresolvable() -> None:
     """评审 F8：读消息链**本身**失败 ⇒ `MEDIA_UNRESOLVABLE`，不是 `MEDIA_NOT_FOUND`。
 
     两者对用户的指向完全不同：`MEDIA_NOT_FOUND` 说"这条消息里没有语音/视频"（用户会重发），
@@ -156,20 +165,21 @@ def test_broken_message_chain_is_media_unresolvable() -> None:
             raise RuntimeError("platform exploded")
 
     with pytest.raises(envelope.ToolError) as exc_info:
-        media.find_media(_BrokenEvent(), "current")
+        await media.find_media(_BrokenEvent(), "current")
     assert _code(exc_info) == envelope.ERR_MEDIA_UNRESOLVABLE
 
     # 对照：getter **不存在** 仍然是空链 ⇒ MEDIA_NOT_FOUND（两件事必须分开）
     with pytest.raises(envelope.ToolError) as exc_info:
-        media.find_media(SimpleNamespace(), "current")
+        await media.find_media(SimpleNamespace(), "current")
     assert _code(exc_info) == envelope.ERR_MEDIA_NOT_FOUND
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("target", ["x", "Current", "QUOTED", "当前", "", " current"])
-def test_find_media_rejects_any_other_target(target: str) -> None:
+async def test_find_media_rejects_any_other_target(target: str) -> None:
     """`target` 只认精确的 `current` / `quoted`，不做大小写或别名归一（SPEC §2.1）。"""
     with pytest.raises(envelope.ToolError) as exc_info:
-        media.find_media(FakeEvent(), target)
+        await media.find_media(FakeEvent(), target)
     assert _code(exc_info) == envelope.ERR_BAD_TARGET
 
 

@@ -10,7 +10,7 @@
 | [4] 原生调用 | 成功 ⇒ 信封里 `transcript=[]` + `summary=<整段回答>`，**零视觉、零抽帧、零音轨调用** |
 | [5] 回退 | 三态矩阵 36 组合逐一断言；**`mode=false` 任何组合都不得抽帧**（最硬的一条） |
 | [6] 摘要 | 原生成功时**不再**调摘要（那一跳的钱也不花） |
-| [7] 信封 | 9 键 / 恰好 3 键；notes ⊆ 41 条词表（F7/R1 各另加 1 条） |
+| [7] 信封 | 9 键 / 恰好 3 键；notes ⊆ 词表（v0.4 起 43 词） |
 
 以及两条跨跳的不变式：
 
@@ -1087,13 +1087,13 @@ async def test_workdir_and_compressed_product_are_removed_after_the_run(
 
 
 # --------------------------------------------------------------------------- #
-# 全部新分支的 note 合规（与 test_analyze 的同一份 41 条词表）
+# 全部新分支的 note 合规（与 test_analyze 的同一份词表，v0.4 起 43 词）
 # --------------------------------------------------------------------------- #
 @pytest.mark.asyncio
 async def test_every_v03_branch_emits_only_vocabulary_notes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """v0.3 新分支（原生/压缩/探测/预算/F7 成本闸/R1 音轨降级）产出的 notes 全部落在 41 条词表里。"""
+    """v0.3 新分支（原生/压缩/探测/预算/F7 成本闸/R1 音轨降级）产出的 notes 全部落在词表里。"""
     from astrbot_plugin_media_analysis import settings
 
     seen: set[str] = set()

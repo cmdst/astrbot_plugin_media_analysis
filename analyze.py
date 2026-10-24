@@ -13,9 +13,15 @@ v0.2 → v0.3 的结构性变化（一句话：**视频主路径改成"原生视
    `false` + 原生失败 ⇒ **绝不静默抽帧**（那是偷偷花两份钱）。
 5. **L1 可见性探测**（首次，缓存 7 天）+ **100 s 预算的 `remaining` 递减**。
 
+v0.4 只加一段（SPEC-v0.4 §5.12）：`[3.5]` 魔数二次确认 + `[4-pre]` **GIF 归一**——
+GIF（`Image` 或群文件）先用 `ffmpeg` 归一成 mp4，再走**完全不变**的视频七跳；
+`kind` 仍是 `"video"`，走 GIF 分支时**跳过 `classify`**（那一步会把 `Image` 判成
+`kind=audio`），缓存 digest 取**源 GIF 字节**。后台异步不在这层（`background.py`）。
+
 三个阶段的降级形状仍然固定：
-- 用户主诉求（转写 / 看画面）无法满足 ⇒ `ToolError`（错误码见 `envelope`，21 条）；
-- 附加项失败（某帧描述、摘要、压缩、探测）⇒ 成功信封 + `notes` 里的一条（39 条词表）。
+- 用户主诉求（转写 / 看画面）无法满足 ⇒ `ToolError`（错误码见 `envelope`，v0.4 起 23 条）；
+- 附加项失败（某帧描述、摘要、压缩、探测、GIF 归一之外的旁支）⇒ 成功信封 + `notes` 一条
+  （v0.4 起 43 个词 / 44 条形态）。
 
 本模块**自己建/删工作目录**（`tempfile.mkdtemp(prefix="media_analysis_")`，落在 `/tmp`），
 调用方不需要关心临时目录；中间产物（wav / 抽帧 jpg / 压缩产物 / 群文件下载物）用完即删，
@@ -226,8 +232,9 @@ async def analyze(
         max_seconds = int(settings.max_media_seconds)
         max_bytes = int(settings.max_media_bytes)
 
-        # 2 —— 定位媒体组件（Record → Video → File）
-        handle = media.find_media(event, target)
+        # 2 —— 定位媒体组件（Record → Video → Image(GIF) → File）
+        #     v0.4：**协程**（`Image` 的 GIF 判定要读 6 字节魔数）；普通图片在这里就被拒
+        handle = await media.find_media(event, target)
         if handle.from_file:
             notes.append("source:file")
 
@@ -239,18 +246,48 @@ async def analyze(
         if download_needed:
             notes.append("file_downloaded")
 
-        # 4 —— 判型 + 时长 + 流（File 走三段梯子；Record/Video 的时长失败仍 PROBE_FAILED）
-        kind, duration_s, has_audio, has_video = await media.classify(
-            handle, path, max_media_bytes=max_bytes, workdir=workdir
-        )
-        if duration_s > max_seconds:
-            raise envelope.ToolError(
-                envelope.ERR_MEDIA_TOO_LONG,
-                log_detail=f"duration_s={duration_s} max_media_seconds={max_seconds}",
+        # 3.5 —— GIF 魔数**二次确认**（SPEC-v0.4 §5.3/§5.12）：File 在此转正或降回，
+        #        Image 非 GIF 直接 MEDIA_NOT_FOUND（远程 `.gif` 那条路的收口点）
+        digest_source = path  # 缓存 digest 取【源】字节（GIF 归一前后都不变）
+        if handle.gif:
+            handle = media.confirm_gif(handle, path)
+
+        # 4-pre —— GIF 分支（SPEC-v0.4 §5.12）：时长闸（**源**）→ 归一 mp4 → 产物当视频用
+        #         ⚠ 必须跳过 `classify`：它会把 `Image` 判成 `kind=audio`（§1.2-M7 实测）
+        if handle.gif:
+            notes.append("source:gif")
+            source_duration_s = await media.probe_duration_s(path)
+            if source_duration_s > max_seconds:
+                raise envelope.ToolError(
+                    envelope.ERR_MEDIA_TOO_LONG,
+                    log_detail=(
+                        f"gif duration_s={source_duration_s} "
+                        f"max_media_seconds={max_seconds}"
+                    ),
+                )
+            gif = await media.normalize_gif(
+                path, workdir=workdir, max_media_bytes=max_bytes
             )
+            notes.append(f"gif_converted:{gif.source_size}->{gif.size}")
+            if gif.static:
+                notes.append("gif_static")
+            path = gif.path
+            kind, duration_s, has_audio, has_video = "video", gif.duration_s, False, True
+        else:
+            # 4 —— 判型 + 时长 + 流（File 走三段梯子；Record/Video 的时长失败仍 PROBE_FAILED）
+            kind, duration_s, has_audio, has_video = await media.classify(
+                handle, path, max_media_bytes=max_bytes, workdir=workdir
+            )
+            if duration_s > max_seconds:
+                raise envelope.ToolError(
+                    envelope.ERR_MEDIA_TOO_LONG,
+                    log_detail=f"duration_s={duration_s} max_media_seconds={max_seconds}",
+                )
 
         # 5 —— 内容哈希 + 缓存键（v3：12 分量，含 mode 与 video_fp）
-        digest = await media.content_digest(path)
+        #     GIF 用**源**字节（不是产物 mp4）⇒ 同一张 GIF 以 Image / File 两种形态到达时
+        #     字节相同 ⇒ 同一个键 ⇒ 共享缓存（SPEC-v0.4 §5.11）
+        digest = await media.content_digest(digest_source)
         key = cache_mod.build_key(
             digest=digest,
             kind=kind,

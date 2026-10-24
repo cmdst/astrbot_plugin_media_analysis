@@ -14,7 +14,12 @@ hint 是唯一可能夹带运行时数据的位置，钉成常量就整条链干
 
 v0.3（SPEC-v0.3 §11.1）**只加不改**：既有 18 条逐字不变，新增 3 条视频链路的终态码
 `VIDEO_UNAVAILABLE` / `VIDEO_FAILED` / `VIDEO_TOO_LARGE` ⇒ 共 **21 条**。
-信封形状**完全不变**（成功 9 键 / 失败恰好 3 键）。
+
+v0.4（SPEC-v0.4 §7.1 / §3）**只加不改**：既有 21 条逐字不变，新增 2 条
+`GIF_CONVERT_FAILED`（GIF 归一失败/超时/空产物）与 `TOO_MANY_TASKS`（两级并发闸）⇒ **23 条**；
+同时把信封从"两种形状"扩到"**三种形状**"：新增**受理态** 4 键
+`{"ok","state","task_id","hint"}`（`ACCEPT_KEYS`），与既有成功 9 键 / 失败 3 键**键名不重叠**
+（除 `ok`）。这是 v0.1 以来第一次动信封形状，属**契约变更**（评审已批准）。
 """
 
 from __future__ import annotations
@@ -41,9 +46,11 @@ ERR_VISION_FAILED = "VISION_FAILED"
 ERR_VIDEO_UNAVAILABLE = "VIDEO_UNAVAILABLE"
 ERR_VIDEO_FAILED = "VIDEO_FAILED"
 ERR_VIDEO_TOO_LARGE = "VIDEO_TOO_LARGE"
+ERR_GIF_CONVERT_FAILED = "GIF_CONVERT_FAILED"  # v0.4 新增
+ERR_TOO_MANY_TASKS = "TOO_MANY_TASKS"  # v0.4 新增
 ERR_INTERNAL_ERROR = "INTERNAL_ERROR"
 
-# 唯一事实源：21 条逐字静态文案（SPEC-v0.2 §8.1 + SPEC-v0.3 §11.1 是它的视图）。
+# 唯一事实源：23 条逐字静态文案（SPEC-v0.2 §8.1 + SPEC-v0.3 §11.1 + SPEC-v0.4 §7.1 是它的视图）。
 HINTS: dict[str, str] = {
     "BAD_TARGET": (
         "target 只接受 current 或 quoted；不要传文件路径。"
@@ -93,6 +100,9 @@ HINTS: dict[str, str] = {
         "视频体积超过直送门槛且压不到门槛内；请让管理员调大 video.max_direct_bytes，"
         "或把 include_frames 设为 auto 或 true 改走抽帧。"
     ),
+    # —— v0.4 新增 2 条（SPEC-v0.4 §7.1；既有 21 条逐字不变）——
+    "GIF_CONVERT_FAILED": "这张动图（GIF）转换失败；请重试，或让用户改发视频。",
+    "TOO_MANY_TASKS": "当前会话或实例正在分析的媒体太多；请等前面的结果发出来再试。",
     "INTERNAL_ERROR": "插件内部错误；已记录日志，请让管理员查看插件日志。",
 }
 
@@ -109,6 +119,23 @@ OK_KEYS: tuple[str, ...] = (
     "cached",
 )
 FAIL_KEYS: tuple[str, ...] = ("ok", "error", "hint")
+
+#: 受理信封的 4 个键，**顺序固定**（SPEC-v0.4 §3.2）。三种形状的键集合两两不相交（除 `ok`）。
+ACCEPT_KEYS: tuple[str, ...] = ("ok", "state", "task_id", "hint")
+
+#: 受理信封 `state` 的两个取值（枚举封闭，SPEC-v0.4 §3.2）。
+#: `accepted` = 新任务已登记；`running` = 同一条消息同一组参数已在跑（去重命中，`task_id` 相同）。
+STATE_ACCEPTED = "accepted"
+STATE_RUNNING = "running"
+ACCEPT_STATES: frozenset[str] = frozenset({STATE_ACCEPTED, STATE_RUNNING})
+
+#: 受理回执给模型的那句话。与 `HINTS` **同一纪律**：纯常量，不夹带任何运行时数据
+#: （不含 `{` / 路径 / URL / 数字串）。模型看到的就是这一句，改一个字都是契约变更。
+ACCEPT_HINT = (
+    "已受理：分析在后台进行，完成后结果会自动发到本会话。"
+    "你现在只回一句「已受理，稍后把结果发来」即可——"
+    "不要编造内容，也不要再调用 media_analyze。"
+)
 
 
 class ToolError(Exception):
@@ -156,6 +183,22 @@ def ok_envelope(
         "notes": notes,
         "elapsed_ms": int(elapsed_ms),
         "cached": bool(cached),
+    }
+
+
+def accept_envelope(state: str, task_id: str) -> dict[str, object]:
+    """受理信封：**恰好** `ok` / `state` / `task_id` / `hint` 四键、顺序固定（SPEC-v0.4 §3.2）。
+
+    与失败信封同一纪律：键集合能被一次断言，任何"顺手多塞一个键"都是契约变更。
+    `state` 不在枚举里 ⇒ 归一到 `accepted`（不留悬空字符串，与 `fail_envelope` 同思路）；
+    `task_id` 只用于日志与去重，**不进用户可见文本**。
+    """
+    safe_state = state if state in ACCEPT_STATES else STATE_ACCEPTED
+    return {
+        "ok": True,
+        "state": safe_state,
+        "task_id": str(task_id or ""),
+        "hint": ACCEPT_HINT,
     }
 
 

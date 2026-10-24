@@ -43,6 +43,8 @@ _PACKAGE_MODULES = {
     # v0.3 新增两个模块（原生视频通道 / L1 探测）；漏登记 = 漏扫一片扁平导入
     "probe",
     "video_native",
+    # v0.4 新增后台任务表（SPEC-v0.4 §2.6）；漏登记 = 漏扫一片扁平导入
+    "background",
 }
 
 #: docstring 能生成的类型词（`provider/func_tool_manager.py:128-145`）。
@@ -275,10 +277,13 @@ def test_envelope_exports_the_frozen_key_orders() -> None:
         "cached",
     )
     assert envelope.FAIL_KEYS == ("ok", "error", "hint")
+    # v0.4 的第三种形状（SPEC-v0.4 §3.2）：受理态 4 键、顺序固定
+    assert envelope.ACCEPT_KEYS == ("ok", "state", "task_id", "hint")
+    assert envelope.ACCEPT_STATES == {"accepted", "running"}
 
 
-#: **21 条** `hint` 的逐字快照（v0.2 的 18 条 + v0.3 的 3 条）。模型唯一读到的操作性文案，
-#: 改一个字都要改这里。
+#: **23 条** `hint` 的逐字快照（v0.2 的 18 条 + v0.3 的 3 条 + v0.4 的 2 条）。
+#: 模型唯一读到的操作性文案，改一个字都要改这里。
 #: 抄自 `envelope.py` 的 `HINTS`；这不是"再抄一遍实现"，而是**契约文本**——
 #: 之前用 `envelope.HINTS[...]` 自证，改错文案全套仍绿，等于没人守。
 HINTS_SNAPSHOT: dict[str, str] = {
@@ -303,12 +308,15 @@ HINTS_SNAPSHOT: dict[str, str] = {
     "VIDEO_UNAVAILABLE": "没有可用的视频模型，也无法回退抽帧；请让管理员在插件配置里指定「视频模型」（走原生视频），或把 include_frames 设为 true 并配置「视觉模型」。",
     "VIDEO_FAILED": "视频模型调用失败或超时；请稍后重试，或让管理员调大 video.native_timeout_seconds。",
     "VIDEO_TOO_LARGE": "视频体积超过直送门槛且压不到门槛内；请让管理员调大 video.max_direct_bytes，或把 include_frames 设为 auto 或 true 改走抽帧。",
+    # —— v0.4 新增 2 条（SPEC-v0.4 §7.1，既有 21 条逐字不变）——
+    "GIF_CONVERT_FAILED": "这张动图（GIF）转换失败；请重试，或让用户改发视频。",
+    "TOO_MANY_TASKS": "当前会话或实例正在分析的媒体太多；请等前面的结果发出来再试。",
     "INTERNAL_ERROR": "插件内部错误；已记录日志，请让管理员查看插件日志。",
 }
 
 
-def test_envelope_hints_cover_all_twenty_one_codes() -> None:
-    """v0.3 是 **21** 码 = v0.2 的 18 条（逐字不变）+ 视频链路的 3 条终态码。
+def test_envelope_hints_cover_all_twenty_three_codes() -> None:
+    """v0.4 是 **23** 码 = v0.2 的 18 条 + v0.3 的 3 条 + v0.4 的 2 条（只加不改）。
 
     码集合与 `HINTS` 键集合必须逐字相等：只加 `ERR_*` 忘了加 hint ⇒ 信封里会出现
     `hint=None` 或 KeyError（`fail_envelope` 会把它归到 `INTERNAL_ERROR`，把真因藏掉）。
@@ -318,10 +326,10 @@ def test_envelope_hints_cover_all_twenty_one_codes() -> None:
         for name, value in vars(envelope).items()
         if name.startswith("ERR_") and isinstance(value, str)
     }
-    assert len(codes) == 21, sorted(codes)
+    assert len(codes) == 23, sorted(codes)
     assert set(envelope.HINTS) == codes
     assert set(HINTS_SNAPSHOT) == codes
-    # v0.3 只加不改：18 条老码一个都没消失
+    # v0.3/v0.4 只加不改：18 条老码一个都没消失
     for legacy in (
         "BAD_TARGET",
         "MEDIA_NOT_FOUND",
@@ -351,7 +359,14 @@ def test_new_video_hints_carry_no_runtime_data() -> None:
 
     信封会被框架按 INFO 全量写进生产日志 ⇒ hint 是唯一可能夹带运行时数据的位置。
     """
-    for code in ("VIDEO_UNAVAILABLE", "VIDEO_FAILED", "VIDEO_TOO_LARGE"):
+    for code in (
+        "VIDEO_UNAVAILABLE",
+        "VIDEO_FAILED",
+        "VIDEO_TOO_LARGE",
+        # v0.4 的两条同样受这条纪律约束（SPEC-v0.4 §7.1 的 hint 是常量）
+        "GIF_CONVERT_FAILED",
+        "TOO_MANY_TASKS",
+    ):
         hint = envelope.HINTS[code]
         assert hint and hint.strip() == hint
         assert not re.search(r"\d", hint), f"{code} 的 hint 里出现数字：{hint!r}"
@@ -368,9 +383,9 @@ def test_removed_stt_codes_are_really_gone() -> None:
 
 
 def test_envelope_hints_match_the_frozen_snapshot_verbatim() -> None:
-    """评审 F3：21 条 `hint` 逐字快照（dict 全等，不只看键集合）。
+    """评审 F3：23 条 `hint` 逐字快照（dict 全等，不只看键集合）。
 
-    这是本仓库唯一的"文案级"契约：模型看到的就是这 21 句，错一个字就等于给模型
+    这是本仓库唯一的"文案级"契约：模型看到的就是这 23 句，错一个字就等于给模型
     错误的操作指令（"换一条视频"vs"去看日志"指错方向）。要改文案：先改 SPEC §5 表，
     再改 `envelope.HINTS`，最后改这里 —— 三处一起动才算契约变更。
     """

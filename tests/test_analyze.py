@@ -45,6 +45,7 @@ from types import SimpleNamespace
 import pytest
 
 from astrbot_plugin_media_analysis import analyze as analyze_mod
+from astrbot_plugin_media_analysis import background
 from astrbot_plugin_media_analysis import cache as cache_mod
 from astrbot_plugin_media_analysis import envelope, main, media, providers, settings
 from _fakes import (
@@ -57,7 +58,7 @@ from _fakes import (
     make_video,
 )
 
-#: notes 词表（SPEC-v0.3 §11.2 的 39 条 + 评审 F7/R1 各 1 条 = 41 条）的唯一副本在 `tests/_vocab.py` ——
+#: notes 词表（v0.3 的 41 条 + v0.4 的 2 词 = 43 词）的唯一副本在 `tests/_vocab.py` ——
 #: 两个主链路测试文件共用一份，避免"一边加了新词、另一边还按旧词表断言"。
 from _vocab import NOTE_PATTERN, NOTE_WORDS, bad_notes  # noqa: E402
 
@@ -823,8 +824,13 @@ async def test_tool_facade_propagates_cancelled_error(
         raise asyncio.CancelledError()
 
     monkeypatch.setattr(analyze_mod, "analyze", _boom)
-    with pytest.raises(asyncio.CancelledError):
-        await rig.tool()
+    # v0.4：取消发生在**后台任务**里（门面已返回受理回执），所以断言变成两条 ——
+    # ① 任务以 cancelled 收尾（`wait()` 拿不到任何信封，绝不能被收成 INTERNAL_ERROR）；
+    # ② 取消**不投递**（没有结果消息，也没有兜底发送）。
+    payload = await rig.tool_expect_accept()
+    assert await background.wait(payload["task_id"], timeout=10.0) is None
+    assert rig.context.calls.named("send_message") == []
+    assert rig.event.sent == []
 
 
 @pytest.mark.asyncio
@@ -833,7 +839,10 @@ async def test_tool_controlled_failure_is_logged_and_enveloped(
 ) -> None:
     """§3.3：`ToolError` 走 INFO 日志 + 3 键信封；`log_detail` 不进信封。"""
     log = RecordingLogger()
+    # v0.4：`ToolError` 在**后台任务**里被捕获（`background._run`），日志从那里出，
+    # 因此两处 LOG 都收进同一个 recorder（门面在受理前仍可能记一条）
     monkeypatch.setattr(main, "LOG", log)
+    monkeypatch.setattr(background, "LOG", log)
     rig = build_rig(monkeypatch, tmp_path, duration=70.0, kind="video")
 
     payload = await rig.tool()
@@ -877,18 +886,23 @@ async def test_hint_is_static_across_runs(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert first == second
 
 
-def test_note_vocabulary_has_forty_one_words() -> None:
-    """词表 = 41 条（v0.2 的 20 条逐字不变 + v0.3 的 19 条 + 评审 F7/R1 各 1 条），且带参形态可解析。
+def test_note_vocabulary_has_forty_three_words() -> None:
+    """词表 = 43 **词**（v0.2 的 20 + v0.3 的 21 + v0.4 的 2），且带参形态可解析。
+
+    条数口径：v0.4 新增 3 条 note **形态**，其中 `source:gif` 是既有词 `source` 的带参
+    形态（与 `source:file` 同构）⇒ 只加 2 个新词。
 
     这条在**不跑主链路**的情况下就能红：谁在 `analyze.py` 里新加一个 note 却忘了同步词表，
     `test_notes_always_come_from_the_frozen_vocabulary` 会红，而这条说明"正确的条数是多少"。
     """
-    from _vocab import V02_NOTES, V03_NOTES
+    from _vocab import V02_NOTES, V03_NOTES, V04_NOTES
 
     assert len(V02_NOTES) == 20
     assert len(V03_NOTES) == 21  # v0.3 的 19 条 + 评审 F7 的 1 条 + R1 的 1 条
-    assert len(NOTE_WORDS) == 41
+    assert len(V04_NOTES) == 2  # v0.4：gif_converted / gif_static
+    assert len(NOTE_WORDS) == 43
     assert V02_NOTES & V03_NOTES == set(), "v0.3 的 19 条不许与 v0.2 重名"
+    assert not (V04_NOTES & (V02_NOTES | V03_NOTES)), "v0.4 的 2 条不许与旧词重名"
     # 带参形态：`:参数` 可含 `->` / `/` / `:`，但不许有空白（否则日志会被拆词）
     assert NOTE_PATTERN.match("video_compressed:1234->567")
     assert NOTE_PATTERN.match("frames_truncated:0/6")
@@ -902,7 +916,7 @@ def test_note_vocabulary_has_forty_one_words() -> None:
 async def test_notes_always_come_from_the_frozen_vocabulary(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """C7：`notes` 词必须 ⊆ 41 条词表（含 `:<参数>` 形式；F7/R1 各另加 1 条）。
+    """C7：`notes` 词必须 ⊆ 43 词表（含 `:<参数>` 形式；F7/R1/v0.4 的 2 条也在内）。
 
     覆盖的场景要足够杂：带帧回退 / 无音轨 / 仅语音 / 空转写 / 截断 focus / 缓存命中。
     v0.3 的原生-压缩-回退链另在 `tests/test_video_chain.py` 里做同一份断言。

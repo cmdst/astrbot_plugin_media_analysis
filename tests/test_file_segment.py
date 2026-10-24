@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from astrbot_plugin_media_analysis import analyze as analyze_mod
+from astrbot_plugin_media_analysis import background
 from astrbot_plugin_media_analysis import cache as cache_mod
 from astrbot_plugin_media_analysis import envelope, media, providers, settings
 from _fakes import (
@@ -44,7 +45,7 @@ def _code(exc_info: pytest.ExceptionInfo) -> str:
     return exc_info.value.code
 
 
-def _file_handle(path: Path, *, name: str | None = None, quoted: bool = False):
+async def _file_handle(path: Path, *, name: str | None = None, quoted: bool = False):
     """从一条真实的 `File` 组件拿到 `MediaHandle`（走真 `find_media`，不手搓 handle）。"""
     comp = make_file(name or path.name, file=str(path))
     event = (
@@ -52,31 +53,34 @@ def _file_handle(path: Path, *, name: str | None = None, quoted: bool = False):
         if quoted
         else make_event(current=[comp])
     )
-    return media.find_media(event, "quoted" if quoted else "current")
+    return await media.find_media(event, "quoted" if quoted else "current")
 
 
 # --------------------------------------------------------------------------- #
 # 1. 定位：File 段进候选集、优先级、`log_detail` 带真实组件类型
 # --------------------------------------------------------------------------- #
-def test_find_media_accepts_a_file_segment(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_find_media_accepts_a_file_segment(tmp_path: Path) -> None:
     """核心事实：`File` 也是媒体候选 ⇒ `from_file=True`（取件走决策树）。"""
     path = tmp_path / "clip.mp4"
     path.write_bytes(b"\x00")
-    handle = _file_handle(path)
+    handle = await _file_handle(path)
     assert handle.from_file is True
     assert handle.quoted is False
     assert handle.name == "clip.mp4"
 
 
-def test_find_media_quoted_file_segment(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_find_media_quoted_file_segment(tmp_path: Path) -> None:
     path = tmp_path / "clip.mp4"
     path.write_bytes(b"\x00")
-    handle = _file_handle(path, quoted=True)
+    handle = await _file_handle(path, quoted=True)
     assert handle.from_file is True
     assert handle.quoted is True
 
 
-def test_find_media_priority_is_record_then_video_then_file(
+@pytest.mark.asyncio
+async def test_find_media_priority_is_record_then_video_then_file(
     media_fixtures: dict[str, Path], tmp_path: Path
 ) -> None:
     """优先级是**全链**的：同一条消息里既有 `File` 又有 `Record` ⇒ 选 `Record`。
@@ -85,45 +89,49 @@ def test_find_media_priority_is_record_then_video_then_file(
     """
     file_comp = make_file("附件.mp4", file=str(tmp_path / "x.mp4"))
     record = make_record(media_fixtures["audio_30s"])
-    handle = media.find_media(make_event(current=[file_comp, record]), "current")
+    handle = await media.find_media(make_event(current=[file_comp, record]), "current")
     assert handle.from_file is False, "Record 优先于 File"
 
     video = make_record(media_fixtures["video_5s"])  # 用 Video 更贴切，见下一条
     assert video is not None
 
 
-def test_find_media_priority_video_beats_file(tmp_path: Path, media_fixtures: dict[str, Path]) -> None:
+@pytest.mark.asyncio
+async def test_find_media_priority_video_beats_file(tmp_path: Path, media_fixtures: dict[str, Path]) -> None:
     from _fakes import make_video
 
     file_comp = make_file("附件.mp4", file=str(tmp_path / "x.mp4"))
     video = make_video(media_fixtures["video_5s"])
-    handle = media.find_media(make_event(current=[file_comp, video]), "current")
+    handle = await media.find_media(make_event(current=[file_comp, video]), "current")
     assert handle.from_file is False, "Video 优先于 File"
 
 
-def test_missing_media_log_detail_carries_real_component_names() -> None:
+@pytest.mark.asyncio
+async def test_missing_media_log_detail_carries_real_component_names() -> None:
     """`log_detail` 必须写**真实组件类型名**（v0.1 只写 `no Record/Video`，定位不了 File 段）。"""
     event = make_event(current=[], quoted=None).plain("只有文字")
     with pytest.raises(envelope.ToolError) as exc_info:
-        media.find_media(event, "current")
+        await media.find_media(event, "current")
     assert _code(exc_info) == envelope.ERR_MEDIA_NOT_FOUND
     assert "chain=[Plain]" in exc_info.value.log_detail, exc_info.value.log_detail
 
 
-def test_missing_media_log_detail_quoted_shows_both_layers() -> None:
+@pytest.mark.asyncio
+async def test_missing_media_log_detail_quoted_shows_both_layers() -> None:
     """引用链里没有媒体时，`log_detail` 同时给引用链与**外层**链的类型名。"""
     from astrbot.api.message_components import Plain, Reply
 
     inner = [Plain("被引用的文字")]
     event = make_event(current=[Plain("外层"), Reply(id="r1", chain=inner)])
     with pytest.raises(envelope.ToolError) as exc_info:
-        media.find_media(event, "quoted")
+        await media.find_media(event, "quoted")
     detail = exc_info.value.log_detail
     assert "chain=[Plain]" in detail, detail
     assert "outer=[Plain, Reply]" in detail, detail
 
 
-def test_broken_message_chain_is_still_media_unresolvable() -> None:
+@pytest.mark.asyncio
+async def test_broken_message_chain_is_still_media_unresolvable() -> None:
     """读消息链本身失败 ⇒ `MEDIA_UNRESOLVABLE`，不许伪装成"消息里没有媒体"。"""
 
     class _Broken:
@@ -131,7 +139,7 @@ def test_broken_message_chain_is_still_media_unresolvable() -> None:
             raise RuntimeError("adapter exploded")
 
     with pytest.raises(envelope.ToolError) as exc_info:
-        media.find_media(_Broken(), "current")
+        await media.find_media(_Broken(), "current")
     assert _code(exc_info) == envelope.ERR_MEDIA_UNRESOLVABLE
     assert "RuntimeError" in exc_info.value.log_detail
 
@@ -148,18 +156,19 @@ def test_file_uri_to_path_variants(tmp_path: Path) -> None:
     assert media.file_uri_to_path("file:///tmp/%E9%99%84%E4%BB%B6.mp4") == "/tmp/附件.mp4"
 
 
-def test_file_download_needed_truth_table(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_file_download_needed_truth_table(tmp_path: Path) -> None:
     """`file_download_needed` 的判定必须与 `resolve_media_path` 的分支一致（notes 溯源用）。"""
     existing = tmp_path / "a.mp4"
     existing.write_bytes(b"\x00")
-    assert media.file_download_needed(_file_handle(existing)) is False
+    assert media.file_download_needed(await _file_handle(existing)) is False
 
-    missing_but_url = media.find_media(
+    missing_but_url = await media.find_media(
         make_event(current=[make_file("a.mp4", url="http://example.invalid/a.mp4")]), "current"
     )
     assert media.file_download_needed(missing_but_url) is True
 
-    neither = media.find_media(make_event(current=[make_file("a.pdf")]), "current")
+    neither = await media.find_media(make_event(current=[make_file("a.pdf")]), "current")
     assert media.file_download_needed(neither) is False
 
     # 非 File 段永远是 False（Record 走预处理落地，Video 走 convert_to_file_path）
@@ -176,7 +185,7 @@ async def test_resolve_file_path_uses_file_uri_without_download(
 ) -> None:
     target = tmp_path / "clip.mp4"
     target.write_bytes(b"\x00" * 16)
-    handle = _file_handle(target)
+    handle = await _file_handle(target)
 
     async def _boom(*_args, **_kwargs):  # pragma: no cover - 走到就是错
         raise AssertionError("file_ 已可用，不许走下载")
@@ -204,7 +213,7 @@ async def test_resolve_file_path_downloads_when_only_url(
         return str(out)
 
     monkeypatch.setattr(media, "download_bounded", _download)
-    handle = media.find_media(
+    handle = await media.find_media(
         make_event(current=[make_file("clip.mp4", url="http://example.invalid/c.mp4")]), "current"
     )
     resolved = await media.resolve_media_path(
@@ -223,7 +232,7 @@ async def test_resolve_file_path_downloads_when_only_url(
 @pytest.mark.asyncio
 async def test_resolve_file_path_without_file_and_url_is_unresolvable(tmp_path: Path) -> None:
     """`file_` 与 `url` 都空 ⇒ `MEDIA_UNRESOLVABLE`（**不**去碰 `.file` 属性 / `get_file()`）。"""
-    handle = media.find_media(make_event(current=[make_file("a.pdf")]), "current")
+    handle = await media.find_media(make_event(current=[make_file("a.pdf")]), "current")
     with pytest.raises(envelope.ToolError) as exc_info:
         await media.resolve_media_path(
             handle, workdir=str(tmp_path), max_media_bytes=_MAX_BYTES
@@ -435,7 +444,7 @@ async def test_classify_file_whitelisted_real_video(
     """① 白名单内 + 真视频 ⇒ `("video", 5.0, has_audio=True, has_video=True)`。"""
     target = tmp_path / "clip.mp4"
     shutil.copyfile(media_fixtures["video_5s"], target)
-    handle = _file_handle(target)
+    handle = await _file_handle(target)
     kind, duration, has_audio, has_video = await media.classify(
         handle, str(target), max_media_bytes=_MAX_BYTES, workdir=str(tmp_path)
     )
@@ -449,7 +458,7 @@ async def test_classify_file_whitelisted_real_audio(
     """① 白名单内 + 真音频（wav）⇒ `("audio", 30.0, True, False)`（没有视频流）。"""
     target = tmp_path / "voice.wav"
     shutil.copyfile(media_fixtures["audio_30s"], target)
-    handle = _file_handle(target)
+    handle = await _file_handle(target)
     kind, duration, has_audio, has_video = await media.classify(
         handle, str(target), max_media_bytes=_MAX_BYTES, workdir=str(tmp_path)
     )
@@ -465,7 +474,7 @@ async def test_classify_file_outside_whitelist_non_media_is_unsupported(tmp_path
     """
     target = tmp_path / "manual.pdf"
     target.write_bytes(b"%PDF-1.4\n" + b"\x00" * 512)
-    handle = _file_handle(target)
+    handle = await _file_handle(target)
     with pytest.raises(envelope.ToolError) as exc_info:
         await media.classify(
             handle, str(target), max_media_bytes=_MAX_BYTES, workdir=str(tmp_path)
@@ -482,7 +491,7 @@ async def test_classify_file_whitelisted_but_probe_fails_is_unsupported(tmp_path
     """
     target = tmp_path / "broken.mp4"
     target.write_bytes(b"\x00\x01\x02not a media file\xff" * 32)
-    handle = _file_handle(target)
+    handle = await _file_handle(target)
 
     # 先证明"探测确实失败"（而不是恰好没有流）：rc != 0 ⇒ PROBE_FAILED
     with pytest.raises(envelope.ToolError) as probe_exc:
@@ -517,7 +526,7 @@ async def test_classify_file_silk_ladder_saves_ffprobe_failure(
         return output_path
 
     monkeypatch.setattr(media, "_core_ensure_wav", _fake_ensure_wav)
-    handle = _file_handle(target)
+    handle = await _file_handle(target)
     kind, duration, has_audio, has_video = await media.classify(
         handle, str(target), max_media_bytes=_MAX_BYTES, workdir=str(tmp_path)
     )
@@ -531,7 +540,7 @@ async def test_classify_file_silk_undecodable_still_unsupported(tmp_path: Path) 
     """对称面：白名单命中 + 探测失败 + **解不成音频** ⇒ 仍是 `UNSUPPORTED_MEDIA_TYPE`。"""
     target = tmp_path / "voice.silk"
     target.write_bytes(b"\x02#!SILK_V3" + b"\x00" * 64)
-    handle = _file_handle(target)
+    handle = await _file_handle(target)
     with pytest.raises(envelope.ToolError) as exc_info:
         await media.classify(
             handle, str(target), max_media_bytes=_MAX_BYTES, workdir=str(tmp_path)
@@ -546,7 +555,7 @@ async def test_classify_file_without_extension_tries_audio_first(
     """无扩展名 / 白名单外但真是 wav ⇒ 第 2 段（音频）救回来，不必要求文件名正确。"""
     target = tmp_path / "voice"
     shutil.copyfile(media_fixtures["audio_30s"], target)
-    handle = _file_handle(target)
+    handle = await _file_handle(target)
     kind, duration, _has_audio, has_video = await media.classify(
         handle, str(target), max_media_bytes=_MAX_BYTES, workdir=str(tmp_path)
     )
@@ -560,7 +569,7 @@ async def test_classify_file_size_over_limit_is_media_too_large(tmp_path: Path) 
     """体积闸在**判型之前**（成本闸门）：超 `max_media_bytes` ⇒ `MEDIA_TOO_LARGE`。"""
     target = tmp_path / "big.mp4"
     target.write_bytes(b"\x00" * 4096)
-    handle = _file_handle(target)
+    handle = await _file_handle(target)
     with pytest.raises(envelope.ToolError) as exc_info:
         await media.classify(handle, str(target), max_media_bytes=1024, workdir=str(tmp_path))
     assert _code(exc_info) == envelope.ERR_MEDIA_TOO_LARGE
@@ -676,6 +685,9 @@ async def test_analyze_file_non_media_is_unsupported_media_type(
         make_event(current=[make_file("notes.pdf", file=str(target))])
     )
     payload = json.loads(raw)
+    # v0.4：门面受理即返回（4 键），失败信封在后台任务里产生（`background.wait` 取回）
+    assert set(payload) == set(envelope.ACCEPT_KEYS), payload
+    payload = await background.wait(payload["task_id"], timeout=30.0)
     assert payload == {
         "ok": False,
         "error": envelope.ERR_UNSUPPORTED_MEDIA_TYPE,

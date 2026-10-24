@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from astrbot_plugin_media_analysis import analyze as analyze_mod
+from astrbot_plugin_media_analysis import background, envelope
 from astrbot_plugin_media_analysis import cache as cache_mod
 from astrbot_plugin_media_analysis import main, media, probe, providers, settings
 from _fakes import (
@@ -80,13 +81,45 @@ class Rig:
         focus: str = "",
         include_frames: bool = False,
     ) -> dict[str, object]:
-        """走工具门面（模型看到的路径）：返回值必须是 JSON 字符串。"""
+        """走工具门面（模型看到的路径）：返回值必须是 JSON 字符串。
+
+        v0.4 的门面**受理即返回**（SPEC-v0.4 §3），所以这里分两步：
+
+        1. 调门面 → 必须是 `str`，解析后**要么**是受理信封（4 键）**要么**是失败信封（3 键）；
+        2. 受理信封 ⇒ `await background.wait(task_id)` 拿后台任务的信封（成功 9 键 /
+           任务内失败 3 键）。
+
+        语义与 v0.3 的"一次调用拿到分析结果"**对齐**：断言面（9 键/3 键、错误码、notes）
+        一个字都没改；变的只是"结果从哪来"（后台任务 vs 同步返回）。同步失败（`BAD_TARGET` /
+        `MEDIA_NOT_FOUND` / `TOO_MANY_TASKS`）照样直接返回，不会被这一步吞掉。
+        """
         raw = await self.plugin.media_analyze(
             self.event, target=target, focus=focus, include_frames=include_frames
         )
         assert isinstance(raw, str), f"工具返回值必须是 str，实际 {type(raw)}"
         payload = json.loads(raw)
         assert isinstance(payload, dict)
+        if not payload.get("state"):
+            return payload  # 同步失败信封（受理前就拒了）
+        assert set(payload) == set(envelope.ACCEPT_KEYS), payload
+        finished = await background.wait(str(payload["task_id"]), timeout=60.0)
+        assert isinstance(finished, dict), "后台任务没有产出信封（被取消？）"
+        return finished
+
+    async def tool_expect_accept(
+        self,
+        *,
+        target: str = "current",
+        focus: str = "",
+        include_frames: object = False,
+    ) -> dict[str, object]:
+        """只调门面并断言返回**受理信封**（不等待后台任务，用于取消/并发类用例）。"""
+        raw = await self.plugin.media_analyze(
+            self.event, target=target, focus=focus, include_frames=include_frames
+        )
+        assert isinstance(raw, str), f"工具返回值必须是 str，实际 {type(raw)}"
+        payload = json.loads(raw)
+        assert set(payload) == set(envelope.ACCEPT_KEYS), payload
         return payload
 
 

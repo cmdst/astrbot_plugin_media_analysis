@@ -30,6 +30,7 @@ SOURCE_MODULES = sorted(REPO_ROOT.glob("*.py"))
 EXPECTED_SOURCE_MODULES = [
     "__init__.py",
     "analyze.py",
+    "background.py",  # v0.4：后台任务表（SPEC-v0.4 §2.6）
     "cache.py",
     "envelope.py",
     "main.py",

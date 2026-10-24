@@ -1,4 +1,11 @@
-"""媒体侧：组件定位 / 路径解析 / 判型 / 判流 / 时长 / 抽音轨 / 抽帧 / 内容哈希。
+"""媒体侧：组件定位 / 路径解析 / 判型 / 判流 / 时长 / 抽音轨 / 抽帧 / GIF 归一 / 内容哈希。
+
+v0.4（SPEC-v0.4 §5）在本模块新增两块，都是**纯函数或纯子进程**，不碰配置、不碰网络：
+- **GIF 识别**：`has_gif_magic`（前 6 字节 `GIF87a`/`GIF89a`，**唯一**判据）+
+  `_looks_like_gif`（后缀只作"要不要去证实"）+ `confirm_gif`（取件后二次确认的统一出口）；
+  `Image` 只在这一档进链（`_pick_gif_image`），普通图片仍然拒绝。
+- **GIF 归一**：`gif_argv`（冻结参数）+ `normalize_gif`（字节/超时/产物三道闸）——
+  产物是 `<workdir>/gif.mp4`，源文件只读。
 
 平台事实（SPEC.md §2.1 + SPEC-v0.2 §3.1，都是实测过的）：
 - `Record` 到手时 `comp.path` **已经是本地 wav** —— 预处理阶段无条件把它落地并写回
@@ -27,11 +34,11 @@ import hashlib
 import json
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from urllib.parse import unquote
 
 from astrbot.api import logger as LOG
-from astrbot.api.message_components import File, Record, Reply, Video
+from astrbot.api.message_components import File, Image, Record, Reply, Video
 
 from . import envelope
 
@@ -106,7 +113,19 @@ DIGEST_CHUNK_BYTES = 1 << 20
 DOWNLOAD_CHUNK_BYTES = 64 * 1024
 
 # 媒体候选集（**顺序＝优先级**：Record → Video → File，§3.5）。
+# v0.4：`Image` 作为 **GIF 候选**插在 `Video` 与 `File` 之间（SPEC-v0.4 §5.2）——
+# 它不是一个新 kind，只是一条"先证魔数再进视频链"的路径，所以不进这张纯类型表，
+# 由 `_pick_gif_image` 单独处理（见 `find_media` 的四档顺序）。
 _MEDIA_KINDS = (Record, Video, File)
+
+# ---- v0.4 GIF 归一（SPEC-v0.4 §5.6 冻结；**代码常量，不新增配置键**）----
+GIF_MAGICS = (b"GIF87a", b"GIF89a")  # 唯一判定依据（后缀只作"要不要去证实"）
+GIF_SNIFF_BYTES = 6  # 只读前 6 字节
+GIF_MAX_FPS = 12  # GIF 常见 10–25 fps；12 保留动感、帧数砍半
+GIF_MAX_WIDTH_PX = 640  # 长边封顶（表情/短视频足够让模型说清"发生了什么"）
+GIF_CRF = 26  # 体积优先；GIF 源已是索引色
+GIF_CONVERT_TIMEOUT_S = 10.0  # 护栏不是产品参数（实测 0.62 s，16× 余量）
+
 
 # 扩展名白名单（SPEC-v0.2 §3.3，大小写不敏感）。表外**不是拒绝**，是转内容探测（§3.4）。
 VIDEO_EXTS = frozenset(
@@ -163,26 +182,62 @@ class CompressResult:
 
 @dataclass(frozen=True)
 class MediaHandle:
-    """一条待分析媒体：组件本身 + 是否来自引用消息 + 是否来自 `File` 段。"""
+    """一条待分析媒体：组件本身 + 是否来自引用消息 + 是否来自 `File` 段 + 是否是 GIF 候选。
 
-    comp: object  # Record | Video | File
+    `gif` 的语义（SPEC-v0.4 §5.2/§5.3）：
+    - `True` = **候选**（`Image` 已用魔数证实，或 `Image`/`File` 只有 `.gif` 后缀线索）；
+      真正的判定点在 `analyze` 的 `[3.5] confirm_gif`（取件后二次验魔数）；
+    - `File` + `.gif` 后缀但魔数不符 ⇒ `confirm_gif` 把它**降回** `gif=False`，
+      继续走 v0.3 的三段梯子（行为不变）。
+    """
+
+    comp: object  # Record | Video | Image(GIF) | File
     quoted: bool
     from_file: bool = False
+    gif: bool = False
 
     @property
     def kind(self) -> str:
-        """`"video"`（Video）或 `"audio"`（Record / File）。
+        """`"video"`（Video / GIF）或 `"audio"`（Record / File）。
 
         `File` 的真实类型**不由扩展名决定**，由 `classify` 按"能解出什么流"判（§3.4），
         所以这里给的是占位值，任何取 `kind` 的地方都必须用 `classify` 的返回值。
+        GIF 是例外：`kind` 恒 `"video"`（SPEC-v0.4 §5.10 —— 不新增 kind），
+        且 `analyze` 对 GIF **跳过 `classify`**（那一步会把 `Image` 判成 `kind=audio`，
+        见 SPEC-v0.4 §1.2 的 M7 实测）。
         """
-        return "video" if isinstance(self.comp, Video) else "audio"
+        if isinstance(self.comp, Video) or self.gif:
+            return "video"
+        return "audio"
 
     @property
     def name(self) -> str:
         """文件名（`File` 段才有意义，用于取扩展名；其余回空串）。"""
         value = getattr(self.comp, "name", "")
         return value if isinstance(value, str) else ""
+
+
+@dataclass(frozen=True)
+class GifResult:
+    """一次 gif→mp4 归一的结果（`analyze` 只读它，不回问媒体层）。
+
+    - `path` / `size`：产物（`<workdir>/gif.mp4`）与它的字节数；
+    - `source_size`：源 GIF 字节（`not`: `gif_converted:<in>-><out>`）；
+    - `duration_s`：**产物**时长（信封与抽帧网格用它的，不是源 GIF 的）；
+    - `frames`：**源 GIF** 的帧数（`<=1` ⇒ 静态，`analyze` 记 `gif_static`）。
+    """
+
+    path: str
+    size: int
+    source_size: int
+    duration_s: float
+    frames: int
+
+    @property
+    def static(self) -> bool:
+        """源 GIF 只有 1 帧（静态图伪装成动图）。帧数读不出（0）时按非静态处理。"""
+        return 0 < self.frames <= 1
+
 
 
 def _components(event) -> list:
@@ -219,21 +274,149 @@ def _type_names(chain) -> str:
     return "[" + ", ".join(names) + "]"
 
 
-def _pick_media(chain) -> object | None:
-    """按固定优先级（Record → Video → File）挑第一个媒体组件。
+def _pick_media(chain, *, quoted: bool) -> MediaHandle | None:
+    """按固定优先级（Record → Video → **Image(GIF)** → File）挑第一个媒体组件。
 
     优先级是**全链**的，不是"先来先得"：同一条消息里既有 `Record` 又有 `File` 时选
     `Record`（更专、体积更小、预处理已落地），`File` 只是 v0.2 新增的兜底候选。
+    v0.4 只在 `File` **之前**插了一档（SPEC-v0.4 §5.2）：既有三种类型的相对顺序不变。
+
+    `Image` 这一档**只**接受 GIF：魔数不符的普通图片不产生 handle（契约 3 的第①条防线），
+    因此继续往后找 `File`；全都没有 ⇒ 上层给 `MEDIA_NOT_FOUND`（与 v0.3 体验一致）。
+
+    唯一的 IO 是"走到 Image 这一档"时至多 3 次 6 字节本地读（`has_gif_magic`），
+    **禁止**在 picker 里下载/转换（受理路径的硬约束，SPEC-v0.4 §5.2）。
     """
     for kind in _MEDIA_KINDS:
+        if kind is File:
+            # `File` 是兜底大类（可能是个 zip）⇒ 必须排在 GIF 候选**之后**，故此处跳过
+            continue
         for comp in chain:
             if isinstance(comp, kind):
-                return comp
+                return MediaHandle(comp=comp, quoted=quoted)
+
+    gif_image = _pick_gif_image(chain)
+    if gif_image is not None:
+        return MediaHandle(comp=gif_image, quoted=quoted, gif=True)
+
+    for comp in chain:
+        if isinstance(comp, File):
+            # `File` + `.gif` 后缀 ⇒ **候选**（魔数在取件后由 `confirm_gif` 二次确认，
+            # 不符就降回 `gif=False` 走 v0.3 的三段梯子，行为不变）
+            return MediaHandle(
+                comp=comp, quoted=quoted, from_file=True, gif=_looks_like_gif(
+                    getattr(comp, "name", "")
+                )
+            )
     return None
 
 
-def find_media(event, target: str) -> MediaHandle:
-    """定位媒体组件（SPEC.md §2.1 + SPEC-v0.2 §3.5 三态）。
+def _pick_gif_image(chain) -> object | None:
+    """在链里找**第一个** GIF 形态的 `Image`（无则 `None`）。
+
+    两种形态（SPEC-v0.4 §5.4）：
+
+    1. **有本地文件** ⇒ 读 6 字节魔数，命中才接受。后缀**不参与判定**：核心预处理会把
+       `file`/`url`/`path` 全部覆写成落地后的临时路径（`preprocess_stage/stage.py:93-96`），
+       QQ 原始文件名已经丢了，落地后缀还可能被按检测到的 MIME 改写。
+    2. **无本地文件**（预处理失败的远程引用）⇒ 只有**后缀线索**（`.gif`）时才受理；
+       任务内 `resolve_media_path` 有界下载后再由 `confirm_gif` 验魔数。
+       没有后缀就**不下载、不接受**（不为一张 JPEG 付一次网络往返）。
+    """
+    for comp in chain:
+        if not isinstance(comp, Image):
+            continue
+        local = image_local_path(comp)
+        if local is not None:
+            if has_gif_magic(local):
+                return comp
+            continue  # 本地文件但不是 GIF ⇒ 继续找下一个 Image（最终可能落到 File）
+        if _looks_like_gif(
+            getattr(comp, "name", ""),
+            getattr(comp, "file", ""),
+            getattr(comp, "url", ""),
+        ):
+            return comp
+    return None
+
+
+def image_local_path(comp) -> str | None:
+    """`Image` 的本地文件路径（三选一第一个 `os.path.isfile` 命中的）；否则 `None`。
+
+    `Image` 到手时三个字段通常都指向同一个落地文件（核心预处理无条件落地并回写，
+    `preprocess_stage/stage.py:65-96`），但平台/版本不同可能只写其中一个 ⇒ 三个都试。
+    """
+    for field_name in ("path", "file", "url"):
+        value = getattr(comp, field_name, "")
+        if not isinstance(value, str) or not value:
+            continue
+        candidate = file_uri_to_path(value)
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+    return None
+
+
+def has_gif_magic(path: str) -> bool:
+    """前 6 字节是否是 GIF 魔数（`GIF87a` / `GIF89a`）——**GIF 的唯一判定依据**。
+
+    为什么"能解出视频流"不能当判据（SPEC-v0.4 §1.2 M6 实测）：`ffprobe` 对 PNG / APNG /
+    WebP 也报 `codec_type=video`，只有 GIF 带 `format.duration`。今天 PNG 被拒靠的是
+    "时长缺失"这个**副作用**，不是显式判据 —— 一旦哪天 ffmpeg 给 APNG 补上时长，
+    图片就会静默流进视频链。所以这里只认魔数。
+
+    读不出来（文件不可读/不足 6 字节）一律 `False`：拿不到证据就不放行。
+    """
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(GIF_SNIFF_BYTES)
+    except OSError:
+        return False
+    return head in GIF_MAGICS
+
+
+def _looks_like_gif(*values: object) -> bool:
+    """名字/引用串是否以 `.gif` 结尾（大小写不敏感；**只作"要不要去证实"，不作判定**）。
+
+    URL 形态会先砍掉 `?query` 与 `#fragment`（QQ 的图链常带签名参数）。
+    """
+    for value in values:
+        if not isinstance(value, str) or not value:
+            continue
+        text = value.split("#", 1)[0].split("?", 1)[0]
+        if text.lower().endswith(".gif"):
+            return True
+    return False
+
+
+def confirm_gif(handle: MediaHandle, path: str) -> MediaHandle:
+    """取件后**二次确认**魔数（SPEC-v0.4 §5.3 的统一出口），返回带确定 `gif` 的 handle。
+
+    刻意**是同步函数**（与 SPEC-v0.4 §5.3 的签名逐字一致）：它只读 6 字节（`has_gif_magic`），
+    没有可等待的 IO，做成协程只会让调用点多一个 `await` 而没有收益。
+
+    三条分支（幂等：对已确认的 handle 再调一次结果相同）：
+
+    1. 魔数命中 ⇒ `gif=True`（`Image` 与 `File` 都走这条）；
+    2. `File` 段但魔数不符 ⇒ **降回** `gif=False`，调用方继续走 v0.3 的三段梯子
+       （改名党说的 `.gif` 不该改变既有行为）；
+    3. `Image` 段但魔数不符 ⇒ `MEDIA_NOT_FOUND`：普通图片**绝不进链**（契约 3）。
+       这里也是"远程 `Image` + `.gif` 后缀"那条路的收口点。
+    """
+    if has_gif_magic(path):
+        return handle if handle.gif else replace(handle, gif=True)
+    if handle.from_file:
+        return handle if not handle.gif else replace(handle, gif=False)
+    raise envelope.ToolError(
+        envelope.ERR_MEDIA_NOT_FOUND,
+        log_detail="image: magic is not GIF (普通图片不进链)",
+    )
+
+
+async def find_media(event, target: str) -> MediaHandle:
+    """定位媒体组件（SPEC.md §2.1 + SPEC-v0.2 §3.5 三态 + SPEC-v0.4 §5.2 GIF 候选）。
+
+    **v0.4 起是协程**（契约变更，评审已批准）：`Image` 的 GIF 判定要读 6 字节魔数。
+    纯类型阶段（Record/Video/File）不产生 IO。
 
     `target` 只认精确的 `"current"` / `"quoted"`，不做大小写/别名归一
     （少一条隐式分支），**绝不**接受文件路径（§3.6：那会给模型一个"读任意本地文件并
@@ -244,14 +427,12 @@ def find_media(event, target: str) -> MediaHandle:
 
     if target == "current":
         chain = _components(event)
-        found = _pick_media(chain)
+        found = _pick_media(chain, quoted=False)
         if found is not None:
-            return MediaHandle(
-                comp=found, quoted=False, from_file=isinstance(found, File)
-            )
+            return found
         raise envelope.ToolError(
             envelope.ERR_MEDIA_NOT_FOUND,
-            log_detail=f"current: no Record/Video/File; chain={_type_names(chain)}",
+            log_detail=f"current: no Record/Video/GIF/File; chain={_type_names(chain)}",
         )
 
     outer = _components(event)
@@ -261,18 +442,17 @@ def find_media(event, target: str) -> MediaHandle:
             continue
         inner_chain = list(comp.chain or [])
         quoted_names.extend(type(item).__name__ for item in inner_chain)
-        found = _pick_media(inner_chain)
+        found = _pick_media(inner_chain, quoted=True)
         if found is not None:
-            return MediaHandle(
-                comp=found, quoted=True, from_file=isinstance(found, File)
-            )
+            return found
     raise envelope.ToolError(
         envelope.ERR_MEDIA_NOT_FOUND,
         log_detail=(
-            "quoted: no Record/Video/File in chain; "
+            "quoted: no Record/Video/GIF/File in chain; "
             f"chain={_type_names_str(quoted_names)}; outer={_type_names(outer)}"
         ),
     )
+
 
 
 def _type_names_str(names: list[str]) -> str:
@@ -740,6 +920,167 @@ async def extract_frames(
         elif notes is not None:
             notes.append(f"frame_extract_failed:{format_at_s(at_s)}")
     return frames
+
+
+def gif_argv(source: str, out_path: str) -> list[str]:
+    """gif→mp4 的**冻结 argv**（SPEC-v0.4 §5.6，逐参数理由见规格表；实测 §13-M9/M10）。
+
+    两个必须写的理由（都不是"更保险"，而是"不写就错"）：
+
+    - `scale='trunc(min(640,iw)/2)*2':-2`：**宽度必须偶数**。奇数宽 GIF + `yuv420p` +
+      libx264 ⇒ `rc=187`、**0 字节产物**（M9 实测 241x162 的样本）；朴素
+      `scale='min(640,iw)'` 会静默产出空文件。
+    - `-an`：显式写"产物无声"，下游 `probe_streams` 得到确定的 `(False, True)`。
+
+    **不加 `-t`**：时长闸在转换**之前**（`analyze` 的 `[4-pre]`）。加了 `-t` 只会在
+    "ffprobe 低报时长"时静默截断用户内容 —— 那比多花一秒 CPU 糟得多。
+    """
+    return [
+        "ffmpeg",
+        "-nostdin",
+        "-y",
+        "-v",
+        "error",
+        "-i",
+        source,
+        "-an",
+        "-vf",
+        f"fps={GIF_MAX_FPS},"
+        f"scale='trunc(min({GIF_MAX_WIDTH_PX},iw)/2)*2':-2:flags=lanczos",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        str(GIF_CRF),
+        "-threads",
+        "1",
+        "-movflags",
+        "+faststart",
+        "-f",
+        "mp4",
+        out_path,
+    ]
+
+
+async def gif_frame_count(path: str) -> int:
+    """源 GIF 的帧数（`nb_frames`）；读不出回 `0`（⇒ 不记 `gif_static`，不误判静态）。
+
+    为什么要单独探一次：`fps=12` 的滤镜会重排帧数（M10：源 500 帧 ⇒ 产物 240 帧），
+    产物帧数**推不出**"源是不是单帧动图"。一次 ffprobe 约 0.02 s，可忽略。
+    """
+    argv = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=nb_frames",
+        "-of",
+        "csv=p=0",
+        path,
+    ]
+    try:
+        returncode, out, _err = await _run(
+            argv, timeout=PROBE_TIMEOUT_S, error_code=envelope.ERR_PROBE_FAILED
+        )
+    except envelope.ToolError:
+        return 0
+    if returncode != 0:
+        return 0
+    text = out.decode("utf-8", "replace").strip().splitlines()
+    if not text:
+        return 0
+    try:
+        return max(0, int(text[0].strip()))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def normalize_gif(
+    source: str, *, workdir: str, max_media_bytes: int
+) -> GifResult:
+    """把 GIF 归一成 mp4（三道闸 + 产物校验，SPEC-v0.4 §5.7 顺序固定）。
+
+    闸①字节（归一前，与 `classify` 同口径）→ 闸③超时（`GIF_CONVERT_TIMEOUT_S=10 s`，
+    子进程 kill）→ 闸④产物（非空 + 不超 `max_media_bytes`）。闸②时长在**调用方**
+    （`analyze` 的 `[4-pre]`，因为闸要卡在"归一之前"、用的是**源**的时长）。
+
+    产物落 `<workdir>/gif.mp4`：`workdir` 是 `analyze` 的 `/tmp/media_analysis_*`，
+    `finally` 整目录删；源文件**只读**（属于平台/事件，绝不删、绝不写回）。
+    半成品（失败/超时/空产物）在这里 `unlink`，不留残渣。
+
+    **失败不静默**：`GIF_CONVERT_FAILED` 是终态码（走"投递一条失败消息"），
+    绝不回退成"把原始 GIF 直接送给模型"——那正是 v0.3 `File .gif` 的缺陷形态。
+    """
+    source_size = _size_of(source) or 0
+    if source_size <= 0:
+        raise envelope.ToolError(
+            envelope.ERR_GIF_CONVERT_FAILED, log_detail="source missing or empty"
+        )
+    if max_media_bytes > 0 and source_size > max_media_bytes:
+        raise envelope.ToolError(
+            envelope.ERR_MEDIA_TOO_LARGE,
+            log_detail=f"gif size={source_size} max_media_bytes={max_media_bytes}",
+        )
+
+    frames = await gif_frame_count(source)
+    out_path = os.path.join(workdir, "gif.mp4")
+    rc, err, timed_out = await _run_capture(
+        gif_argv(source, out_path), timeout=GIF_CONVERT_TIMEOUT_S
+    )
+    if timed_out:
+        _unlink(out_path)
+        raise envelope.ToolError(
+            envelope.ERR_GIF_CONVERT_FAILED,
+            log_detail=f"ffmpeg timeout {GIF_CONVERT_TIMEOUT_S}s",
+        )
+    if rc != 0:
+        _unlink(out_path)
+        raise envelope.ToolError(
+            envelope.ERR_GIF_CONVERT_FAILED,
+            log_detail=f"ffmpeg rc={rc} stderr={err.decode('utf-8', 'replace')[:160]!r}",
+        )
+
+    size = _size_of(out_path) or 0
+    if size <= 0:
+        _unlink(out_path)
+        raise envelope.ToolError(
+            envelope.ERR_GIF_CONVERT_FAILED, log_detail=f"empty output (rc={rc})"
+        )
+    if max_media_bytes > 0 and size > max_media_bytes:
+        _unlink(out_path)
+        raise envelope.ToolError(
+            envelope.ERR_MEDIA_TOO_LARGE,
+            log_detail=f"gif output size={size} max_media_bytes={max_media_bytes}",
+        )
+
+    try:
+        duration_s = await probe_duration_s(out_path)
+    except envelope.ToolError as exc:
+        _unlink(out_path)
+        raise envelope.ToolError(
+            envelope.ERR_GIF_CONVERT_FAILED,
+            log_detail=f"output duration unavailable ({exc.log_detail})",
+        ) from None
+
+    LOG.info(
+        "media_analysis: gif→mp4 %d B → %d B（%.2f s / 源 %d 帧）",
+        source_size,
+        size,
+        duration_s,
+        frames,
+    )
+    return GifResult(
+        path=out_path,
+        size=size,
+        source_size=source_size,
+        duration_s=duration_s,
+        frames=frames,
+    )
 
 
 def compress_target_kbps(budget_bytes: int, duration_s: float) -> int:

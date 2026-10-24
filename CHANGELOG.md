@@ -1,5 +1,92 @@
 # CHANGELOG
 
+## v0.4.0 — 2026-10-25（**实现完成，待评审 / 待推送 `main` / 待部署**）
+
+两个变更：**① GIF 以视频解析**（`Image` 与群文件里的 GIF 一律先用 ffmpeg 归一成 mp4，
+再走**完全不变**的原生视频链）；**② 工具调用改为后台异步**（`media_analyze` **受理即返回**，
+分析在后台跑完并**唯一投递**一条结果消息；视频 30 s–数分钟不再阻塞会话）。
+规格：`SPEC-v0.4.md`（dev lane 工作区，926 行，冻结增量）。
+
+**配置 0 新键、工具参数 0 改动**（21 键 / 3 参数）；错误码 21 → **23**、notes 41 → **44**（只加不改）。
+
+### ① GIF 以视频解析（`Image` + 群文件）
+
+- **判据＝魔数**：文件前 6 字节 ∈ `{GIF87a, GIF89a}` 是**唯一**判定依据；`.gif` 后缀只用来
+  决定"要不要去证实"（远程 `Image` 无本地文件时，没后缀就**不下载、不接受**）。
+- **为什么不能靠"能解出视频流"**：`ffprobe` 对 **PNG / APNG / WebP** 也报 `codec_type=video`，
+  只有 GIF 带 `format.duration`。今天 PNG 被拒靠的是"时长缺失"这个**副作用**，不是判据
+  ⇒ 一旦 ffmpeg 给 APNG 补上时长，图片就会**静默**流进视频链。
+- **候选优先级**：`Record → Video → Image(GIF) → File`（只在 `File` 前插一档，既有顺序不变）。
+  普通图片（JPEG/PNG/WebP/APNG）在**受理路径**就被拒（`MEDIA_NOT_FOUND`，同步返回）——
+  契约「图片不进本插件」原样成立。
+- **归一参数冻结**：`-an` + `fps=12` + `scale='trunc(min(640,iw)/2)*2':-2` + `yuv420p` +
+  libx264 `veryfast`/`crf 26` + `-threads 1` + `+faststart` + `-f mp4`。
+  其中 **`trunc(.../2)*2` 是硬要求**：奇数宽 GIF + `yuv420p` + libx264 ⇒ **`rc=187`、0 字节产物**
+  （实测 241x162 的样本）；朴素 `scale=min(640,iw)` 会安静地吐一个空文件。
+- **四道闸**（顺序固定）：源字节 ≤ `limits.max_media_bytes` ⇒ 否则 `MEDIA_TOO_LARGE`；
+  源时长 ≤ `limits.max_media_seconds` ⇒ 否则 `MEDIA_TOO_LONG`；整次 ffmpeg ≤ **10 s**（实测
+  7.8 MB / 20 s 的 GIF 只要 **0.62 s**）⇒ 否则 `GIF_CONVERT_FAILED`；产物非空且不超上限。
+- **`kind` 仍是 `"video"`**（不新增 kind）：原生/压缩/抽帧/摘要/缓存键/`_KIND_CN` 全部复用；
+  GIF 走这条分支时**跳过 `classify`**（那一步会把 `Image` 判成 `kind=audio`）。
+- **notes 三条**：`source:gif`、`gif_converted:<in>-><out>`、`gif_static`（源只有 1 帧）。
+- **缓存键不加 gif 标记**：`digest` 取**源 GIF 字节**（不是产物 mp4）⇒ 同一张 GIF 无论以
+  `Image` 还是群文件形态到达都是同一个键（共享缓存）；参数是代码常量，随 `PLUGIN_VERSION` 失效。
+- **`-t` 刻意不加**：时长闸在转换**之前**；加了 `-t` 只会在 ffprobe 低报时长时**静默截断**
+  用户内容。
+
+### ② 修复（v0.3 潜在缺陷）：群文件 `.gif` 曾被贴 `data:video/mp4` 直送
+
+v0.3 的 `File` + `.gif` 已经"进链"了，但是错的那种：`_classify_file` 第 3 段用
+"有视频流"判型，而 ffprobe 对 GIF 就是 `codec_type=video` ⇒ **原始 GIF 字节**被
+`video_native` 的 `data:video/mp4` 前缀贴出去送给模型（MIME 错、容器错，且没有任何测试覆盖）。
+`Image` + `.gif` 更糟：被判成 `kind=audio`（`has_audio=True`）。
+本版两者一并修掉：**所有 GIF 一律先归一成 mp4**，从不把原始 GIF 字节送给模型。
+
+### ③ 工具调用改为后台异步（受理即返回 + 唯一投递）
+
+- **受理信封（第三种形状，4 键、顺序固定）**：
+  `{"ok":true,"state":"accepted|running","task_id":"<32hex>","hint":"<常量>"}`。
+  与成功 9 键 / 失败 3 键**键名不重叠**（除 `ok`）。模型**只会**看到"受理"或"失败"；
+  成功信封变成一条**发给用户**的中文消息（不再回到模型）。
+- **机制**：插件自管任务表（`_TASKS` / `_BY_KEY` / `_BY_UMO`）+ `asyncio.create_task`；
+  去重键 `umo|target|message_id|mode|focus`（同一条消息同一组参数重复调用 ⇒ 返回**同一个
+  `task_id`**，`state="running"`，不新建任务；拿不到 `message_id` 时**关掉**去重）。
+- **并发闸**：单会话 3 / 单实例 6 ⇒ 超限返回 `TOO_MANY_TASKS`（同步、失败 3 键）。
+- **投递 at-most-once**：一次 `context.send_message`；**只有**它返回 `False`（＝没找到平台、
+  什么都没发）时才 `event.send` 兜底一次；任何异常只记 WARNING、**不重试**。
+  **重复消息比缺一条消息更伤** —— 所以宁可少一条，绝不重复。
+- **取消**：`terminate()` 对全部任务 `cancel()` 并等它们收尾（`star_manager.py:1965`），
+  **不留持有 event 的孤儿 task**；取消**不投递**任何消息。
+- **为什么不用核心的 `is_background_task`**：核心 4.29.1 的派发层读的是
+  `_PermissionGuardedTool` **包装器**（只镜像 name/description/parameters/active/
+  handler_module_path，**没有** `__getattr__`），而 `get_full_tool_set()` 每次重建包装器
+  ⇒ 在 `llm_tools.get_func(...)` 上置 flag **恒为 False**（`/tmp` 探针实测：仍同步执行）；
+  即便改置到包装器实例上，回执文案被核心写死、多一次整段历史的 agent 回合、而且**投递
+  由模型决定**（核心只记一句 WARNING）—— 拿不到"恰好一次"。故采用插件自管的 A2。
+- **不做任务持久化**：进程重启/插件重载会丢掉进行中的任务（用户侧表现为"没有结果消息"）。
+  重发媒体即可，这是本版明确接受的产品行为。
+
+### ④ 版本与连带的两个冷启动
+
+- `metadata.yaml:version` / `settings.PLUGIN_VERSION` / 本文件顶部条目三处互钉到 **`0.4.0`**。
+- **结果缓存与 L1 探测缓存都会"冷启动"一次**：`PLUGIN_VERSION` 是两者的键分量 ⇒ v0.3 写的
+  条目**永不命中**（无需动作，按 TTL/容量自然淘汰；急可 `rm -rf data/plugin_data/<插件>/cache/`）；
+  每个视频模型首用会**多做一次 L1 探测**（约 3–20 s，可先跑
+  `tools/probe_video_capability.py` 预热）。
+- **部署比 v0.3 简单一档**：覆盖代码 + **一次重载**即可（schema 未变、21 键一个不动 ⇒ 核心不会
+  补键也不会删键、**不需要**迁移器、不需要第二次重载）。回滚也简单：回代码 + 重载，
+  **配置无需回滚**（0 新键、0 改名、0 默认值变化）。
+
+### ⑤ 已知限制（都是决定，不是待办）
+
+- 后台任务**不持久化**：重启丢任务，结果不会补发。
+- 投递是 **at-most-once**：平台掉线/找不到平台时用户可能**收不到**结果，且插件不会重试。
+- 会话 `/reset` 或用户打断**不取消**后台任务（工作已经付费，静默丢弃更糟）——结果照常投递。
+- GIF 归一参数是**代码常量**（640 宽 / 12 fps / crf 26）：小字可能糊；要调就随版本调。
+- **不支持 APNG / WebP 动图**：它们没有 `format.duration`，"以视频解析"的前提不成立
+  （将来要做，判据必须是各自的魔数，而不是"能解出视频流"）。
+- 静态 GIF 会被当 1 s 视频处理（记 `gif_static`，语义噪声可接受）。
+
 ## v0.3.0 — 2026-10-24（**已评审通过（t14 PASS；t17 复核 R1/R2 PASS）；待推送 `main` / 待部署**）
 
 把**视频主路径**改成「原生视频直送多模态模型」，抽帧降级为**回退**；v0.2 的音频多模态、
