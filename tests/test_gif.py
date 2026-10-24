@@ -514,14 +514,68 @@ async def test_normalize_gif_missing_source_is_gif_convert_failed(tmp_path) -> N
 async def test_normalize_gif_product_duration_unavailable_is_gif_convert_failed(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    """产物时长读不出来 ⇒ `GIF_CONVERT_FAILED`（下游的时长闸与信封都要它）。"""
+    """产物**连流都探不出来**（ffprobe 真坏）⇒ `GIF_CONVERT_FAILED`（不放行、不留残渣）。"""
     source = write_gif(tmp_path / "src.gif", width=16, height=16, frames=2)
     _patch_convert(monkeypatch, duration=None)
+
+    async def _broken(_path: str):
+        raise envelope.ToolError(envelope.ERR_PROBE_FAILED, log_detail="ffprobe rc=1")
+
+    monkeypatch.setattr(media, "probe_streams", _broken)
 
     with pytest.raises(envelope.ToolError) as exc_info:
         await media.normalize_gif(str(source), workdir=str(tmp_path), max_media_bytes=1 << 20)
     assert _code(exc_info) == envelope.ERR_GIF_CONVERT_FAILED
     assert "output duration unavailable" in exc_info.value.log_detail
+    assert "stream probe failed" in exc_info.value.log_detail
+    assert not (tmp_path / "gif.mp4").exists()
+
+
+@pytest.mark.asyncio
+async def test_normalize_gif_stream_confirmed_without_duration_is_zero(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """**F2 裁决**：产物**有视频流但没有可度量时长** ⇒ 按 `0.0` 放行（唯一放行口）。
+
+    这是 `format.duration=N/A` 的那一档：只要 ffprobe 能确认产物**有 video 流**（说明帧确实
+    被编码出来了、只是 muxer 没写时长），就按静态假定收 `0.0`，不把整次分析判死。
+    用例走桩（`probe_duration_s` 抛"时长缺失" + `probe_streams` 报有视频流）—— 当前冻结
+    argv 产不出这种形态（实测：极短帧间隔产的是**0 流**空 mp4，走下面那条重试路径），
+    所以这一档是**对未来 ffmpeg / 上游容器差异的防御**。
+    """
+    source = write_gif(tmp_path / "src.gif", width=16, height=16, frames=1)
+    _patch_convert(monkeypatch, duration=None, frames=1)
+
+    async def _streams(_path: str):
+        return False, True
+
+    monkeypatch.setattr(media, "probe_streams", _streams)
+
+    result = await media.normalize_gif(
+        str(source), workdir=str(tmp_path), max_media_bytes=1 << 20
+    )
+    assert result.duration_s == 0.0
+    assert result.frames == 1 and result.static is True
+    assert (tmp_path / "gif.mp4").exists(), "放行时产物必须保留"
+
+
+@pytest.mark.asyncio
+async def test_normalize_gif_streamless_product_is_gif_convert_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """产物**一个流都没有**且源不是单帧 ⇒ 仍 `GIF_CONVERT_FAILED`（不给空视频发"成功"）。"""
+    source = write_gif(tmp_path / "src.gif", width=16, height=16, frames=4)
+    _patch_convert(monkeypatch, duration=None, frames=4)
+
+    async def _no_streams(_path: str):
+        return False, False
+
+    monkeypatch.setattr(media, "probe_streams", _no_streams)
+
+    with pytest.raises(envelope.ToolError) as exc_info:
+        await media.normalize_gif(str(source), workdir=str(tmp_path), max_media_bytes=1 << 20)
+    assert _code(exc_info) == envelope.ERR_GIF_CONVERT_FAILED
+    assert "no video stream" in exc_info.value.log_detail
     assert not (tmp_path / "gif.mp4").exists()
 
 
@@ -660,6 +714,77 @@ async def test_normalize_gif_single_frame_is_static(tmp_path) -> None:
     assert "mp4" in _probe(result.path)["format_name"]
 
 
+@pytest.mark.asyncio
+async def test_single_frame_short_delay_gif_is_retried_into_a_real_mp4(tmp_path) -> None:
+    """**F2（medium）**：单帧 GIF 的保持时长 < 1/12 s ⇒ 冻结 argv 产 **0 流空 mp4** ⇒ 重试一次。
+
+    真机（`VERIFY-v0.4.md` §12-F2）报的是"产物 `format.duration=N/A` 被误判
+    `GIF_CONVERT_FAILED`"；本用例把**根因**钉成可执行事实：先证明同一份 argv 跑在源上
+    确实只得到 262 字节、**一个流都没有**的空容器（`fps=12` 按输出帧间隔中点取帧，源帧
+    只有 0.04 s ⇒ 唯一一帧被跳过），再断言 `normalize_gif` 会抬高保持时长重试并成功。
+
+    修法刻意**不动冻结 argv**（SPEC §5.4/§5.6 的 argv 有逐字符快照）：只在一份**拷贝**上
+    改 GCE 的 2 字节 delay，源文件只读。
+    """
+    _require_ffmpeg()
+    source = write_gif(tmp_path / "f2.gif", width=200, height=150, frames=1, delay_cs=4)
+    original = source.read_bytes()
+
+    # ① 根因证据：冻结 argv 直接跑源 ⇒ 容器正常但**没有任何流**
+    naive = tmp_path / "naive.mp4"
+    proc = subprocess.run(media.gif_argv(str(source), str(naive)), capture_output=True)
+    assert proc.returncode == 0, proc.stderr
+    naive_info = _probe(str(naive))
+    assert "codec_type" not in naive_info, naive_info  # 0 个流
+    assert naive.stat().st_size < 1024, naive.stat().st_size
+
+    # ② 归一：抬高保持时长重试一次 ⇒ 真 mp4（1 帧 @12 fps）
+    result = await media.normalize_gif(
+        str(source), workdir=str(tmp_path), max_media_bytes=1 << 20
+    )
+    assert result.size > 0
+    assert result.frames == 1 and result.static is True
+    assert result.duration_s == pytest.approx(1 / media.GIF_MAX_FPS, abs=0.02)
+    assert await media.probe_streams(result.path) == (False, True)
+    # 重试用的拷贝已清掉、源只读（SPEC §5.8）
+    assert not (tmp_path / "gif_static.gif").exists()
+    assert source.read_bytes() == original
+
+
+def test_prepare_static_gif_copy_patches_only_the_delay_field(tmp_path) -> None:
+    """`prepare_static_gif_copy` 的粒度：**只改 GCE 的 2 字节**，且三种情形不动手。
+
+    这条守的是"修法最小"：如果哪天有人改成重编码/改 argv/改源文件，这里会红。
+    """
+    source = write_gif(tmp_path / "short.gif", width=20, height=20, frames=1, delay_cs=4)
+    found = media.gif_gce_delay(source.read_bytes())
+    assert found is not None
+    offset, delay = found
+    assert delay == 4
+
+    dest = tmp_path / "patched.gif"
+    assert media.prepare_static_gif_copy(str(source), str(dest)) is True
+
+    before, after = source.read_bytes(), dest.read_bytes()
+    assert len(before) == len(after)
+    diff = [i for i, (x, y) in enumerate(zip(before, after)) if x != y]
+    assert diff == [offset], (diff, offset)  # 高字节本来就是 0，只动低字节
+    assert after[offset] == media.GIF_STATIC_MIN_DELAY_CS
+    assert source.read_bytes() == before, "源文件必须只读"
+
+    # ① 已经够长的保持时长 ⇒ 不动手（不然会无谓改用户字节）
+    long = write_gif(tmp_path / "long.gif", width=20, height=20, frames=1, delay_cs=10)
+    assert media.prepare_static_gif_copy(str(long), str(tmp_path / "long2.gif")) is False
+    # ② 没有 GCE 的 GIF87a（delay 0）⇒ 不动手（它本来就能正常归一）
+    no_gce = write_gif(tmp_path / "nogce.gif", width=20, height=20, frames=1, delay_cs=0)
+    assert media.gif_gce_delay(no_gce.read_bytes()) is None
+    assert media.prepare_static_gif_copy(str(no_gce), str(tmp_path / "nogce2.gif")) is False
+    # ③ 不是 GIF ⇒ 不动手
+    junk = tmp_path / "junk.bin"
+    junk.write_bytes(b"not a gif at all")
+    assert media.prepare_static_gif_copy(str(junk), str(tmp_path / "junk2.gif")) is False
+
+
 def test_png_and_apng_probe_as_video_but_are_still_not_gif(tmp_path) -> None:
     """M6 的事实守卫：PNG/APNG 的 `codec_type` 也是 `video`，但它们**没有时长**、更不是 GIF。
 
@@ -784,6 +909,44 @@ async def test_gc_less_static_gif_is_accepted_and_marked_static(
     assert "source:gif" in payload["notes"]
     assert "gif_static" in payload["notes"]
     assert rig.media_calls["classify"] == 0
+
+
+@pytest.mark.asyncio
+async def test_short_delay_static_gif_is_accepted_and_marked_static(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """**F2 的行为级证据**：`delay_cs=4`（0.04 s，即 `ffmpeg -frames:v 1` 的默认值）走完整链路。
+
+    修复前它会以 `GIF_CONVERT_FAILED` 失败（REVIEW/VERIFY 的 F2）；修复后必须
+    `ok=true` / `kind=video` / notes 含 `gif_static`，并且**只调用一次**原生视频通道。
+    """
+    _require_ffmpeg()
+    gif_path = write_gif(tmp_path / "short.gif", width=64, height=48, frames=1, delay_cs=4)
+    native = native_video(text="一张静态图片：一个方块。")
+    rig = build_rig(
+        monkeypatch,
+        tmp_path,
+        kind="video",
+        event=make_event(current=[make_image(gif_path)]),
+        native=native,
+    )
+
+    payload = await rig.run()
+
+    assert payload["ok"] is True, payload
+    assert payload["kind"] == "video"
+    assert "source:gif" in payload["notes"]
+    assert "gif_static" in payload["notes"]
+    assert any(note.startswith("gif_converted:") for note in payload["notes"])
+    assert "video_native" in payload["notes"]
+    assert rig.media_calls["classify"] == 0
+    assert len(native.creates()) == 1
+    # 送给模型的是真 mp4（`ftyp`），不是那份 0 流空容器
+    url = native.video_urls()[-1]
+    assert url.startswith("data:video/mp4;base64,")
+    payload_bytes = base64.b64decode(url.split(",", 1)[1])
+    assert b"ftyp" in payload_bytes[:16]
+    assert len(payload_bytes) > 1024
 
 
 @pytest.mark.asyncio

@@ -33,6 +33,7 @@ import contextlib
 import hashlib
 import json
 import os
+import shutil
 import time
 from dataclasses import dataclass, replace
 from urllib.parse import unquote
@@ -125,6 +126,8 @@ GIF_MAX_FPS = 12  # GIF 常见 10–25 fps；12 保留动感、帧数砍半
 GIF_MAX_WIDTH_PX = 640  # 长边封顶（表情/短视频足够让模型说清"发生了什么"）
 GIF_CRF = 26  # 体积优先；GIF 源已是索引色
 GIF_CONVERT_TIMEOUT_S = 10.0  # 护栏不是产品参数（实测 0.62 s，16× 余量）
+GIF_STATIC_MIN_DELAY_CS = 9  # ceil(100/GIF_MAX_FPS)：单帧源的最小保持时长（1/12 s）
+GIF_STATIC_SCAN_BYTES = 64 * 1024  # 找 GCE 只扫这个前缀（GCE 必在首个图像描述符之前）
 
 
 # 扩展名白名单（SPEC-v0.2 §3.3，大小写不敏感）。表外**不是拒绝**，是转内容探测（§3.4）。
@@ -1036,8 +1039,17 @@ async def normalize_gif(
     """把 GIF 归一成 mp4（三道闸 + 产物校验，SPEC-v0.4 §5.7 顺序固定）。
 
     闸①字节（归一前，与 `classify` 同口径）→ 闸③超时（`GIF_CONVERT_TIMEOUT_S=10 s`，
-    子进程 kill）→ 闸④产物（非空 + 不超 `max_media_bytes`）。闸②时长在**调用方**
-    （`analyze` 的 `[4-pre]`，因为闸要卡在"归一之前"、用的是**源**的时长）。
+    子进程 kill）→ 闸④产物（非空 + 不超 `max_media_bytes` + **时长可度量**）。
+    闸②时长在**调用方**（`analyze` 的 `[4-pre]`，因为闸要卡在"归一之前"、用的是**源**的时长）。
+
+    闸④ 的"时长"一侧有一个**唯一放行口**（真机 F2 裁决）：产物**有视频流但没有可度量时长**
+    ⇒ 按 `0.0` 收（一行 LOG，不加 note）；产物缺失/0 字节/ffprobe 真坏仍 `GIF_CONVERT_FAILED`。
+
+    另有一条**单帧保时长重试**（真机 F2 的根因修正，见 `_gif_retry_single_frame`）：冻结 argv
+    里的 `fps=12` 按输出帧间隔的**中点**取帧，源帧时长 < 半个间隔（0.0417 s）时**整帧被丢掉**
+    ⇒ 产物是 262 字节、**0 个流**的空 mp4（实测，`ffmpeg -frames:v 1` 造的静态 GIF 正是 0.04 s）。
+    这种产物"没有流"而不是"有时长读不出"，所以上面的放行口救不了它；单帧源的保持时长
+    对画面无意义，抬高到 1/12 s 后用**同一份 argv** 重试一次即可。
 
     产物落 `<workdir>/gif.mp4`：`workdir` 是 `analyze` 的 `/tmp/media_analysis_*`，
     `finally` 整目录删；源文件**只读**（属于平台/事件，绝不删、绝不写回）。
@@ -1075,27 +1087,18 @@ async def normalize_gif(
             log_detail=f"ffmpeg rc={rc} stderr={err.decode('utf-8', 'replace')[:160]!r}",
         )
 
-    size = _size_of(out_path) or 0
-    if size <= 0:
-        _unlink(out_path)
-        raise envelope.ToolError(
-            envelope.ERR_GIF_CONVERT_FAILED, log_detail=f"empty output (rc={rc})"
-        )
-    if max_media_bytes > 0 and size > max_media_bytes:
-        _unlink(out_path)
-        raise envelope.ToolError(
-            envelope.ERR_MEDIA_TOO_LARGE,
-            log_detail=f"gif output size={size} max_media_bytes={max_media_bytes}",
-        )
+    size = _gif_product_size(out_path, rc=rc, max_media_bytes=max_media_bytes)
 
-    try:
-        duration_s = await probe_duration_s(out_path)
-    except envelope.ToolError as exc:
-        _unlink(out_path)
-        raise envelope.ToolError(
-            envelope.ERR_GIF_CONVERT_FAILED,
-            log_detail=f"output duration unavailable ({exc.log_detail})",
-        ) from None
+    duration_s = await _gif_product_duration(out_path)
+    if duration_s is None:
+        # 产物**一个流都没有**：唯一已知成因是"单帧 GIF 的唯一帧被 fps 网格吃掉"（F2 根因）
+        size, duration_s = await _gif_retry_single_frame(
+            source,
+            out_path,
+            frames=frames,
+            max_media_bytes=max_media_bytes,
+            workdir=workdir,
+        )
 
     LOG.info(
         "media_analysis: gif→mp4 %d B → %d B（%.2f s / 源 %d 帧）",
@@ -1111,6 +1114,227 @@ async def normalize_gif(
         duration_s=duration_s,
         frames=frames,
     )
+
+
+def gif_gce_delay(head: bytes) -> tuple[int, int] | None:
+    """首个图形控制扩展（GCE）的 `(delay 字段字节偏移, 当前 delay_cs)`；没有就 `None`。
+
+    只做**块级扫描**（不解析 LZW 数据），所以不会误命中图像数据里的字节：GIF 的顶层块序列
+    只有三种 —— 扩展 `0x21 <label> <子块链> 0x00`、图像 `0x2C <9 字节描述符> [LCT] <LZW> <子块链>`
+    与结尾 `0x3B`，每种都自带长度前缀，可以严格跳过。
+
+    找不到（GIF87a 常无 GCE）、或扫描到第一个图像描述符就停（GCE 必须出现在图像**之前**）
+    ⇒ `None`。`head` 可以是文件前缀：块被截断时返回 `None`（宁可放弃修正，也不猜）。
+    """
+    if len(head) < 14 or head[:6] not in GIF_MAGICS:
+        return None
+    packed = head[10]
+    pos = 13
+    if packed & 0x80:  # 全局色表存在 ⇒ 跳过 3*2^(N+1) 字节
+        pos += 3 * (2 ** ((packed & 0x07) + 1))
+    while pos < len(head):
+        marker = head[pos]
+        if marker == 0x3B:  # trailer：没有 GCE
+            return None
+        if marker == 0x2C:  # 图像描述符：GCE 只能在它之前，走过头就不找了
+            return None
+        if marker != 0x21 or pos + 1 >= len(head):
+            return None
+        label = head[pos + 1]
+        cursor = pos + 2
+        first: tuple[int, int] | None = None
+        while cursor < len(head):
+            size = head[cursor]
+            if size == 0:  # 块终止符
+                cursor += 1
+                break
+            if first is None:
+                first = (cursor, size)
+            cursor += 1 + size
+        if cursor > len(head):  # 前缀被截断：不猜
+            return None
+        if label == 0xF9 and first is not None and first[1] == 4:
+            # GCE 的 4 字节数据：packed / delay(lo,hi) / transparent
+            offset = first[0] + 2
+            if offset + 1 >= len(head):
+                return None
+            return offset, head[offset] | (head[offset + 1] << 8)
+        pos = cursor
+    return None
+
+
+def prepare_static_gif_copy(
+    source: str, dest: str, *, min_delay_cs: int = GIF_STATIC_MIN_DELAY_CS
+) -> bool:
+    """把**单帧** GIF 的 GCE 保持时长抬到 `min_delay_cs`，拷到 `dest`；不需要/做不到 ⇒ `False`。
+
+    为什么需要（真机 F2 的**根因**）：冻结 argv 里的 `fps=12` 按输出帧间隔的**中点**取帧
+    （实测边界就在 0.0417 s = 半个 1/12 s），源帧时长更短时**整帧被丢掉** ⇒ 产物是
+    **262 字节、0 个流**的空 mp4（`format.duration=N/A`）。这不是"转换失败"，而是"唯一的一帧
+    被 fps 网格吃掉"；也正因如此"有流无时长"的放行口救不了它（连流都没有）。
+
+    为什么改保持时长是**语义恒等**：单帧源没有帧率可言，GCE 的 delay 只决定"这张静态图被
+    展示多久"，与画面、帧数、字节内容都无关。抬到 1/12 s 后同一份 argv 就能正常产出 1 帧。
+    只改 2 字节（delay 的低/高位），**源文件只读**：先 `copyfile` 再 `r+b` 定点改。
+    """
+    try:
+        with open(source, "rb") as handle:
+            head = handle.read(GIF_STATIC_SCAN_BYTES)
+    except OSError:
+        return False
+    found = gif_gce_delay(head)
+    if found is None:
+        return False
+    offset, delay = found
+    if delay >= int(min_delay_cs):
+        return False
+    try:
+        shutil.copyfile(source, dest)
+        with open(dest, "r+b") as handle:
+            handle.seek(offset)
+            handle.write(bytes([int(min_delay_cs) & 0xFF, (int(min_delay_cs) >> 8) & 0xFF]))
+    except OSError:
+        _unlink(dest)
+        return False
+    return True
+
+
+def _gif_product_size(out_path: str, *, rc: int, max_media_bytes: int, stage: str = "") -> int:
+    """闸④ 前半：产物**非空**且不超 `max_media_bytes`（失败一律 `_unlink` 不留残渣）。"""
+    size = _size_of(out_path) or 0
+    if size <= 0:
+        _unlink(out_path)
+        raise envelope.ToolError(
+            envelope.ERR_GIF_CONVERT_FAILED, log_detail=f"empty output{stage} (rc={rc})"
+        )
+    if max_media_bytes > 0 and size > max_media_bytes:
+        _unlink(out_path)
+        raise envelope.ToolError(
+            envelope.ERR_MEDIA_TOO_LARGE,
+            log_detail=f"gif output size={size} max_media_bytes={max_media_bytes}{stage}",
+        )
+    return size
+
+
+async def _gif_product_duration(out_path: str) -> float | None:
+    """闸④ 的时长一侧：`float` = 产物时长（可能 `0.0`）；`None` = 产物**一个流都没有**。
+
+    三档（真机 F2 的分档就是这张表）：
+
+    | 产物状态 | 返回 |
+    | --- | --- |
+    | 有时长 | 时长 |
+    | **有视频流**但没有可度量时长（`format.duration=N/A`） | `0.0` + 一行 LOG（**唯一放行口**） |
+    | **没有任何流**（`fps` 网格把唯一一帧吃掉，262 字节空 mp4） | `None`（调用方决定是否重试） |
+    | 其余（ffprobe 真坏 / 探不出流） | `GIF_CONVERT_FAILED` |
+
+    `0.0` 是安全的：下游只把它用在压缩码率公式（产物小到不用压）与抽帧网格（单帧源只有
+    一帧画面）；"没有可度量时长"只可能来自**极短**源，撞不上 `max_media_seconds` 这类上界闸。
+    """
+    try:
+        return await probe_duration_s(out_path)
+    except envelope.ToolError as exc:
+        if exc.code != envelope.ERR_PROBE_FAILED or exc.log_detail != DURATION_UNAVAILABLE:
+            _unlink(out_path)
+            raise envelope.ToolError(
+                envelope.ERR_GIF_CONVERT_FAILED,
+                log_detail=f"output duration unavailable ({exc.log_detail})",
+            ) from None
+
+    try:
+        _has_audio, has_video = await probe_streams(out_path)
+    except envelope.ToolError as exc:
+        _unlink(out_path)
+        raise envelope.ToolError(
+            envelope.ERR_GIF_CONVERT_FAILED,
+            log_detail=(
+                "output duration unavailable; stream probe failed "
+                f"({exc.log_detail})"
+            ),
+        ) from None
+    if not has_video:
+        return None  # 连流都没有：交给 `_gif_retry_single_frame` 判，这里不删产物
+    LOG.info(
+        "media_analysis: gif→mp4 产物有视频流但没有可度量时长（极短帧间隔），按 0.0 处理",
+    )
+    return 0.0
+
+
+async def _gif_retry_single_frame(
+    source: str,
+    out_path: str,
+    *,
+    frames: int,
+    max_media_bytes: int,
+    workdir: str,
+) -> tuple[int, float]:
+    """F2 的**最小修正**：单帧 GIF 的唯一帧被 `fps=12` 网格吃掉时，抬高保持时长重试**一次**。
+
+    触发条件（三条同时成立才动手，其余情形保持 v0.4.0 的 `GIF_CONVERT_FAILED`）：
+    ① 首轮产物**一个流都没有**（`_gif_product_duration` 返回 `None`）；
+    ② 源**只有一帧**（`gif_frame_count == 1`）；
+    ③ 源字节里能找到 GCE 且保持时长 < `GIF_STATIC_MIN_DELAY_CS`。
+
+    为什么不改 argv：`SPEC-v0.4 §5.6` 的 argv 是**冻结面**（`tests/test_gif.py` 有逐字符快照），
+    而这里要解决的只是"输入的唯一一帧太短、被输出网格取样时跳过"——改输入（一份拷贝，
+    2 字节）比改冻结参数小得多，也不需要新增第二套转换器。
+    """
+    if frames != 1:
+        _unlink(out_path)
+        raise envelope.ToolError(
+            envelope.ERR_GIF_CONVERT_FAILED, log_detail="output has no video stream"
+        )
+
+    retry_source = os.path.join(workdir, "gif_static.gif")
+    prepared = await asyncio.to_thread(prepare_static_gif_copy, source, retry_source)
+    if not prepared:
+        _unlink(out_path)
+        raise envelope.ToolError(
+            envelope.ERR_GIF_CONVERT_FAILED,
+            log_detail=(
+                "output has no video stream and the single frame cannot be "
+                "delay-normalised"
+            ),
+        )
+
+    LOG.info(
+        "media_analysis: 单帧 GIF 的唯一帧短于 1/%d s（被 fps 网格吃掉），"
+        "把保持时长抬到 %d cs 后重试一次",
+        GIF_MAX_FPS,
+        GIF_STATIC_MIN_DELAY_CS,
+    )
+    rc, err, timed_out = await _run_capture(
+        gif_argv(retry_source, out_path), timeout=GIF_CONVERT_TIMEOUT_S
+    )
+    try:
+        if timed_out:
+            _unlink(out_path)
+            raise envelope.ToolError(
+                envelope.ERR_GIF_CONVERT_FAILED,
+                log_detail=f"ffmpeg timeout {GIF_CONVERT_TIMEOUT_S}s (retried)",
+            )
+        if rc != 0:
+            _unlink(out_path)
+            raise envelope.ToolError(
+                envelope.ERR_GIF_CONVERT_FAILED,
+                log_detail=(
+                    f"ffmpeg rc={rc} (retried) "
+                    f"stderr={err.decode('utf-8', 'replace')[:160]!r}"
+                ),
+            )
+        size = _gif_product_size(
+            out_path, rc=rc, max_media_bytes=max_media_bytes, stage=" (retried)"
+        )
+        duration_s = await _gif_product_duration(out_path)
+        if duration_s is None:
+            _unlink(out_path)
+            raise envelope.ToolError(
+                envelope.ERR_GIF_CONVERT_FAILED,
+                log_detail="retried output still has no video stream",
+            )
+        return size, duration_s
+    finally:
+        _unlink(retry_source)
 
 
 def compress_target_kbps(budget_bytes: int, duration_s: float) -> int:
