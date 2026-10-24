@@ -33,6 +33,12 @@
   `Image` 还是群文件形态到达都是同一个键（共享缓存）；参数是代码常量，随 `PLUGIN_VERSION` 失效。
 - **`-t` 刻意不加**：时长闸在转换**之前**；加了 `-t` 只会在 ffprobe 低报时长时**静默截断**
   用户内容。
+- **源 GIF 没有时长就不是错误**（`media.probe_gif_duration_s`，t3 测试面发现的实现缺陷）：
+  **没有 GCE 块**的单帧 GIF 是 `format.duration=N/A`（真 `ffprobe` 实测），而这类老图是
+  真实世界里最常见的静态 GIF。沿用视频口径会给它们一个 `PROBE_FAILED`，SPEC §5.5 的
+  "单帧 GIF ⇒ 受理 + `gif_static`" 就落不了地 ⇒ 该情形按 **0 s** 处理（闸②是上界闸，
+  未知即不可能超限；真实时长由产物 mp4 提供）。ffprobe 真坏（缺失/超时/异常）仍
+  `PROBE_FAILED`。
 
 ### ② 修复（v0.3 潜在缺陷）：群文件 `.gif` 曾被贴 `data:video/mp4` 直送
 
@@ -46,7 +52,8 @@ v0.3 的 `File` + `.gif` 已经"进链"了，但是错的那种：`_classify_fil
 
 - **受理信封（第三种形状，4 键、顺序固定）**：
   `{"ok":true,"state":"accepted|running","task_id":"<32hex>","hint":"<常量>"}`。
-  与成功 9 键 / 失败 3 键**键名不重叠**（除 `ok`）。模型**只会**看到"受理"或"失败"；
+  与成功 9 键**键名不重叠**（除 `ok`）、与失败 3 键只共用 `ok` / `hint`（判别靠 `state`）。
+  模型**只会**看到"受理"或"失败"；
   成功信封变成一条**发给用户**的中文消息（不再回到模型）。
 - **机制**：插件自管任务表（`_TASKS` / `_BY_KEY` / `_BY_UMO`）+ `asyncio.create_task`；
   去重键 `umo|target|message_id|mode|focus`（同一条消息同一组参数重复调用 ⇒ 返回**同一个

@@ -31,6 +31,7 @@ from _fakes import (
     TrackingFakeEvent,
     UnresolvableRecord,
     make_event,
+    make_file,
     make_record,
     make_video,
 )
@@ -577,3 +578,32 @@ async def test_probe_streams_zero_rc_with_empty_stdout_is_false_not_failure(
     monkeypatch.setenv("PATH", str(bin_dir))
 
     assert await media.probe_streams(str(tmp_path / "clip.mp4")) == (False, False)
+
+
+# --------------------------------------------------------------------------- #
+# v0.4 形状回归：`find_media` 变异步、`MediaHandle` 多一个 `gif` 标志
+#
+# GIF 的**行为**用例在 `tests/test_gif.py`（魔数/候选优先级/四道闸/argv 全在那里）。
+# 这里只钉两条"接口形状"，它们一旦回退，所有调用点的 `await` 都会静默变成"没执行"。
+# --------------------------------------------------------------------------- #
+def test_find_media_became_a_coroutine_in_v04() -> None:
+    """SPEC-v0.4 §5.2：`find_media` 由 `def` 改 `async def`（`Image` 要读 6 字节魔数）。
+
+    为什么值得单测：同步函数被 `await` 会在运行期 `TypeError`，而**协程**被漏掉
+    `await` 只会得到一个"永远不被等待"的对象 —— 后者是静默的（本项目最贵的失败形态）。
+    """
+    assert inspect.iscoroutinefunction(media.find_media) is True
+    # `confirm_gif` 刻意保持同步（只读 6 字节，没有可等待的 IO）
+    assert inspect.iscoroutinefunction(media.confirm_gif) is False
+
+
+def test_media_handle_gif_flag_defaults_false(media_fixtures: dict[str, Path]) -> None:
+    """`MediaHandle.gif` 默认 `False`：既有三种类型（Record/Video/File）的行为一字不变。"""
+    record = media.MediaHandle(comp=make_record(media_fixtures["audio_30s"]), quoted=False)
+    video = media.MediaHandle(comp=make_video(media_fixtures["video_5s"]), quoted=False)
+    file_ = media.MediaHandle(comp=make_file("x.mp4"), quoted=False, from_file=True)
+
+    assert record.gif is False and video.gif is False and file_.gif is False
+    assert record.kind == "audio" and video.kind == "video"
+    # `gif=True` 的句柄 `kind` 恒为 video（不新增 kind，SPEC-v0.4 §5.10）
+    assert media.MediaHandle(comp=record.comp, quoted=False, gif=True).kind == "video"

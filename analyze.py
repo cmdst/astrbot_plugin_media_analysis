@@ -256,7 +256,9 @@ async def analyze(
         #         ⚠ 必须跳过 `classify`：它会把 `Image` 判成 `kind=audio`（§1.2-M7 实测）
         if handle.gif:
             notes.append("source:gif")
-            source_duration_s = await media.probe_duration_s(path)
+            # 用 GIF 专用入口：无 GCE 的单帧 GIF 没有 `format.duration`（真 ffprobe 实测
+            # `N/A`）⇒ 0.0（闸②是上界闸，未知即不可能超限）；真正的探测故障仍 PROBE_FAILED
+            source_duration_s = await media.probe_gif_duration_s(path)
             if source_duration_s > max_seconds:
                 raise envelope.ToolError(
                     envelope.ERR_MEDIA_TOO_LONG,

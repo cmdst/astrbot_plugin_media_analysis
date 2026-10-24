@@ -785,6 +785,11 @@ async def ensure_provider_wav(path: str, *, workdir: str, extracted: bool = Fals
     return await _ffmpeg_to_wav(source, os.path.join(workdir, "provider.wav"))
 
 
+#: "容器里没有可读时长"的 `log_detail`（`probe_duration_s` 与 `probe_gif_duration_s`
+#: 共用一份字面量，别在两处各写一遍导致比对失效）。
+DURATION_UNAVAILABLE = "duration unavailable"
+
+
 async def probe_duration_s(path: str) -> float:
     """时长（秒，2 位小数）：复用核心 `get_media_duration`（**返回毫秒**，失败 None）。"""
     try:
@@ -802,9 +807,34 @@ async def probe_duration_s(path: str) -> float:
         ) from None
     if not isinstance(duration_ms, (int, float)) or duration_ms <= 0:
         raise envelope.ToolError(
-            envelope.ERR_PROBE_FAILED, log_detail="duration unavailable"
+            envelope.ERR_PROBE_FAILED, log_detail=DURATION_UNAVAILABLE
         )
     return round(float(duration_ms) / 1000.0, 2)
+
+
+async def probe_gif_duration_s(path: str) -> float:
+    """**源 GIF** 的时长（秒）；"没有可度量的时长" ⇒ `0.0`（SPEC-v0.4 §5.7 闸②）。
+
+    为什么要单独一个入口（v0.4 实测的**实现缺陷修复**）：`ffprobe`/`get_media_duration`
+    对**没有 GCE 块**的单帧 GIF 直接读不到时长（实测 `format.duration=N/A` ⇒
+    `could not convert string to float: 'N/A'`），而这类 GIF 恰恰是真实世界里**最常见**的
+    静态 GIF（GIF87a 老图；`/usr/share/doc/**/*.gif` 抽样 8/9 无 GCE）。沿用视频口径抛
+    `PROBE_FAILED` 会让 SPEC-v0.4 §5.5 的"单帧 GIF ⇒ 受理 → 视频链 + `gif_static`"落不了地。
+
+    为什么 `0.0` 是安全的：闸②是**上界**闸（`duration > max_media_seconds` 才拒），
+    "没有可度量的时长"只可能来自"单帧 / 延迟全为 0"这类**极短**源，不可能超上限；
+    真实时长稍后由产物 mp4 提供（`GifResult.duration_s`，`normalize_gif` 里再探一次，
+    那次失败仍然 `GIF_CONVERT_FAILED`）。
+
+    **只降级这一种情形**：ffprobe 缺失/超时/异常（`log_detail` 不是 `duration unavailable`）
+    照旧上抛 `PROBE_FAILED` —— 那是环境坏了，不该被伪装成"没有时长"。
+    """
+    try:
+        return await probe_duration_s(path)
+    except envelope.ToolError as exc:
+        if exc.code == envelope.ERR_PROBE_FAILED and exc.log_detail == DURATION_UNAVAILABLE:
+            return 0.0
+        raise
 
 
 async def probe_streams(path: str) -> tuple[bool, bool]:

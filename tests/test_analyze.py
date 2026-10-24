@@ -54,6 +54,8 @@ from _fakes import (
     RecordingLogger,
     audio_chat,
     make_event,
+    make_file,
+    make_image,
     make_record,
     make_video,
 )
@@ -1681,3 +1683,322 @@ async def test_configured_stt_provider_id_in_audio_slot_is_capability_mismatch(
     payload = await rig.tool()
     assert payload["error"] == envelope.ERR_PROVIDER_CAPABILITY_MISMATCH
     assert not stt.calls.named("get_text"), "STT 面一次都不该被调用"
+
+
+# --------------------------------------------------------------------------- #
+# v0.4 GIF 分支：`[3.5] confirm_gif` → `[4-pre]` 时长闸 → 归一 → 既有七跳（SPEC-v0.4 §5.12）
+#
+# 与 `tests/test_gif.py` 的分工：那边测**媒体层**（魔数/候选/四道闸/argv/真 ffmpeg），
+# 这里测**主链路里的接线**——顺序、跳过 `classify`、`kind`、notes、缓存键取源字节。
+# 归一的三个外部依赖（源时长 / 归一 / 帧数）在这里打桩 ⇒ 这些用例不依赖 ffmpeg。
+# --------------------------------------------------------------------------- #
+def _gif_event(tmp_path: Path, name: str = "sticker.gif", **kwargs: object):
+    """造一条 `Image`(GIF) 事件 + 源文件路径（`_gif.write_gif`，零依赖手工字节）。"""
+    from _gif import write_gif
+
+    path = write_gif(tmp_path / name, **kwargs)
+    return make_event(current=[make_image(path)]), path
+
+
+def _stub_gif_convert(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    source_duration: float = 8.0,
+    frames: int = 8,
+    product: bytes | None = None,
+    error: BaseException | None = None,
+    product_duration: float = 8.0,
+) -> dict[str, object]:
+    """把 GIF 归一的外围依赖换成可注入假身：源时长 / 归一 / 产物。"""
+    calls: dict[str, object] = {"duration": 0, "normalize": 0, "source": ""}
+
+    async def _duration(path: str) -> float:
+        calls["duration"] = int(calls["duration"]) + 1
+        calls["duration_path"] = path
+        return float(source_duration)
+
+    async def _normalize(source: str, *, workdir: str, max_media_bytes: int):
+        calls["normalize"] = int(calls["normalize"]) + 1
+        calls["source"] = source
+        calls["max_media_bytes"] = max_media_bytes
+        if error is not None:
+            raise error
+        out = Path(workdir) / "gif.mp4"
+        out.write_bytes(
+            product
+            if product is not None
+            else b"\x00\x00\x00\x18ftypisom" + b"\x00" * 64
+        )
+        return media.GifResult(
+            path=str(out),
+            size=out.stat().st_size,
+            source_size=Path(source).stat().st_size,
+            duration_s=float(product_duration),
+            frames=frames,
+        )
+
+    monkeypatch.setattr(media, "probe_gif_duration_s", _duration)
+    monkeypatch.setattr(media, "normalize_gif", _normalize)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_gif_branch_reports_kind_video_with_three_notes_and_no_classify(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """§5.10 / §5.12：`kind` 仍取 `video`、notes 三条、**跳过 `classify`**、零抽帧零转写。"""
+    from _fakes import native_video
+
+    event, gif_path = _gif_event(tmp_path, width=32, height=32, frames=4)
+    rig = build_rig(
+        monkeypatch, tmp_path, kind="video", event=event, native=native_video()
+    )
+    calls = _stub_gif_convert(monkeypatch, frames=4)
+
+    payload = await rig.run()
+
+    assert payload["ok"] is True
+    assert payload["kind"] == "video"
+    assert payload["frames"] == [] and payload["transcript"] == []
+    notes = list(payload["notes"])
+    assert "source:gif" in notes
+    converted = [note for note in notes if note.startswith("gif_converted:")]
+    assert len(converted) == 1
+    size_in, _, size_out = converted[0].partition(":")[2].partition("->")
+    assert size_in == str(gif_path.stat().st_size)
+    assert size_out == str(len(b"\x00\x00\x00\x18ftypisom" + b"\x00" * 64))
+    assert "gif_static" not in notes
+    assert rig.media_calls["classify"] == 0, "GIF 必须跳过 classify（否则 Image 会被判成 kind=audio）"
+    assert calls["normalize"] == 1
+    assert calls["source"] == str(gif_path)  # 归一拿到的是**源**文件
+
+
+@pytest.mark.asyncio
+async def test_gif_branch_confirms_the_magic_before_normalising(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """§5.12 的顺序冻结：`[3.5] confirm_gif` 必须早于 `[4-pre] normalize_gif`。
+
+    顺序错了也不会"看起来错"：先归一后确认 ⇒ 改名党（`.gif` + PNG 字节）会被无谓地
+    喂给 ffmpeg，且失败码会从 `MEDIA_NOT_FOUND` 漂成 `GIF_CONVERT_FAILED`。
+    """
+    from _fakes import native_video
+
+    event, _path = _gif_event(tmp_path, width=32, height=32, frames=2)
+    rig = build_rig(
+        monkeypatch, tmp_path, kind="video", event=event, native=native_video()
+    )
+    order: list[str] = []
+    real_confirm = media.confirm_gif
+
+    def _confirm(handle, path):  # type: ignore[no-untyped-def]
+        order.append("confirm")
+        return real_confirm(handle, path)
+
+    monkeypatch.setattr(media, "confirm_gif", _confirm)
+    calls = _stub_gif_convert(monkeypatch)
+    real_normalize = media.normalize_gif
+
+    async def _normalize(source: str, *, workdir: str, max_media_bytes: int):
+        order.append("normalize")
+        return await real_normalize(
+            source, workdir=workdir, max_media_bytes=max_media_bytes
+        )
+
+    monkeypatch.setattr(media, "normalize_gif", _normalize)
+
+    await rig.run()
+
+    assert order == ["confirm", "normalize"]
+    assert calls["normalize"] == 1
+
+
+@pytest.mark.asyncio
+async def test_gif_source_duration_gate_rejects_before_conversion(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """§5.7 闸②：**源**时长超 `limits.max_media_seconds` ⇒ `MEDIA_TOO_LONG`，一次都不转。"""
+    from _fakes import native_video
+
+    event, _path = _gif_event(tmp_path, width=32, height=32, frames=2)
+    rig = build_rig(
+        monkeypatch,
+        tmp_path,
+        kind="video",
+        event=event,
+        native=native_video(),
+        cfg=settings.Settings(max_media_seconds=5, vision_provider_id="fake-chat"),
+    )
+    calls = _stub_gif_convert(monkeypatch, source_duration=9.5)
+
+    with pytest.raises(envelope.ToolError) as exc_info:
+        await rig.run()
+    assert exc_info.value.code == envelope.ERR_MEDIA_TOO_LONG
+    assert "gif duration_s=9.5" in exc_info.value.log_detail
+    assert calls["normalize"] == 0, "时长闸在归一**之前**（闸②）"
+
+
+@pytest.mark.asyncio
+async def test_gif_conversion_failure_is_a_delivered_failure_envelope(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """§5.9：归一失败 ⇒ `GIF_CONVERT_FAILED`，**经后台投递一条失败消息**（不是静默）。"""
+    from _fakes import native_video
+
+    event, _path = _gif_event(tmp_path, width=32, height=32, frames=2)
+    rig = build_rig(
+        monkeypatch, tmp_path, kind="video", event=event, native=native_video()
+    )
+    _stub_gif_convert(
+        monkeypatch,
+        error=envelope.ToolError(
+            envelope.ERR_GIF_CONVERT_FAILED, log_detail="ffmpeg rc=187"
+        ),
+    )
+
+    payload = await rig.tool()
+
+    assert list(payload) == list(envelope.FAIL_KEYS)
+    assert payload["error"] == envelope.ERR_GIF_CONVERT_FAILED
+    # 后台那条用户消息也必须是失败文案（`render` 的失败形态）
+    from astrbot.api.message_components import Plain
+
+    texts = [
+        comp.text
+        for call in rig.context.calls.named("send_message")
+        for comp in call.args[1].chain
+        if isinstance(comp, Plain)
+    ]
+    assert len(texts) == 1
+    assert texts[0].startswith("媒体分析失败：GIF_CONVERT_FAILED。")
+
+
+@pytest.mark.asyncio
+async def test_gif_cache_key_uses_source_bytes_on_both_sides(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """§5.11：缓存 `digest` 取**源**字节 —— 换产物**仍命中**、换源**必 miss**。
+
+    两侧都断言才算钉住（只测一侧的话，"拿产物算 digest"也能让某一侧碰巧过）。
+    """
+    from _fakes import native_video
+    from _gif import gif_bytes
+
+    real_digest = media.content_digest  # build_rig 会把 content_digest 桩掉 ⇒ 先抓真身
+    event, gif_path = _gif_event(tmp_path, width=32, height=32, frames=2)
+    rig = build_rig(
+        monkeypatch, tmp_path, kind="video", event=event, native=native_video()
+    )
+    calls = _stub_gif_convert(monkeypatch)
+    seen: list[str] = []
+
+    async def _digest(path: str) -> str:
+        seen.append(str(path))
+        return await real_digest(str(path))
+
+    monkeypatch.setattr(media, "content_digest", _digest)
+
+    first = await rig.run()
+    assert first["cached"] is False
+    assert seen == [str(gif_path)], "digest 只应针对**源**算一次（不是 gif.mp4）"
+
+    # ① 同一份源字节、**换掉产物字节**（重新打桩归一）⇒ 键不变 ⇒ 命中
+    _stub_gif_convert(monkeypatch, product=b"\x00\x00\x00\x18ftypisom" + b"\xff" * 16)
+    second = await rig.run()
+    assert second["cached"] is True
+    assert second["summary"] == first["summary"]
+
+    # ② 换掉源字节 ⇒ digest 变 ⇒ 必 miss
+    gif_path.write_bytes(gif_bytes(width=40, height=40, frames=3))
+    third = await rig.run()
+    assert third["cached"] is False
+    assert seen[-1] == str(gif_path)
+
+
+@pytest.mark.asyncio
+async def test_image_gif_and_file_gif_with_same_bytes_share_one_cache_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """§5.11-1：同一张 GIF 以 `Image` / 群文件两种形态到达 ⇒ 同一键 ⇒ 共享缓存。"""
+    from _fakes import native_video
+
+    real_digest = media.content_digest  # build_rig 会把 content_digest 桩成常量 ⇒ 先抓真身
+    event, gif_path = _gif_event(tmp_path, width=32, height=32, frames=3)
+    rig = build_rig(
+        monkeypatch, tmp_path, kind="video", event=event, native=native_video()
+    )
+    _stub_gif_convert(monkeypatch)
+    monkeypatch.setattr(media, "content_digest", real_digest)
+
+    image_payload = await rig.run()
+    assert image_payload["cached"] is False
+
+    second_copy = tmp_path / "same-bytes.gif"
+    second_copy.write_bytes(gif_path.read_bytes())  # 字节相同、路径不同、形态不同
+    rig.event = make_event(current=[make_file("same-bytes.gif", file=str(second_copy))])
+    file_payload = await rig.run()
+
+    assert file_payload["cached"] is True
+    assert file_payload["summary"] == image_payload["summary"]
+    # 命中时 notes 是**缓存里那一份**（信封整体入缓存，`source:file` 属本次调用、不进缓存）
+    assert "source:gif" in file_payload["notes"]
+    assert "source:file" not in file_payload["notes"]
+
+
+@pytest.mark.asyncio
+async def test_remote_gif_image_is_rejected_after_download_when_magic_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """§5.4：远程 `Image` + `.gif` 后缀 ⇒ 受理；下载后魔数不符 ⇒ `MEDIA_NOT_FOUND`。
+
+    下载本身用桩（`resolve_media_path` 返回一份 PNG 落地文件）—— 测试不联网，
+    但走的是**同一条** `[3] resolve → [3.5] confirm_gif` 顺序。
+    """
+    from _gif import png_bytes
+    from _fakes import native_video
+
+    landed = tmp_path / "downloaded.gif"
+    landed.write_bytes(png_bytes())
+    event = make_event(
+        current=[make_image("", url="https://x.invalid/sticker.gif?sig=1")]
+    )
+    rig = build_rig(
+        monkeypatch, tmp_path, kind="video", event=event, native=native_video()
+    )
+    _stub_gif_convert(monkeypatch)
+
+    async def _resolve(_handle, *, workdir: str, max_media_bytes: int) -> str:
+        return str(landed)
+
+    monkeypatch.setattr(media, "resolve_media_path", _resolve)
+
+    with pytest.raises(envelope.ToolError) as exc_info:
+        await rig.run()
+    assert exc_info.value.code == envelope.ERR_MEDIA_NOT_FOUND
+    assert "普通图片不进链" in exc_info.value.log_detail
+
+
+@pytest.mark.asyncio
+async def test_gif_static_note_tracks_the_source_frame_count(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """§5.10：`gif_static` 只在**源** GIF ≤ 1 帧时出现（多帧不许误标）。"""
+    from _fakes import native_video
+    from _gif import gif_bytes
+
+    real_digest = media.content_digest  # 同上：要让 digest 真的跟着源字节走
+    event, gif_path = _gif_event(tmp_path, width=32, height=32, frames=1, delay_cs=10)
+    rig = build_rig(
+        monkeypatch, tmp_path, kind="video", event=event, native=native_video()
+    )
+    _stub_gif_convert(monkeypatch, frames=1)
+    monkeypatch.setattr(media, "content_digest", real_digest)
+
+    single = await rig.run()
+    assert "gif_static" in single["notes"]
+
+    gif_path.write_bytes(gif_bytes(width=32, height=32, frames=5))  # 源字节变 ⇒ 新键
+    _stub_gif_convert(monkeypatch, frames=5)
+    animated = await rig.run()
+    assert animated["cached"] is False
+    assert "gif_static" not in animated["notes"]

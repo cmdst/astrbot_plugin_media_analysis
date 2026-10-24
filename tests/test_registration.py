@@ -229,6 +229,39 @@ def test_docstring_carries_usage_constraints() -> None:
     assert "include_frames" in docstring and "focus" in docstring
 
 
+def test_docstring_promises_accept_and_background_delivery() -> None:
+    """§3.3 / §8.3：docstring 必须写清"立即返回 + 结果由后台单独发送"（否则模型会编造内容）。
+
+    这条守的是**模型行为**：v0.4 起工具返回值里不再有分析结果，模型若以为还能拿到，
+    就会开始编造摘要（或反复调用）。文档里三件事缺一不可：受理回执、后台发送、别再调用。
+    """
+    docstring = ast.get_docstring(_media_analyze_def()) or ""
+    assert "立即返回" in docstring
+    assert "后台" in docstring and "自动发" in docstring
+    assert "受理" in docstring
+    assert "不要" in docstring and "重复调用" in docstring
+    # 受理回执的 4 键形状写进文档（模型据此判断"这是受理、不是结果"）
+    assert "\"state\"" in docstring and "task_id" in docstring
+    assert "GIF" in docstring  # v0.4 的媒体范围扩到 GIF，文档也得说
+
+
+def test_accept_hint_is_a_constant_without_runtime_data() -> None:
+    """§3.2 / §3.3：`ACCEPT_HINT` 是**纯常量**（与 `HINTS` 同级纪律）。
+
+    它会被框架按 INFO 全量写进生产日志、也是模型唯一读到的操作性指令 ⇒ 不许夹带
+    数字/路径/URL/占位符（`{`/`}`），也不许是可变的 f-string 产物。
+    """
+    hint = envelope.ACCEPT_HINT
+    assert hint and hint.strip() == hint
+    assert not re.search(r"\d", hint), f"受理文案里出现数字：{hint!r}"
+    assert "/" not in hint and "\\" not in hint
+    assert "http" not in hint.lower()
+    assert "{" not in hint and "}" not in hint
+    assert "task_id" not in hint  # 不许让模型复述 task_id（§3.3 第 2 条）
+    # 常量只此一份：`accept_envelope` 引用的就是它
+    assert envelope.accept_envelope("accepted", "a" * 32)["hint"] == hint
+
+
 # --------------------------------------------------------------------------- #
 # 4. 真机注册面的 schema 形状（C10；工具已在本进程注册）
 # --------------------------------------------------------------------------- #
