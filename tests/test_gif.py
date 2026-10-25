@@ -744,7 +744,9 @@ async def test_single_frame_short_delay_gif_is_retried_into_a_real_mp4(tmp_path)
     )
     assert result.size > 0
     assert result.frames == 1 and result.static is True
-    assert result.duration_s == pytest.approx(1 / media.GIF_MAX_FPS, abs=0.02)
+    # F2-R：抬到 1.0 s（不是 1/12 s）—— 0.083 s 的产物会被上游视频通道 400 拒收
+    assert result.duration_s == pytest.approx(media.GIF_STATIC_HOLD_CS / 100.0, abs=0.1)
+    assert result.duration_s >= 0.5, "必须明显高于上游最小可读时长（≈1 s）"
     assert await media.probe_streams(result.path) == (False, True)
     # 重试用的拷贝已清掉、源只读（SPEC §5.8）
     assert not (tmp_path / "gif_static.gif").exists()
@@ -755,7 +757,11 @@ def test_prepare_static_gif_copy_patches_only_the_delay_field(tmp_path) -> None:
     """`prepare_static_gif_copy` 的粒度：**只改 GCE 的 2 字节**，且三种情形不动手。
 
     这条守的是"修法最小"：如果哪天有人改成重编码/改 argv/改源文件，这里会红。
+    同时钉住 **F2-R 的双数纪律**：触发阈值（9 cs，由 fps 网格决定）与"抬到多少"
+    （100 cs = 1.0 s，由上游最小可读时长决定）是**两个**常量，不能合并、不能一起改大。
     """
+    assert media.GIF_STATIC_MIN_DELAY_CS == 9, "触发阈值只由 fps 网格决定，不许为凑上游时长改大"
+    assert media.GIF_STATIC_HOLD_CS == 100, "单帧重试写入的保持时长 = 1.00 s（上游可读）"
     source = write_gif(tmp_path / "short.gif", width=20, height=20, frames=1, delay_cs=4)
     found = media.gif_gce_delay(source.read_bytes())
     assert found is not None
@@ -769,7 +775,8 @@ def test_prepare_static_gif_copy_patches_only_the_delay_field(tmp_path) -> None:
     assert len(before) == len(after)
     diff = [i for i, (x, y) in enumerate(zip(before, after)) if x != y]
     assert diff == [offset], (diff, offset)  # 高字节本来就是 0，只动低字节
-    assert after[offset] == media.GIF_STATIC_MIN_DELAY_CS
+    # 写进去的是"抬到多少"（`GIF_STATIC_HOLD_CS` = 1.00 s），不是触发阈值（9 cs）
+    assert after[offset] == media.GIF_STATIC_HOLD_CS
     assert source.read_bytes() == before, "源文件必须只读"
 
     # ① 已经够长的保持时长 ⇒ 不动手（不然会无谓改用户字节）
@@ -1032,6 +1039,8 @@ async def test_short_delay_static_gif_is_accepted_and_marked_static(
 
     assert payload["ok"] is True, payload
     assert payload["kind"] == "video"
+    # F2-R：信封里的时长是**产物真实时长**（1.0 s），不是 1/12 s 也不是 0.0
+    assert payload["duration_s"] == pytest.approx(media.GIF_STATIC_HOLD_CS / 100.0, abs=0.1)
     assert "source:gif" in payload["notes"]
     assert "gif_static" in payload["notes"]
     assert any(note.startswith("gif_converted:") for note in payload["notes"])

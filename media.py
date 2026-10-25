@@ -126,7 +126,15 @@ GIF_MAX_FPS = 12  # GIF 常见 10–25 fps；12 保留动感、帧数砍半
 GIF_MAX_WIDTH_PX = 640  # 长边封顶（表情/短视频足够让模型说清"发生了什么"）
 GIF_CRF = 26  # 体积优先；GIF 源已是索引色
 GIF_CONVERT_TIMEOUT_S = 10.0  # 护栏不是产品参数（实测 0.62 s，16× 余量）
-GIF_STATIC_MIN_DELAY_CS = 9  # ceil(100/GIF_MAX_FPS)：单帧源的最小保持时长（1/12 s）
+#: **触发阈值**：GCE 保持时长低于它就重试（`ceil(100/GIF_MAX_FPS)` = 1/12 s）。
+#: 这个数只由"`fps` 网格从哪一刻开始吃掉唯一一帧"决定（实测边界 0.0417 s），**不要**为了
+#: 凑上游时长把它改大 —— 5–12 cs 的源本来就能产出正常 1 帧 mp4，不需要动它们的字节。
+GIF_STATIC_MIN_DELAY_CS = 9  # ceil(100/GIF_MAX_FPS)
+#: **抬到多少**：单帧重试时写入的保持时长（1.0 s）。1/12 s（0.083 s）的产物会被上游视频通道
+#: 直接 400 拒收（真机 F2-R：Gemini `BadRequestError`，两次独立复现），而 1.0 s 的同一份画面
+#: 能被正常受理。所以"能不能过网格"（9 cs）与"能不能被上游读"（100 cs）是**两个**数，
+#: 混成一个就会把不必要改字节的源也一起改掉。
+GIF_STATIC_HOLD_CS = 100  # = 1.00 s（上游最小可读时长，见 GIF_STATIC_MIN_DELAY_CS）
 GIF_STATIC_SCAN_BYTES = 64 * 1024  # 找 GCE 只扫这个前缀（GCE 必在首个图像描述符之前）
 
 
@@ -1164,18 +1172,29 @@ def gif_gce_delay(head: bytes) -> tuple[int, int] | None:
 
 
 def prepare_static_gif_copy(
-    source: str, dest: str, *, min_delay_cs: int = GIF_STATIC_MIN_DELAY_CS
+    source: str,
+    dest: str,
+    *,
+    trigger_delay_cs: int = GIF_STATIC_MIN_DELAY_CS,
+    hold_cs: int = GIF_STATIC_HOLD_CS,
 ) -> bool:
-    """把**单帧** GIF 的 GCE 保持时长抬到 `min_delay_cs`，拷到 `dest`；不需要/做不到 ⇒ `False`。
+    """把**单帧** GIF 的 GCE 保持时长抬到 `hold_cs`，拷到 `dest`；不需要/做不到 ⇒ `False`。
 
-    为什么需要（真机 F2 的**根因**）：冻结 argv 里的 `fps=12` 按输出帧间隔的**中点**取帧
-    （实测边界就在 0.0417 s = 半个 1/12 s），源帧时长更短时**整帧被丢掉** ⇒ 产物是
+    两个数各管一件事（**不要合并**，合并会同时改坏两件事）：
+
+    - `trigger_delay_cs`（默认 9 cs = 1/12 s）**只决定要不要动手**：低于它的源帧会被冻结 argv
+      的 `fps=12` 网格整帧吃掉（按输出帧间隔**中点**取样，实测边界 0.0417 s）。5–12 cs 的源
+      本来就能产出正常 1 帧 mp4 ⇒ 不该动它们的字节。
+    - `hold_cs`（默认 100 cs = 1.0 s）**决定写进去多少**：1/12 s 的产物虽然"有画面"，但会被
+      上游视频通道 400 拒收（真机 F2-R），1.0 s 的同一份画面能被正常受理。
+
+    为什么需要（真机 F2 的**根因**）：源帧时长低于半个输出间隔时**整帧被丢掉** ⇒ 产物是
     **262 字节、0 个流**的空 mp4（`format.duration=N/A`）。这不是"转换失败"，而是"唯一的一帧
     被 fps 网格吃掉"；也正因如此"有流无时长"的放行口救不了它（连流都没有）。
 
     为什么改保持时长是**语义恒等**：单帧源没有帧率可言，GCE 的 delay 只决定"这张静态图被
-    展示多久"，与画面、帧数、字节内容都无关。抬到 1/12 s 后同一份 argv 就能正常产出 1 帧。
-    只改 2 字节（delay 的低/高位），**源文件只读**：先 `copyfile` 再 `r+b` 定点改。
+    展示多久"，与画面、帧数、字节内容都无关。只改 2 字节（delay 的低/高位），
+    **源文件只读**：先 `copyfile` 再 `r+b` 定点改。
     """
     try:
         with open(source, "rb") as handle:
@@ -1186,13 +1205,14 @@ def prepare_static_gif_copy(
     if found is None:
         return False
     offset, delay = found
-    if delay >= int(min_delay_cs):
+    if delay >= int(trigger_delay_cs):
         return False
+    target = int(hold_cs)
     try:
         shutil.copyfile(source, dest)
         with open(dest, "r+b") as handle:
             handle.seek(offset)
-            handle.write(bytes([int(min_delay_cs) & 0xFF, (int(min_delay_cs) >> 8) & 0xFF]))
+            handle.write(bytes([target & 0xFF, (target >> 8) & 0xFF]))
     except OSError:
         _unlink(dest)
         return False
@@ -1273,7 +1293,7 @@ async def _gif_retry_single_frame(
     触发条件（三条同时成立才动手，其余情形保持 v0.4.0 的 `GIF_CONVERT_FAILED`）：
     ① 首轮产物**一个流都没有**（`_gif_product_duration` 返回 `None`）；
     ② 源**只有一帧**（`gif_frame_count == 1`）；
-    ③ 源字节里能找到 GCE 且保持时长 < `GIF_STATIC_MIN_DELAY_CS`。
+    ③ 源字节里能找到 GCE 且保持时长 < `GIF_STATIC_MIN_DELAY_CS`（触发阈值，9 cs）。
 
     为什么不改 argv：`SPEC-v0.4 §5.6` 的 argv 是**冻结面**（`tests/test_gif.py` 有逐字符快照），
     而这里要解决的只是"输入的唯一一帧太短、被输出网格取样时跳过"——改输入（一份拷贝，
@@ -1299,9 +1319,10 @@ async def _gif_retry_single_frame(
 
     LOG.info(
         "media_analysis: 单帧 GIF 的唯一帧短于 1/%d s（被 fps 网格吃掉），"
-        "把保持时长抬到 %d cs 后重试一次",
+        "把保持时长抬到 %d cs（%.2f s，上游最小可读时长）后重试一次",
         GIF_MAX_FPS,
-        GIF_STATIC_MIN_DELAY_CS,
+        GIF_STATIC_HOLD_CS,
+        GIF_STATIC_HOLD_CS / 100.0,
     )
     rc, err, timed_out = await _run_capture(
         gif_argv(retry_source, out_path), timeout=GIF_CONVERT_TIMEOUT_S
