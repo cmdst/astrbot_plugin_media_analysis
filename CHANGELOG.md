@@ -1,5 +1,49 @@
 # CHANGELOG
 
+## v0.4.2 — 2026-10-25（**实验模式；待评审 / 待推送 / 待部署**）
+
+**+1 配置键 / 0 参数变更 / 0 错误码与 notes 词表变更**。把 v0.4.1 评估过的"路线 C
+（核心原生后台）"从"不采用"精确化为「**默认不采用、可显式选择**」，并补上报告 §3.2 要求的
+能力探测、互斥与回退。**默认行为与 v0.4.1 逐字相同**（A2 的受理/投递面一字未改）。
+
+- **新配置键 `background.mode`**（`plugin` 默认 / `core` 实验）⇒ **22 键 / 6 组**。新组
+  `background` **追加在 schema 最末尾**，既有 21 键的相对顺序一个字都没动；四处互钉
+  （schema / `KEY_MAP` / `main._settings()` / **`tools/migrate_config_v042.py:KEY_ORDER`**）
+  + 新增第五个断言「v0.3 迁移器是 22 键表的 21 键前缀」。`tools/migrate_config_v03.py`
+  **冻结**为 v0.2→v0.3 的历史快照（仍 21 键）。坏值一律回 `plugin`（保守侧）+ WARNING 一次。
+- **路线 C 可选（实验）**：`core` 模式下插件给**自己的** `FuncTool` 置
+  `is_background_task`，由核心 `create_task` + 唤醒轮交付。**前置条件**：核心在
+  `_PermissionGuardedTool.__init__` 补**一行**镜像（`is_background_task`）并**重启**
+  `astrbot.service`；未修核心时插件**拒绝 `core`** —— ERROR 一条 + **内存级回落 `plugin`**
+  （不写配置、不落盘、不改你的选择）。
+- **能力探测（fail-closed）**：`initialize()` 最后一步「定位原始 `FuncTool` → 置位 →
+  用 `get_full_tool_set()` 的**包装器**比对」；七个 reason（`config_plugin` /
+  `wrapper_mirrors_raw` / `no_manager` / `no_tool` / `no_wrapper` / `wrapper_no_mirror` /
+  `probe_error`）。**默认 `plugin` 只打 DEBUG**（生产零噪音）；`ready:` 行**逐字不动**，
+  引擎判据 = ①配置值 ②**无** `REJECTED` 行。探测失败一律**还原 flag**（不留半开）。
+- **C 模式的 handler**：同步跑 `analyze` → 返回**人读文本**（不可信内容前缀 + 正文
+  ≤ 1200 字符 + A2 同源页脚），**不建任务表、不 `send`、不去重、无并发闸**；受控失败返回
+  「媒体分析失败：CODE。hint」，未知异常只回 `INTERNAL_ERROR`（**不把异常文本拼进返回体**），
+  `CancelledError` **上抛**（停止即静默）。`background.render()` 因此多一个关键字参数
+  `max_chars`（默认值 ⇒ A2 输出**逐字节不变**）。
+- **互斥**：结构互斥（C 分支**必然 return**、`core_mode` 不导入 `submit`/`_deliver`）
+  与行为互斥 4 格矩阵（配置 × 核心是否已修）；「core + 未修核心」= **回落 A2 + 一条消息**。
+  首次调用的一次性复检（`_bg_recheck_pending`）：变 reject ⇒ **本次仍按 C 跑**，后续回落 A2。
+- **为什么默认仍是 A2**（口径以 `SPEC-v0.4.2.md` §1.4 为准，**不再**引用"媒体无出口"）：
+  ① **投递不确定** —— C 的发声靠唤醒轮模型主动调 `send_message_to_user`，没调只有核心一条
+  WARNING（从"恰好一次"退化为"大概率一次"）；② **多一轮主 Agent**（每条任务多一轮完整
+  模型调用）；③ **3600 s 硬编码 + 无闸**（核心那层超时改不了，且去重/并发/预算闸在 C 模式下
+  全部不存在）。本插件的交付面**只有一条 `Plain` 文本**，所以报告 §5.2/§6.8 的"结果带媒体
+  ⇒ 没有可靠媒体出口"**对本插件不成立**（`frames` 是帧数计数，不是图片）。调研报告
+  `research/20261025-native-core-background-route.md`。
+- **上线**：只上插件 ⇒ 覆盖 + **重载一次**（核心 `check_config_integrity` 自动补
+  `background.mode="plugin"`）；开 C ⇒ 核心一行补丁 + **重启** → 配 `core` → 重载插件。
+  回滚三种形态：**R1** 配置回 `plugin` + 重载（首选止血，秒级）/ **R2** 回插件版本（成对反向，
+  旧 schema 会把 `background.mode` 当 stale 删掉）/ **R3** 撤核心补丁 + 重启（**先做 R1**）。
+- **版本 bump 的连带**：`PLUGIN_VERSION` 是结果缓存与 L1 探测的键分量 ⇒ 0.4.2 首次使用会
+  **再次冷启动**（旧缓存不命中、视频位首用多一次 L1 探测）。
+
+
 ## v0.4.1 — 2026-10-25（**残留清理；待评审 / 待推送 / 待部署**）
 
 **0 新配置键 / 0 参数变更 / 0 错误码与 notes 词表变更**。只清 v0.4.0 登记的残留，外加一条

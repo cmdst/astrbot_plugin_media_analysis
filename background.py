@@ -10,11 +10,23 @@ flag **恒为 False**（`/tmp` 探针实测：仍同步执行）。即便把 fla
 （`core/astr_agent_tool_exec.py:677-684` 只记 WARNING）⇒ 拿不到"恰好一次"。
 
 **v0.4.1 复核**（路线 C 调研，`research/20261025-native-core-background-route.md`）：核心侧
-只要在 `_PermissionGuardedTool.__init__` 里补一行镜像就能让 flag 生效，但**仍不 adopt**——
-① 唤醒轮的唯一可靠出口是模型自己调 `send_message_to_user`，没调只 WARNING，与 at-most-once
-冲突；② 本插件的成果是**带媒体**的（转写/摘要 + 可能的帧），C 模式下没有可靠媒体出口；
-③ 每任务多一轮完整主 Agent 调用。`tests/test_registration.py` 的
-`test_tool_is_not_a_core_background_task` 把"不置 flag"钉死，防止将来"顺手开原生"造成双发。
+只要在 `_PermissionGuardedTool.__init__` 里补一行镜像就能让 flag 生效，但 v0.4.1 **仍不
+adopt**。**v0.4.2 把口径精确化为"默认不采用、可显式选择"**（`background.mode=core`，
+实验模式，实现在 `core_mode.py`；本模块**不导入**它，依赖方向是 `main → core_mode →
+{analyze, envelope, background.render}`）。默认 `plugin` 下本模块仍是唯一引擎。
+
+默认不开 C 的三条理由（**v0.4.2 的事实更正**，见 SPEC-v0.4.2 §1.4 / §9.3）：
+① **投递不确定** —— C 的发声靠唤醒轮模型主动调 `send_message_to_user`，没调只有核心一条
+WARNING ⇒ 从"恰好一次"退化为"大概率一次"；② **多一轮主 Agent** —— 每条后台任务多一轮
+完整模型调用；③ **3600 s 硬编码 + 无闸** —— 核心那层超时改不了，且 C 模式下去重/并发闸/
+预算闸**全部不存在**。
+
+**（作废的说法）"本插件的成果是带媒体 ⇒ C 模式下没有可靠媒体出口"**：本插件的交付面
+**只有一条 `Plain` 文本**（`_deliver` ⇒ `MessageChain([Plain(text)])`，信封里的 `frames`
+是**帧数计数**不是图片）⇒ 报告 §5.2 / §6.8 的"媒体无可靠出口"对本插件**不成立**。
+未来的禁令见 SPEC-v0.4.2 §9.2：若 `_deliver` 哪天开始投媒体组件，C 模式必须先被移除。
+`tests/test_registration.py` 的 `test_tool_is_not_a_core_background_task` 继续把
+"**默认模式**下不置 flag"钉死，防止"顺手开原生"造成同一条任务两条消息。
 
 本模块的三条纪律（每条都在评审清单上）：
 
@@ -305,12 +317,18 @@ async def _deliver(context, event, umo: str, text: str) -> bool:
 # --------------------------------------------------------------------------- #
 # 渲染（纯函数、不读配置、可单测）
 # --------------------------------------------------------------------------- #
-def render(payload: dict[str, object]) -> str:
+def render(payload: dict[str, object], *, max_chars: int = DELIVERY_MAX_CHARS) -> str:
     """把信封渲染成**给用户看的一条文本**（SPEC-v0.4 §3.4 冻结）。
 
     只读信封，不读配置、不碰网络、**不带**路径 / `task_id` / provider id / 异常文本 /
     note 原文（note 只进日志与信封）。成功三形态：`summary` → `transcript` 拼接 →
     "（本次没有可用的文字内容）"。
+
+    `max_chars` 是 v0.4.2 为 C 模式（核心原生后台）加的**唯一**改动（SPEC-v0.4.2 §6.2）：
+    C 模式的正文要塞进唤醒轮的 system prompt，比一条群消息更紧（`CORE_BODY_MAX`）。
+    **默认值 == `DELIVERY_MAX_CHARS` ⇒ A2 的输出逐字节不变**；
+    两种模式的用户可见文本必须同源（同一份摘要/转写/页脚/`…` 规则），否则"同一个结果在
+    两种模式下长得不一样"会变成第二个事实源。
     """
     if payload.get("ok") is False:
         code = str(payload.get("error") or envelope.ERR_INTERNAL_ERROR)
@@ -339,9 +357,10 @@ def render(payload: dict[str, object]) -> str:
     if payload.get("cached"):
         footer += "｜缓存"
 
-    truncated = len(body) > DELIVERY_MAX_CHARS
+    limit = max(0, int(max_chars))
+    truncated = len(body) > limit
     if truncated:
-        body = body[:DELIVERY_MAX_CHARS]
+        body = body[:limit]
     return f"{body}{'…' if truncated else ''}\n{footer}"
 
 

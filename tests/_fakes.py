@@ -575,6 +575,9 @@ class FakeContext:
         has_provider_manager: False ⇒ `provider_manager` 为 `None`（测第 ③ 步落空）。
         send_ok: `send_message` 的返回值（`False` = "没找到平台，什么都没发"，v0.4 的兜底分支）。
         raise_on_send: `send_message` 抛出的异常（投递失败只 WARNING、不重试）。
+        manager: `get_llm_tool_manager()` 的返回（v0.4.2 的引擎探测读它）。
+            **缺省（`_UNSET`）⇒ 返回真核心的全局 `llm_tools` 单例**——那正是生产里
+            `context.get_llm_tool_manager()` 的语义；传 `None` 则模拟"桩环境没有管理器"。
     """
 
     def __init__(
@@ -588,7 +591,9 @@ class FakeContext:
         has_provider_manager: bool = True,
         send_ok: bool = True,
         raise_on_send: BaseException | None = None,
+        manager: Any = _UNSET,
     ) -> None:
+        self._manager = manager
         self._by_id = dict(by_id or {})
         self._send_ok = send_ok
         self._raise_on_send = raise_on_send
@@ -632,6 +637,21 @@ class FakeContext:
         if self._raise_on_send is not None:
             raise self._raise_on_send
         return bool(self._send_ok)
+
+    # -- v0.4.2 引擎探测面（SPEC-v0.4.2 §4.1 ③a） ---------------------------- #
+    def get_llm_tool_manager(self) -> Any:
+        """真核心语义：`context.get_llm_tool_manager()` ⇒ 全局 `llm_tools` 单例。
+
+        缺省返回**真单例**（`astrbot.core.provider.register.llm_tools`）：生产里
+        `initialize()` 就是靠它定位自己的 `FuncTool`，假身必须同形，否则"探测拿不到
+        管理器"这条路径会在所有用例里假红。
+        """
+        self.calls.record("get_llm_tool_manager")
+        if self._manager is _UNSET:
+            from astrbot.core.provider.register import llm_tools
+
+            return llm_tools
+        return self._manager
 
     # -- 断言辅助 ----------------------------------------------------------- #
     def provider_ids_asked(self) -> list[str]:

@@ -163,5 +163,26 @@
         "default": 86400
       }
     }
+  },
+  "background": {
+    "description": "后台执行（实验）",
+    "hint": "默认 plugin＝插件自管：受理即返回，分析完成后由插件自己发一条结果消息（恰好一次，含失败终态、去重、并发上限）。core＝把本工具交给 AstrBot 原生后台任务，由核心在完成后唤醒主模型转述；该模式需要核心先打一行补丁并重启（否则插件会拒绝并回落到 plugin），且投递由模型决定、不保证发声。除非你在做灰度验证，保持 plugin。",
+    "type": "object",
+    "items": {
+      "mode": {
+        "description": "后台执行模式",
+        "hint": "plugin（默认）＝插件自管，投递确定（at-most-once）。core＝核心原生后台（实验）：需要核心已补 _PermissionGuardedTool 镜像一行并重启；未修时插件会打 ERROR 并回落到 plugin（不写配置、不改你的选择）。",
+        "type": "string",
+        "options": [
+          "plugin",
+          "core"
+        ],
+        "labels": [
+          "插件自管（默认，投递确定）",
+          "核心原生后台（实验，需核心补丁+重启）"
+        ],
+        "default": "plugin"
+      }
+    }
   }
 }

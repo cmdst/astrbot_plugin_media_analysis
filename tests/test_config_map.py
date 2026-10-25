@@ -3,9 +3,11 @@
 为什么单开一个文件：本插件的配置键要同时出现在**四处** ——
 `_conf_schema.json`（WebUI 渲染 + `check_config_integrity()` 的合法键集合）、
 `settings.KEY_MAP`（点号路径 ⇄ 字段名的映射）、`main._settings()`（显式白名单读取点）、
-`tools/migrate_config_v03.py:KEY_ORDER`（运维侧迁移器的报告顺序）。
+`tools/migrate_config_v042.py:KEY_ORDER`（运维侧迁移器的报告顺序；**v0.4.2 起第四处换成
+它**，v0.3 的脚本冻结为 v0.2→v0.3 的历史快照，改由"21 键前缀"断言守住）。
 漏任何一处都是**静默故障**：父手册 §3 第 8 条那次事故里，两个旋钮只写进了 schema 与消费方，
-漏了 `main` 的白名单，生产链路上设置被丢掉一整天（v0.2 是 4 处 × 11 键，v0.3 是 4 处 × 21 键）。
+漏了 `main` 的白名单，生产链路上设置被丢掉一整天（v0.2 是 4 处 × 11 键，v0.3 是 4 处 × 21 键，
+**v0.4.2 是 4 处 × 22 键**）。
 
 本文件把四处钉成双射，并且**证明守卫本身会咬人**（planted-key 反例），
 否则"守卫永远绿"和"没有守卫"是同一件事。
@@ -27,9 +29,11 @@ import pytest
 from astrbot_plugin_media_analysis import main, settings
 
 _PLUGIN_DIR = Path(__file__).resolve().parents[1]
+_MIGRATOR_V042 = _PLUGIN_DIR / "tools" / "migrate_config_v042.py"
 _MIGRATOR_V03 = _PLUGIN_DIR / "tools" / "migrate_config_v03.py"
 
-#: SPEC-v0.3 §8.1 冻结的 **21** 个点号键（写死在这里 = 契约快照；要加键必须先改 SPEC）。
+#: SPEC-v0.3 §8.1 + SPEC-v0.4.2 §3.1 冻结的 **22** 个点号键（写死在这里 = 契约快照；
+#: 要加键必须先改 SPEC）。
 #: 其中 `provider_settings.stt_provider_id` 是**弃用键**：它必须继续留在 schema 里，
 #: 否则核心 `check_config_integrity()` 会把用户配置里的旧值当 stale 键删掉并落盘
 #: （`astrbot_config.py:252-266` + `:113-121`）。代码只读不生效，迁移脚本负责搬值。
@@ -56,11 +60,13 @@ EXPECTED_LEAVES: frozenset[str] = frozenset(
         "limits.max_frames",
         "limits.max_media_bytes",
         "cache.ttl_seconds",
+        "background.mode",
     }
 )
 
-#: 分组顺序 == WebUI 渲染顺序（v0.3 在 `provider_settings` 之后插入了 `video` 组）
-EXPECTED_GROUPS = ["provider_settings", "video", "prompts", "limits", "cache"]
+#: 分组顺序 == WebUI 渲染顺序（v0.3 在 `provider_settings` 之后插入了 `video` 组；
+#: **v0.4.2 的新组 `background` 追加在最末尾** ⇒ 既有 21 键的相对顺序一个字都没动）
+EXPECTED_GROUPS = ["provider_settings", "video", "prompts", "limits", "cache", "background"]
 
 
 # --------------------------------------------------------------------------- #
@@ -120,20 +126,28 @@ def _read_points(source: str) -> set[str]:
     return found
 
 
-def _load_migrator_v03():
+def _load_migrator(path, name: str):
     """按路径加载迁移器（独立脚本，不属于包 ⇒ 不能 `from astrbot_plugin_media_analysis`）。"""
-    assert _MIGRATOR_V03.is_file(), f"迁移器不见了：{_MIGRATOR_V03}"
-    spec = importlib.util.spec_from_file_location(
-        "migrate_config_v03_under_test", _MIGRATOR_V03
-    )
+    assert path.is_file(), f"迁移器不见了：{path}"
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
 
 
+def _load_migrator_v042():
+    """当前迁移器（22 键）：**第四处**的事实源（v0.4.2 起）。"""
+    return _load_migrator(_MIGRATOR_V042, "migrate_config_v042_under_test")
+
+
+def _load_migrator_v03():
+    """v0.2→v0.3 的**历史快照**（21 键）：只用于"前缀关系"那条断言。"""
+    return _load_migrator(_MIGRATOR_V03, "migrate_config_v03_under_test")
+
+
 def _migrator_keys() -> set[str]:
-    return {key for key, _type in _load_migrator_v03().KEY_ORDER}
+    return {key for key, _type in _load_migrator_v042().KEY_ORDER}
 
 
 def _four_way_diff(
@@ -160,11 +174,11 @@ def _four_way_diff(
 # --------------------------------------------------------------------------- #
 # C1：schema 叶子 ⇄ KEY_MAP ⇄ main._settings() ⇄ 迁移器 KEY_ORDER（四处 21 键）
 # --------------------------------------------------------------------------- #
-def test_schema_has_exactly_the_frozen_twenty_one_leaves() -> None:
-    """契约：SPEC-v0.3 §8.1 的 21 个键；多一个少一个都红（要加键先改 SPEC）。"""
+def test_schema_has_exactly_the_frozen_twenty_two_leaves() -> None:
+    """契约：SPEC-v0.3 §8.1 + SPEC-v0.4.2 §3.1 的 22 个键；多一个少一个都红（先改 SPEC）。"""
     leaves = _schema_leaves(_schema())
     assert set(leaves) == EXPECTED_LEAVES, f"schema 叶子漂了：{sorted(leaves)}"
-    assert len(leaves) == 21
+    assert len(leaves) == 22
 
 
 def test_schema_groups_are_object_with_description_and_hint() -> None:
@@ -187,11 +201,11 @@ def test_main_read_points_match_key_map_exactly() -> None:
     """C1：`main._settings()` 里出现的 `settings.KEY_*` == KEY_MAP 键集合（漏读＝生产静默丢键）。"""
     read_points = _read_points(_main_src())
     assert read_points == set(settings.KEY_MAP), f"读取点漂了：{sorted(read_points)}"
-    assert len(read_points) == 21
+    assert len(read_points) == 22
 
 
 def test_migrator_key_order_matches_key_map_exactly() -> None:
-    """第四处：`tools/migrate_config_v03.py:KEY_ORDER` 的键集合 == `settings.KEY_MAP`。
+    """第四处：`tools/migrate_config_v042.py:KEY_ORDER` 的键集合 == `settings.KEY_MAP`。
 
     迁移器不 import 插件模块 ⇒ 这份 `KEY_ORDER` 是与 `KEY_MAP` 的**手工对偶**。少一个键
     意味着 `--report` 不会报告它（运维以为"这个键已经就位"），多一个键则会在 `plan()` 里
@@ -207,9 +221,41 @@ def test_key_order_shares_the_schema_writing_order() -> None:
     也容易在下一次加键时插错位置（然后靠人肉数行数发现）。
     """
     schema_order = _schema_leaf_order(_schema())
-    key_order = [key for key, _type in _load_migrator_v03().KEY_ORDER]
+    key_order = [key for key, _type in _load_migrator_v042().KEY_ORDER]
     assert schema_order == key_order
     assert schema_order == list(settings.KEY_MAP)
+
+
+def test_v03_migrator_is_the_frozen_21_key_prefix() -> None:
+    """**第五个断言**（SPEC-v0.4.2 §3.2）：v0.3 迁移器**恰好**是 v0.4.2 的 21 键前缀。
+
+    为什么必须有这一条：v0.4.2 把"第四处"换成了 `migrate_config_v042.py`，而
+    `migrate_config_v03.py` 冻结成历史快照（`VERIFY-v0.3.md` 与旧派单引用过它的 21 行
+    报告）。不钉住这层关系，v0.3 脚本就会**悄悄变成半个事实源**：有人往它里面补键，
+    "哪一格在守哪个版本"立刻变成谜，且旧证据失效。
+    """
+    v03 = [(key, type_name) for key, type_name in _load_migrator_v03().KEY_ORDER]
+    v042 = [(key, type_name) for key, type_name in _load_migrator_v042().KEY_ORDER]
+
+    assert len(v03) == 21 and len(v042) == 22
+    assert v03 == v042[:21], "v0.3 必须是 v0.4.2 的 21 键**前缀**（顺序 + 类型标签都一致）"
+    assert set(key for key, _t in v03) == set(settings.KEY_MAP) - {"background.mode"}
+    assert [key for key, _t in v042][-1] == "background.mode", "新键只许追加在末尾"
+
+
+def test_background_mode_enum_matches_settings() -> None:
+    """`background.mode` 的三处枚举互钉：schema `options`/`default` ⇄ `settings` 常量。
+
+    WebUI 的下拉框、`Settings` 的默认值、以及"合法取值集合"必须是同一份：任一处漂了，
+    用户在下拉框里选出的值都可能被运行期归一成**另一个**（`plugin`），且没有报错。
+    """
+    leaf = _schema_leaves(_schema())["background.mode"]
+    assert leaf["type"] == "string"
+    assert tuple(leaf["options"]) == settings.BACKGROUND_MODES
+    assert leaf["default"] == settings.DEFAULT_BACKGROUND_MODE
+    assert settings.DEFAULT_BACKGROUND_MODE == settings.Settings().background_mode
+    assert settings.BACKGROUND_MODES == (settings.MODE_PLUGIN, settings.MODE_CORE)
+    assert len(leaf["labels"]) == len(leaf["options"]), "每个 option 都要有人读的 label"
 
 
 def test_four_way_diff_is_empty_for_the_real_tree() -> None:
@@ -286,7 +332,7 @@ def test_guard_bites_when_a_key_is_added_in_only_one_place() -> None:
 
 
 def test_key_map_values_are_exactly_the_settings_fields() -> None:
-    """C2：`KEY_MAP` 的值集合 == `Settings` 的字段集合（21 个，双射）。
+    """C2：`KEY_MAP` 的值集合 == `Settings` 的字段集合（22 个，双射）。
 
     派生量（`prompts` / `prompts_trimmed` / `prompts_fp` / `video_fp` /
     `compress_budget_bytes`）走 `property` / `cached_property`，**不是**字段 ——
@@ -294,7 +340,7 @@ def test_key_map_values_are_exactly_the_settings_fields() -> None:
     """
     fields = {field.name for field in dataclasses.fields(settings.Settings)}
     assert fields == set(settings.KEY_MAP.values())
-    assert len(fields) == 21
+    assert len(fields) == 22
     derived = {
         "prompts",
         "prompts_trimmed",

@@ -32,6 +32,7 @@ EXPECTED_SOURCE_MODULES = [
     "analyze.py",
     "background.py",  # v0.4：后台任务表（SPEC-v0.4 §2.6）
     "cache.py",
+    "core_mode.py",  # v0.4.2：路线 C 的激活面（SPEC-v0.4.2 §4/§6）
     "envelope.py",
     "main.py",
     "media.py",

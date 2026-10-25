@@ -9,7 +9,8 @@ v0.2 → v0.3 与 v0.1 → v0.2 的**性质不同**，测试面也不同：
 
 所以这里断言的是 v0.3 自己的承诺：
 
-1. `KEY_ORDER` 是 21 键、顺序 == schema 书写顺序；
+1. `KEY_ORDER` 是 21 键、顺序 == schema 书写顺序；**v0.4.2 起它是 22 键表的 21 键前缀**
+   （本脚本冻结为历史快照，当前迁移器是 `tools/migrate_config_v042.py`）；
 2. `NEW_KEY_DEFAULTS` 恰好是那 10 个新键，且默认值与 `settings.py` / `_config_schema.json`
    **逐字**相同（脚本不 import 插件模块 ⇒ 这份对偶只能靠测试对齐）；
 3. 默认干跑（不写盘、不建目录、不产生备份）；
@@ -124,12 +125,19 @@ def _run(capsys, *argv: str) -> tuple[int, str, str]:
 # 1. KEY_ORDER / NEW_KEY_DEFAULTS：与插件侧的对偶
 # --------------------------------------------------------------------------- #
 def test_key_order_is_the_twenty_one_keys_in_schema_order() -> None:
-    """21 键、集合 == `settings.KEY_MAP`、顺序 == schema 书写顺序 == KEY_MAP 顺序。"""
+    """21 键、**是 v0.4.2 键表的 21 键前缀**（SPEC-v0.4.2 §3.2）。
+
+    **v0.4.2 起本脚本冻结**（v0.2→v0.3 的历史快照）：当前键表是 22 键、第四处换成了
+    `tools/migrate_config_v042.py`，所以这里的判据从"全等"降级为"**前缀**"——集合 ==
+    全集 − `{"background.mode"}`、顺序 == 前 21 位。这几个字是 v0.4.2 唯一改动本文件的地方。
+    """
     keys = [key for key, _type in migrator.KEY_ORDER]
+    current = list(settings.KEY_MAP)
     assert len(keys) == 21
-    assert set(keys) == set(settings.KEY_MAP)
-    assert keys == list(_schema_leaves())
-    assert keys == list(settings.KEY_MAP)
+    assert set(keys) == set(settings.KEY_MAP) - {"background.mode"}
+    assert keys == list(_schema_leaves())[:21]
+    assert keys == current[:21], "v0.3 必须是 v0.4.2 的**21 键前缀**"
+    assert current[21:] == ["background.mode"], "新键只许追加在末尾"
 
 
 def test_key_order_type_labels_match_the_schema_types() -> None:
@@ -147,6 +155,7 @@ def test_key_order_type_labels_match_the_schema_types() -> None:
 def test_new_key_defaults_are_exactly_the_ten_new_keys() -> None:
     """`NEW_KEY_DEFAULTS` 不能多也不能少：多一个 = 脚本替用户造了旧键的值。"""
     assert set(migrator.NEW_KEY_DEFAULTS) == NEW_KEYS
+    # v0.4.2：全集是 22 键 ⇒ 右边多一个 `background.mode`（12 = 11 个 v0.2 键 + 1 个 v0.4.2 键）
     assert set(settings.KEY_MAP) - NEW_KEYS == {
         "provider_settings.audio_provider_id",
         "provider_settings.vision_provider_id",
@@ -159,7 +168,8 @@ def test_new_key_defaults_are_exactly_the_ten_new_keys() -> None:
         "limits.max_frames",
         "limits.max_media_bytes",
         "cache.ttl_seconds",
-    }, "v0.2 的 11 键集合漂了"
+        "background.mode",
+    }, "v0.2 的 11 键 + v0.4.2 的 1 键集合漂了"
 
 
 def test_new_key_defaults_match_settings_and_schema_verbatim() -> None:

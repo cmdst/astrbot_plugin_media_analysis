@@ -26,7 +26,7 @@ import pytest
 from astrbot.api.star import Star
 from astrbot.core.provider.register import llm_tools
 
-from astrbot_plugin_media_analysis import envelope, main
+from astrbot_plugin_media_analysis import envelope, main, settings
 
 _PLUGIN_DIR = Path(__file__).resolve().parents[1]
 _PKG_NAME = "astrbot_plugin_media_analysis"
@@ -45,6 +45,8 @@ _PACKAGE_MODULES = {
     "video_native",
     # v0.4 新增后台任务表（SPEC-v0.4 §2.6）；漏登记 = 漏扫一片扁平导入
     "background",
+    # v0.4.2 新增路线 C 的激活面（SPEC-v0.4.2 §4/§6）；漏登记 = 漏扫一片扁平导入
+    "core_mode",
 }
 
 #: docstring 能生成的类型词（`provider/func_tool_manager.py:128-145`）。
@@ -243,6 +245,10 @@ def test_docstring_promises_accept_and_background_delivery() -> None:
     # 受理回执的 4 键形状写进文档（模型据此判断"这是受理、不是结果"）
     assert "\"state\"" in docstring and "task_id" in docstring
     assert "GIF" in docstring  # v0.4 的媒体范围扩到 GIF，文档也得说
+    # v0.4.2 §6.5：C 模式下模型看不到我们的 JSON（看到的是核心那句固定英文），
+    # 这一句消除歧义，且**不泄漏**配置/模式概念（模型不需要知道"为什么"）
+    assert "原生后台任务" in docstring
+    assert "框架的受理回执" in docstring
 
 
 def test_accept_hint_is_a_constant_without_runtime_data() -> None:
@@ -288,15 +294,23 @@ def test_registered_schema_descriptions_are_nonempty() -> None:
 
 
 def test_tool_is_not_a_core_background_task() -> None:
-    """v0.4.1 防双发：`media_analyze` 必须继续由**插件自管**后台，不置核心 flag。
+    """防双发哨兵（v0.4.1 立，v0.4.2 **收窄到默认模式**）：**默认配置**下必须不置核心 flag。
 
     若哪天有人把 `is_background_task` 置 True（核心修好包装层后"顺手开原生"），
     同一条任务会同时走核心唤醒轮与插件的 `send_message` ⇒ **两条消息**。
-    本用例把"不置 flag"钉成契约；迁移原生路线（C）必须同时重写信封语义。
+
+    v0.4.2 的语义迁移（SPEC-v0.4.2 §11.4）：路线 C 变成**显式实验模式**
+    （`background.mode=core`），flag 只在**探测通过后**才由 `core_mode.activate()` 置
+    —— 那条路径的守卫在 `tests/test_core_mode.py`（含"未修核心 ⇒ 拒绝 + 还原"）。
+    本格继续守"**默认**（`plugin`）下不置 flag"，名字保留（让"防双发"这条线索可 grep）。
     """
+    assert settings.Settings().background_mode == "plugin", "默认模式必须还是 plugin"
+    assert settings.DEFAULT_BACKGROUND_MODE == "plugin"
     tool = llm_tools.get_func("media_analyze")
     assert tool is not None
-    assert tool.is_background_task is False
+    assert tool.is_background_task is False, (
+        "默认模式下不许置核心 flag（core 只能由 core_mode.activate 在探测通过后置）"
+    )
 
 
 def test_tool_name_is_not_shadowed_by_another_plugin() -> None:

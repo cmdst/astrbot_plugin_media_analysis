@@ -10,7 +10,7 @@
 2. `Star.__init__` **不保存** `config`（`star/base.py:26-29`）⇒ 自己存。
 3. 工具方法**只挂** `@filter.llm_tool`：叠加 `@filter.permission_type` 会让它被当成
    消息处理器，权限不符就丢用户消息（AGENTS §3 装饰器纪律）。
-4. `_settings()` 是**唯一配置读取点**，21 个键逐条显式读（`settings.KEY_MAP` ↔
+4. `_settings()` 是**唯一配置读取点**，22 个键逐条显式读（`settings.KEY_MAP` ↔
    `_conf_schema.json` ↔ 迁移器 `KEY_ORDER` ↔ 这里四方一致）。漏一个键 ＝ 生产链路上
    **静默丢弃**设置。
 """
@@ -25,7 +25,7 @@ from astrbot.api import AstrBotConfig, logger as LOG
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 
-from . import analyze, background, cache, envelope, media, settings
+from . import analyze, background, cache, core_mode, envelope, media, settings
 
 # --------------------------------------------------------------------------- #
 # 核心**内部面**加固（`error_redaction` 不在 `astrbot.api.*` 的公开导出里）。
@@ -98,12 +98,23 @@ class MediaAnalysisPlugin(Star):
         # 由 `_cache_store()` 兜一个同配置的实例（懒建，绝不因为生命周期顺序而抛）。
         self._cache: cache.DiskCache | None = None
         self._settings_cache: settings.Settings | None = None
+        # 引擎激活态（**内存级、进程级**；v0.4.2 新增，SPEC-v0.4.2 §4 / §5.1）。
+        # 默认就是 `plugin`（A2）⇒ 没跑过 `initialize()` 时（含测试台 `_rig`）行为与
+        # v0.4.1 **逐字一致** —— 这就是"默认不变"的机械证据。
+        self._bg: core_mode.Activation = core_mode.INACTIVE
+        # 首次调用的一次性复检开关（仅 `effective == core` 时置 True，SPEC-v0.4.2 §4.5）
+        self._bg_recheck_pending = False
 
     async def initialize(self) -> None:
-        """生命周期钩子（`star/base.py:141-145`）：装配配置摘要 + 建缓存。
+        """生命周期钩子（`star/base.py:141-145`）：装配配置摘要 + 建缓存 + **决定引擎**。
 
         摘要行只打 **provider id 与数字**（provider id 是配置值不是凭据）；
         弃用键 `stt_provider_id` 只"是否非空"，**不打值**。
+
+        最后一步 `core_mode.activate()` 是 v0.4.2 加的（SPEC-v0.4.2 §8.1/§8.2）：`FuncTool`
+        对象随每次 import **重建** ⇒ flag 必须**每次加载都重放**，探测也随之重跑。
+        `ready:` 行**逐字不动**（运维口径"与 v0.3 同形"继续有效）；引擎判据走**独立一行**：
+        `plugin` ⇒ DEBUG（生产零噪音）、`core` ⇒ INFO、被拒 ⇒ **ERROR**。
         """
         self._settings_cache = self._settings()
         current = self._settings_cache
@@ -139,6 +150,28 @@ class MediaAnalysisPlugin(Star):
                 "（检测到旧值非空，本行不打值）；请改用 provider_settings.audio_provider_id，"
                 "旧值可用 tools/migrate_config_v02.py 迁移"
             )
+        # 引擎决定的**唯一**入口（同步、幂等、永不抛；失败只回落、绝不改配置）
+        self._bg = core_mode.activate(
+            self._tool_manager(), requested=current.background_mode
+        )
+        self._bg_recheck_pending = self._bg.effective == core_mode.MODE_CORE
+
+    def _tool_manager(self):
+        """安全取 `get_llm_tool_manager()`（`context is None` / 桩环境 ⇒ `None`，**不抛**）。
+
+        为什么必须容错：既有 `test_ready_line…` 与出厂路径都用 `context=None` 调
+        `initialize()`，任何一处抛异常都会把"加载期探测"变成"加载失败"。
+        """
+        getter = getattr(self.context, "get_llm_tool_manager", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter()
+        except BaseException as exc:  # noqa: BLE001 —— 取不到就当没有（fail-closed）
+            LOG.debug(
+                "media_analysis: get_llm_tool_manager 取不到（%s）", type(exc).__name__
+            )
+            return None
 
     def _log_direct_bytes_hint(self, current: settings.Settings) -> None:
         """按 §4 的建议表提示一句（**只打数字，不覆盖配置**）。
@@ -181,15 +214,24 @@ class MediaAnalysisPlugin(Star):
         因此插件卸载后不留"持有 event/context 的孤儿 task"（SPEC-v0.4 §2.6）。
         `terminate` 由核心在卸载/重载时调用（`core/star/star_manager.py:1965`），
         且必须是**本类自身** `__dict__` 里的方法（核心只在 `star_cls_type.__dict__` 里找）。
+
+        v0.4.2 追加一步 `core_mode.deactivate()`：把本插件工具上的 `is_background_task`
+        置回 `False`（幂等、永不抛）。C 模式下**在飞**的任务归核心 registry 管，这里
+        **不取消**（§5.3：任务跨重载继续、唤醒轮仍能交付；"重载即止血"在 C 模式下失效，
+        止血口径是"配置改回 `plugin` + 重载"，即 SPEC-v0.4.2 §13.3 的 R1）。
         """
         await background.cancel_all()
+        self._bg = core_mode.INACTIVE
+        self._bg_recheck_pending = False
+        core_mode.deactivate(self._tool_manager())
         self._settings_cache = None
         store, self._cache = self._cache, None
         if store is not None:
             await store.close()
 
     def _settings(self) -> settings.Settings:
-        """唯一配置读取点：21 个键逐条显式读（SPEC-v0.3 §8.1 键表），禁止散落到别处。
+        """唯一配置读取点：22 个键逐条显式读（SPEC-v0.3 §8.1 + SPEC-v0.4.2 §3.1 键表），
+        禁止散落到别处。
 
         漏一个键 ＝ 生产链路上**静默丢弃**设置（父手册 §3 第 8 条）；
         `tests/test_config_map.py` 用四方一致守卫钉住这里。
@@ -274,6 +316,12 @@ class MediaAnalysisPlugin(Star):
                 lo=settings.MIN_CACHE_TTL_SECONDS,
                 hi=settings.MAX_CACHE_TTL_SECONDS,
             ),
+            # v0.4.2 第 22 键：枚举归一（坏值回 plugin + 一条 WARNING），不走 ConfigView
+            background_mode=settings.normalize_background_mode(
+                view.get(
+                    settings.KEY_BACKGROUND_MODE, settings.DEFAULT_BACKGROUND_MODE
+                )
+            ),
         )
 
     def _cache_store(self) -> cache.DiskCache:
@@ -301,7 +349,9 @@ class MediaAnalysisPlugin(Star):
         current 或 quoted 取，不要传文件路径**。普通图片（JPEG/PNG/WebP/APNG）不在本工具
         范围内。
 
-        **本工具立即返回，分析在后台进行**：返回的要么是受理回执
+        **本工具立即返回，分析在后台进行**：（若 AstrBot 已把本工具作为**原生后台任务**
+        派发，你会收到框架的受理回执而不是下面的 JSON；语义相同：结果稍后另行发送。）
+        否则返回的要么是受理回执
         {"ok":true,"state":"accepted","task_id":"…","hint":"…"}（同一条消息同一组参数重复
         调用时 state 为 "running"，task_id 不变），要么是失败信封
         {"ok":false,"error":"…","hint":"…"}。**分析结果不会回到你手里**——它会在完成时
@@ -322,6 +372,22 @@ class MediaAnalysisPlugin(Star):
             str: 受理信封（4 键）或失败信封（3 键）的 JSON 文本；分析结果由后台任务
             单独发送给用户，不经由本返回值。
         """
+        mode = self._bg.effective  # ① 入口快照：一次调用只认一个引擎（§5.2）
+        if mode == core_mode.MODE_CORE:  # ② 单值分支；C 分支**必然 return**
+            if self._bg_recheck_pending:  # ③ 一次性复检（§4.5）：只影响**后续**调用
+                self._bg_recheck_pending = False
+                self._bg = core_mode.activate(
+                    self._tool_manager(), requested=core_mode.MODE_CORE
+                )
+            return await self._run_core(
+                event=event,
+                target=target,
+                focus=focus,
+                include_frames=include_frames,
+            )
+        # —— 以下逐字沿用 v0.4.1 的 A2 门面（try/except 三出口不变）——
+        # 注意：`mode` 这个名字在这里被**有意复用**（下面两行是 v0.4.1 原文）—— A2 分支
+        # 用的是 `include_frames` 的三态；引擎快照已在上面那个 if 里用完（C 分支必然 return）。
         try:
             mode = _as_mode(include_frames)
             # 受理路径：类型判定 + 至多 6 字节魔数读（0 下载、0 转换、0 ffmpeg、0 provider）
@@ -353,3 +419,32 @@ class MediaAnalysisPlugin(Star):
                 redact_sensitive_text(traceback.format_exc())[:4000],
             )
             return envelope.dumps(envelope.fail_envelope(envelope.ERR_INTERNAL_ERROR))
+
+    async def _run_core(
+        self,
+        *,
+        event,
+        target: str,
+        focus: str,
+        include_frames: object,
+    ) -> str:
+        """C 模式（核心原生后台）的唯一入口：取快照 → 交给 `core_mode.run`。
+
+        只做两件事（SPEC-v0.4.2 §6.1）：取一次 `settings` / `cache` 的**快照**，再调
+        `core_mode.run`。**不** try/except —— 异常口径全在 `core_mode.run` 里（只有
+        `asyncio.CancelledError` 上抛）。
+
+        为什么必须"按值取好再往下传"：C 模式的任务可能在插件**重载之后**才跑完，那时旧
+        实例的 `_settings_cache` 已被 `terminate()` 置 `None`（§8.3）；在 `run` 里反复
+        `self._settings()` 会读到 `None`，这里一次取好就没有这个窗口。
+        """
+        current = self._settings_cache or self._settings()
+        return await core_mode.run(
+            context=self.context,
+            event=event,
+            target=target,
+            focus=focus,
+            include_frames=include_frames,
+            settings=current,
+            cache=self._cache_store(),
+        )

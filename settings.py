@@ -1,4 +1,4 @@
-"""配置读取层：21 个键 + 点号读取 + 钳位 + 提示词校验（SPEC-v0.2 §5.2 / SPEC-v0.3 §8）。
+"""配置读取层：22 个键 + 点号读取 + 钳位 + 提示词校验（SPEC-v0.2 §5.2 / SPEC-v0.3 §8 / SPEC-v0.4.2 §3）。
 
 模块名**刻意不叫 `config`**：`Star.__init__` 的第二个形参就叫 `config`，加载器按
 `star_cls_type(context=…, config=…)` 关键字调用（`star_manager.py:1229-1238`），
@@ -13,6 +13,14 @@
 **21 个键里有九个是 v0.3 新增的**（SPEC-v0.3 §8.1）：`provider_settings.video_provider_id`
 + `video.*` 八键（含 `prompts.video_native` 属提示词组）；v0.2 的 11 键**一个都没删、
 没改名、没改默认值** ⇒ 用户旧配置零迁移可用，新 schema 只是超集。
+
+**v0.4.2 加第 22 个键 `background.mode`**（SPEC-v0.4.2 §3）：新组 `background` **追加在
+schema 最末尾** ⇒ 既有 21 键的相对顺序一个字都没动（v0.3 迁移器的 21 键顺序、
+`EXPECTED_GROUPS[:5]`、"第 7 行是什么键"这类对文档的动作全部不变，只是多了第 6 组）。
+取值只有 `plugin`（默认，插件自管后台 A2）/ `core`（核心原生后台，**实验**，需核心一行
+补丁 + 重启）。坏值一律**回 `plugin`**（保守侧：少花钱、少不确定性），见
+`normalize_background_mode`；它是"业务语义"归一，**不进** `ConfigView`（那三个方法只管
+类型面，加 `choice()` 会让这个类开始懂配置项语义）。
 
 `provider_settings.stt_provider_id` 仍是**弃用键**（SPEC-v0.2 §5.3）：它必须继续留在
 schema 与 `KEY_MAP` 里 —— 从 schema 删掉的那一刻，核心 `check_config_integrity()` 会把
@@ -35,11 +43,12 @@ from astrbot.api import logger as LOG
 PLUGIN_NAME = "astrbot_plugin_media_analysis"
 """插件目录名（== `metadata.yaml:name`，也 == 缓存 / probe 目录名）。"""
 
-PLUGIN_VERSION = "0.4.1"
+PLUGIN_VERSION = "0.4.2"
 """与 `metadata.yaml:version` 去掉 `v` 前缀后逐字相等（缓存键与 probe 键成分）。"""
 
 # --------------------------------------------------------------------------- #
-# 点号键（21 条，SPEC-v0.3 §8.1 键表；顺序 == schema 顺序 == 迁移器 KEY_ORDER 顺序）
+# 点号键（22 条，SPEC-v0.3 §8.1 + SPEC-v0.4.2 §3.1 键表；
+# 顺序 == schema 顺序 == 迁移器 `migrate_config_v042.py:KEY_ORDER` 顺序）
 # --------------------------------------------------------------------------- #
 KEY_AUDIO_PROVIDER_ID = "provider_settings.audio_provider_id"
 KEY_VIDEO_PROVIDER_ID = "provider_settings.video_provider_id"  # v0.3 新增
@@ -67,8 +76,10 @@ KEY_MAX_MEDIA_BYTES = "limits.max_media_bytes"
 
 KEY_CACHE_TTL_SECONDS = "cache.ttl_seconds"
 
+KEY_BACKGROUND_MODE = "background.mode"  # v0.4.2 新增（新组，追加在最末尾）
+
 # 点号路径 → Settings 字段名。这是「schema ⇄ KEY_MAP ⇄ 读取点 ⇄ 迁移器 KEY_ORDER」
-# 四处守卫的事实源。值集合 == Settings 的字段集合（21 条，一一对应；派生量走
+# 四处守卫的事实源。值集合 == Settings 的字段集合（22 条，一一对应；派生量走
 # properties，不算字段）。
 KEY_MAP: dict[str, str] = {
     KEY_AUDIO_PROVIDER_ID: "audio_provider_id",
@@ -92,6 +103,7 @@ KEY_MAP: dict[str, str] = {
     KEY_MAX_FRAMES: "max_frames",
     KEY_MAX_MEDIA_BYTES: "max_media_bytes",
     KEY_CACHE_TTL_SECONDS: "cache_ttl_seconds",
+    KEY_BACKGROUND_MODE: "background_mode",
 }
 
 # --------------------------------------------------------------------------- #
@@ -101,6 +113,20 @@ DEFAULT_MAX_MEDIA_SECONDS = 60
 DEFAULT_MAX_FRAMES = 6
 DEFAULT_MAX_MEDIA_BYTES = 67108864  # 64 MiB：生产那条群视频 5.64 MB 的 11 倍余量
 DEFAULT_CACHE_TTL_SECONDS = 86400  # 1 天
+
+# v0.4.2 `background.mode`（枚举，不是布尔：见 SPEC-v0.4.2 §3.1「键的取舍」——布尔表达不了
+# "默认 / 实验"的语义差别，将来出现第三种引擎还要再改类型＝破坏性变更）
+MODE_PLUGIN = "plugin"
+"""插件自管后台（A2）：受理即返回 + 插件自己 `send_message` **恰好一次**。**默认值**。"""
+
+MODE_CORE = "core"
+"""核心原生后台（路线 C，**实验**）：需核心补 `_PermissionGuardedTool` 一行镜像并重启。"""
+
+BACKGROUND_MODES: tuple[str, str] = (MODE_PLUGIN, MODE_CORE)
+"""合法取值（== `_conf_schema.json` 的 `options`，测试钉相等）。"""
+
+DEFAULT_BACKGROUND_MODE = MODE_PLUGIN
+"""默认值（== schema 的 `default` == `Settings.background_mode` 的默认值）。"""
 
 # v0.3 `video.*`（默认值 == `_conf_schema.json` 的 `default`，逐字相同）
 DEFAULT_VIDEO_PROBE_ENABLED = True
@@ -267,6 +293,43 @@ def _warn_once(key: str, reason: str) -> None:
     )
 
 
+def normalize_background_mode(value: object) -> str:
+    """把配置里的 `background.mode` 归一成 `"plugin" | "core"`（SPEC-v0.4.2 §3.3）。
+
+    | 输入 | 输出 | 日志 |
+    | --- | --- | --- |
+    | `"plugin"` / `"core"`（`strip().lower()` 后） | 原样 | 无 |
+    | `"CORE"` / `" core "` | `"core"` | 无（大小写与空白是可容忍的手滑） |
+    | `""` / `None` / 缺键 | `"plugin"` | 无（缺键由核心 `check_config_integrity` 补默认） |
+    | 其它（`"on"` / `"1"` / `True` / `{}` / `2.5`…） | `"plugin"` | **WARNING 一次**（不打值） |
+
+    方向与 `analyze.normalize_mode`（工具参数非法值回 `auto`＝多花一次调用）**相反**：
+    配置是运维写的，写错时应当站在**保守侧**（`plugin` 少花钱、少不确定性）。
+    """
+    if value is None:
+        return DEFAULT_BACKGROUND_MODE
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in BACKGROUND_MODES:
+            return text
+        if not text:
+            return DEFAULT_BACKGROUND_MODE
+    _warn_bad_background_mode(type(value).__name__)
+    return DEFAULT_BACKGROUND_MODE
+
+
+def _warn_bad_background_mode(type_name: str) -> None:
+    """非法 `background.mode` **只告警一次**，且**不打值**（配置值不进日志，AGENTS §8）。"""
+    token = ("background.mode", type_name)
+    if token in _WARNED:
+        return
+    _WARNED.add(token)
+    LOG.warning(
+        "media_analysis: 配置 background.mode 非法（类型 %s），按 plugin 处理",
+        type_name,
+    )
+
+
 def validate_prompts(raw: Mapping[str, Any]) -> tuple[dict[str, str], frozenset[str]]:
     """把配置原文变成**生效模板**：空值→默认、非法→默认、超长→截断。
 
@@ -305,7 +368,7 @@ def validate_prompts(raw: Mapping[str, Any]) -> tuple[dict[str, str], frozenset[
 class Settings:
     """一次装配、整轮复用的配置快照（配置改动仍需重启，核心不在运行期热更）。
 
-    字段 == `KEY_MAP` 的值集合（21 条，一一对应）。五个 `prompt_*` 字段存的是**配置原文**
+    字段 == `KEY_MAP` 的值集合（22 条，一一对应）。五个 `prompt_*` 字段存的是**配置原文**
     （`ConfigView.text` 去空白后），生效模板与派生量走下面的缓存属性：
 
     - `prompts`：5 元组，顺序固定 `(audio, video, frame, summary, video_native)`，
@@ -341,6 +404,12 @@ class Settings:
     max_media_bytes: int = DEFAULT_MAX_MEDIA_BYTES
 
     cache_ttl_seconds: int = DEFAULT_CACHE_TTL_SECONDS
+
+    background_mode: str = DEFAULT_BACKGROUND_MODE
+    """引擎选择（**已归一**）：`plugin`（默认，A2）/ `core`（实验，核心原生后台）。
+
+    它**不进**缓存键（12 分量）：交付机制不影响分析结果，换引擎不该让老条目失效。
+    """
 
     @cached_property
     def _effective_prompts(self) -> tuple[dict[str, str], frozenset[str]]:

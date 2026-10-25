@@ -15,6 +15,54 @@
 就是本地文件、群文件一行 `file_`/`url` 就能拿到 —— 硬件条件齐了，缺的只是
 "把视频降维成模型能吃的东西"这一段编排。
 
+## v0.4.2 改了什么（**默认行为与 v0.4.1 逐字相同**）
+
+**+1 配置键 / 0 参数变更 / 0 错误码与 notes 词表变更**。把 v0.4.1 评估过的「路线 C（核心
+原生后台）」从"不采用"精确化为「**默认不采用、可显式选择**」，并按调研报告 §3.2 补齐
+**能力探测 / 互斥 / 回退**。
+
+| # | 变更 | 一句话 |
+|---|---|---|
+| ① | **`background.mode`（22 键 / 6 组）** | `plugin`（默认，插件自管 A2，投递确定）/ `core`（核心原生后台，**实验**）。新组 `background` **追加在 schema 最末尾**，既有 21 键相对顺序不动；新增迁移器 `tools/migrate_config_v042.py`（22 键），v0.3 那支**冻结**为历史快照 |
+| ② | **能力探测（fail-closed）** | `initialize()` 最后一步：定位**自己的** `FuncTool` → 置 `is_background_task` → 用 `get_full_tool_set()` 的**包装器**比对。核心没补那一行镜像 ⇒ **ERROR 一条 + 内存级回落 `plugin`**（不写配置、不落盘、不改用户选择），**绝不半开** |
+| ③ | **C 模式的 handler** | 同步跑 `analyze` → 返回**人读文本**（不可信内容前缀 + ≤ 1200 字符 + 与 A2 同源的页脚），**不建任务表、不 `send`、不去重、无并发闸**；失败返回「媒体分析失败：CODE。hint」；`CancelledError` **上抛**（停止即静默） |
+| ④ | **互斥** | 结构互斥（C 分支**必然 return**；`core_mode` 不导入 `submit`/`_deliver`）+ 行为互斥 4 格矩阵（配置 × 核心是否已修）⇒「一条任务两条消息」在代码面**不可达** |
+
+### 为什么默认仍然**不**迁 C
+
+调研报告 `research/20261025-native-core-background-route.md`（dev lane）对 media_analysis
+的结论是「**不建议整体迁 C**」，本版把它的理由换成下面**三条**（报告 §5.2 / §6.8 的两处
+判断对本插件**不成立**，已按事实更正）：
+
+1. **投递不确定**：C 的发声靠唤醒轮模型主动调 `send_message_to_user`；没调时核心只打一条
+   WARNING ⇒ 从"恰好一次"退化为"大概率一次"（**这是第一理由**，且不可消除）。
+2. **多一轮主 Agent**：每条后台任务多一轮完整模型调用（历史重放 + 信封进 system prompt）。
+3. **3600 s 硬编码 + 无闸**：核心那层超时改不了；且 C 模式下去重 / 并发闸 / 预算闸
+   **全部不存在**（插件不能再持表，否则就是被否决的"混合模式"）。
+
+> **`§6.8` 的事实更正**：报告说"含媒体的工具应保留 plugin 引擎（C 没有可靠媒体出口）"——
+> 本插件**就是**纯文本结果的工具：交付面只有 `MessageChain([Plain(text)])`，信封里的
+> `frames` 是**帧数计数**不是图片，中间产物（帧图 / 压缩 mp4 / wav）只落 `/tmp` 且从不外发。
+> 所以"媒体无可靠出口"**对本插件不成立**；它约束的是 `browser_llm` 那类要回图的工具。
+> 未来禁令：**一旦 `background._deliver` 开始投递媒体组件，C 模式必须被移除或重新设计**。
+
+### 开 C 的前置条件（缺一不可）
+
+1. 核心在 `_PermissionGuardedTool.__init__` 的镜像区补**一行**并**重启** `astrbot.service`：
+
+```python
+        self.is_background_task = getattr(tool, "is_background_task", False)   # ← 仅镜像，不改权限判定
+```
+
+2. 配置 `background.mode = "core"` → **重载插件**（配置改动不热更）。
+3. 日志出现 `media_analysis: background mode=core effective=core probe=wrapper_mirrors_raw flag=on`。
+4. 接受三条代价（投递不确定 / 多一轮 / 无闸），并在灰度会话里先跑一条真机验证。
+
+未满足第 1 步就配 `core` ⇒ 每次加载**一条 ERROR**：
+`background mode=core REJECTED reason=wrapper_no_mirror; 已回落 plugin（内存级，未改配置）。`
+**功能正确、日志响亮**，不会静默阻塞。默认 `plugin` 下探测只打 **DEBUG**（生产零噪音），
+`ready:` 行与 v0.4.1 **逐字同形** ⇒ "当前引擎是什么"的判据 = ①配置键值 ②**无** `REJECTED` 行。
+
 ## v0.4.1 修了什么
 
 **0 新配置键 / 0 参数变更 / 0 错误码变更**，只清 v0.4.0 登记的残留：
@@ -26,10 +74,11 @@
 - **N2/N3 清理**：5 处旧 `-r 1` 注释改成 `tpad` 口径、删无用的 `import shutil`、
   移除 `_gif_product_size` 的死参。
 - **原生后台路线 C 不采用**：核心 `is_background_task` 仍对 `@filter.llm_tool` 不可达
-  （包装器不镜像），即便修好也**没有可靠媒体出口**、且"模型是否调用 `send_message_to_user`"
-  不可保证 ⇒ 与本插件 at-most-once 冲突。保留插件自管（A2），并新增测试钉住
-  "不置核心 flag"（防一条任务双发）。调研报告：dev lane
-  `research/20261025-native-core-background-route.md`。
+  （包装器不镜像），且"模型是否调用 `send_message_to_user`"不可保证 ⇒ 与本插件
+  at-most-once 冲突。保留插件自管（A2），并新增测试钉住"默认模式不置核心 flag"（防一条
+  任务双发）。调研报告：dev lane `research/20261025-native-core-background-route.md`。
+  **（v0.4.2 起口径更新：默认仍不采用，但可作为显式实验模式 `background.mode=core`
+  启用，见上节。）**
 - **版本 0.4.1 的连带**：结果缓存与 L1 探测再次冷启动（`PLUGIN_VERSION` 是两者键分量）。
 
 ## v0.4 改了什么
@@ -124,6 +173,11 @@
   取消**不投递**任何消息。
 - **不持久化**：进程重启/插件重载丢掉进行中的任务（用户侧＝"没有结果消息"），重发媒体即可。
 - **`/reset` 或用户打断不取消**后台任务（工作已付费，静默丢弃更糟），结果照常投递。
+
+> **v0.4.2 追加：`background.mode=core`（实验）时上述 A2 机制全部不参与**——任务归核心
+> `active_event_registry`，没有去重 / 并发闸 / `TOO_MANY_TASKS`，也**不**由插件投递；
+> 唤醒轮模型决定是否发声（可能 0 条）。C 模式下**重载插件不再止血**（in-flight 任务继续、
+> 唤醒轮仍能交付），止血口径是**把配置改回 `plugin` + 重载**（R1）。
 
 ## v0.3 改了什么
 
@@ -321,12 +375,14 @@
 `[无语音]` 是**提示词约定的哨兵**：模型认为整段无人声时只输出它。插件侧把"空文本"与
 `[无语音]` 都归一成 `transcript: []` + note `audio_empty`（**不是错误**）。
 
-## 配置（5 组 / 21 键）
+## 配置（6 组 / 22 键）
 
 v0.3 新增 **`video` 组（8 键）** + `provider_settings.video_provider_id` +
-`prompts.video_native`；v0.2 的 11 个键**名字/类型/默认值一个都没动**（新 schema 是超集
-⇒ 用户旧配置零迁移可用）。键表（**21 个叶子键**，与 `settings.KEY_MAP`、
-`main._settings()`、`_conf_schema.json`、迁移脚本 `KEY_ORDER` **四处互钉**）：
+`prompts.video_native`；v0.2 的 11 个键**名字/类型/默认值一个都没动**；**v0.4.2 新增
+`background` 组（1 键）**，追加在 schema **最末尾**（既有 21 键的相对顺序一个字都没动）。
+新 schema 一直是超集 ⇒ 用户旧配置零迁移可用。键表（**22 个叶子键**，与
+`settings.KEY_MAP`、`main._settings()`、`_conf_schema.json`、迁移脚本
+**`tools/migrate_config_v042.py:KEY_ORDER`** **四处互钉**；v0.3 的迁移器冻结为 21 键前缀）：
 
 | 组 | 键 | 类型 | 默认 | 说明 |
 |---|---|---|---|---|
@@ -347,6 +403,7 @@ v0.3 新增 **`video` 组（8 键）** + `provider_settings.video_provider_id` +
 | `video` | `compress_target_bytes` | int | `8388608`（8 MiB） | **v0.3 新增**。压缩预算上界；实际取 `min(它, max_direct_bytes)`；允许 512 KiB–32 MiB |
 | `video` | `compress_timeout_seconds` | int | `30` | **v0.3 新增**。两趟转码共享这一个预算；允许 10–60 |
 | `cache` | `ttl_seconds` | int | `86400`（1 天） | **v0.2 新增**。缓存 TTL；`0`＝关闭缓存；允许 0–2592000（30 天） |
+| `background` | `mode` | string（枚举） | `"plugin"` | **v0.4.2 新增**。`plugin`＝插件自管后台（A2，投递确定）/ `core`＝核心原生后台（**实验**，需核心一行补丁 + 重启，且投递由模型决定）。**坏值一律回 `plugin`**（保守侧）+ 一条 WARNING |
 
 插件内**没有** API key 字段：模型一律走 AstrBot 的 provider 引用。
 `modalities` 取**严格口径**（`None`/缺省 ⇒ 不支持）：核心在两处按"未配置＝全支持"兜底，
@@ -490,6 +547,29 @@ python3 tools/probe_video_capability.py --provider <id> --clear          # 清�
 > `[无用内容]`）会被当成"原生成功"，见 `CHANGELOG.md` 遗留 F6。
 
 ## 部署与迁移
+
+### v0.4.1 → v0.4.2（**+1 键：仍然是"覆盖 + 重载一次"**）
+
+| 步 | 动作 | 校验 |
+|---|---|---|
+| 1 | 整目录备份（插件目录 + 插件配置两个 `cp -a`）+ 记 `git rev-parse HEAD` | 两份都在；配置 sha256 记下 |
+| 2 | 覆盖代码到 `v0.4.2` | `grep -m1 '^version:' metadata.yaml` ⇒ `v0.4.2` |
+| 3 | **重载一次** | 核心 `check_config_integrity()` 自动补 `background.mode="plugin"` 并落盘；`ready:` 行**与 v0.4.1 逐字同形**（引擎判据走独立一行，默认只打 DEBUG） |
+| 4 | （可选）审计 / 显式落盘 | `python tools/migrate_config_v042.py --root /root/AstrBot --report` ⇒ `keys=22`、`background.mode` 一行 `keep`（或 `add`）；要落盘再 `--apply` |
+| 5 | 复验 | 配置 **22 键 / 6 组**；**无** `background mode=core` 的 ERROR 行；`Added llm tool: media_analyze` 恰 1 次；`Failed to import plugin …` 0 |
+
+- **顺序不可反**（超集 ⇒ **代码先行**）：先跑迁移器、再换代码时，**旧 schema** 不认识
+  `background.mode`，下次加载会把它当 stale **删掉并落盘**。
+- **要开 C**（实验，与上表**分开做**）：① 先上插件、确认"新插件 + 旧核心"安全 ⇒ ② 打核心
+  那**一行**补丁 → **重启** `astrbot.service`（核心改动不能靠插件重载生效）⇒ ③ 配置
+  `background.mode="core"` → **重载插件** ⇒ ④ 一条真机视频验证（受理回执 / 前台不阻塞 /
+  **恰好一条**结果 / 插件侧无 `bg accepted`、`bg finished` / 追问能答）。
+- **回滚三种形态**：**R1**（首选，秒级）配置回 `plugin` + 重载；**R2** 回代码到 `v0.4.1`
+  （`metadata.yaml` + `settings.PLUGIN_VERSION` 一起回）+ 重载 ⇒ 旧 schema 把
+  `background.mode` 当 stale 删掉（成对反向）；**R3** 撤核心补丁 + 重启（**必须先做 R1**，
+  否则核心回退后插件仍选 `core`，每次加载刷一条 ERROR）。
+- 缓存：v0.4.2 的条目键含 `0.4.2` ⇒ 升级**双冷启动**（结果缓存 + L1 探测；每个视频位首用
+  多一次 L1 调用 3–20 s）。急可 `rm -rf data/plugin_data/astrbot_plugin_media_analysis/{cache,probe}`（归 ops）。
 
 ### v0.3 → v0.4（比 v0.3 简单一档：**没有迁移步骤、没有第二次重载**）
 

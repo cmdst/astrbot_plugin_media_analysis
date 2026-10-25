@@ -834,6 +834,31 @@ def test_render_truncates_the_body_but_keeps_the_footer() -> None:
     assert "媒体分析：视频" in footer
 
 
+def test_render_respects_an_explicit_max_chars_and_keeps_the_default() -> None:
+    """`max_chars` 关键字（v0.4.2 为 C 模式加的**唯一**改动，SPEC-v0.4.2 §6.2）。
+
+    两条都要：
+    ① 显式给 `max_chars=200` ⇒ 正文按 200 截断（C 模式的正文要塞进唤醒轮 system prompt，
+       比一条群消息更紧）；
+    ② **默认参数输出与 v0.4.1 逐字节相同**（A2 的 1200 语义一个字都没改）。
+    """
+    long_summary = "字" * (background.DELIVERY_MAX_CHARS + 120)
+    payload = _ok_payload(summary=long_summary)
+
+    tight = background.render(payload, max_chars=200)
+    body, _, footer = tight.partition("\n")
+    assert body == "字" * 200 + "…"
+    assert "媒体分析：视频" in footer, "截断只切正文，页脚照旧"
+
+    # 默认参数 == 显式给出冻结常量 == v0.4.1 的语义（1200 + "…"）
+    assert background.render(payload) == background.render(
+        payload, max_chars=background.DELIVERY_MAX_CHARS
+    )
+    assert background.render(payload).partition("\n")[0] == (
+        "字" * background.DELIVERY_MAX_CHARS + "…"
+    )
+
+
 def test_render_failure_is_code_plus_static_hint() -> None:
     """§3.4 失败形态：`媒体分析失败：{error}。{hint}`（hint 来自常量表，无运行时数据）。"""
     rendered = background.render(envelope.fail_envelope(envelope.ERR_GIF_CONVERT_FAILED))
