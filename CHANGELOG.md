@@ -1,5 +1,26 @@
 # CHANGELOG
 
+## v0.4.1 — 2026-10-25（**残留清理；待评审 / 待推送 / 待部署**）
+
+**0 新配置键 / 0 参数变更 / 0 错误码与 notes 词表变更**。只清 v0.4.0 登记的残留，外加一条
+"不迁原生后台"的决策与防双发守卫。
+
+- **`File` 无 `.gif` 后缀的 GIF**：`[3.5]` 现在对 **`File` 一律验魔数**（后缀只决定"要不要先当候选"）
+  ⇒ 无后缀 GIF 也会归一成 mp4，不再走 v0.3 梯子把**原始 GIF 字节**贴 `data:video/mp4` 直送。
+  读取成本是每文件 6 字节，只发生在取件之后。
+- **`File` 里的图片**（PNG / APNG / JPEG / 动画 WebP）：按图片魔数**显式**拒绝
+  `UNSUPPORTED_MEDIA_TYPE`。旧行为靠"`ffprobe` 读不出时长"这个副作用；APNG / 动画 WebP 有
+  视频流也可能带时长，会静默流进视频链。
+- **N2/N3 清理**：`media.py` 5 处旧 `-r 1` 注释改成最终 `tpad` 口径；删除无调用的
+  `import shutil`；`_gif_product_size(..., stage=...)` 的死参移除。
+- **原生后台路线 C 评估（不采用）**：核心 4.29.1 的 `is_background_task` 仍对 `@filter.llm_tool`
+  不可达（`_PermissionGuardedTool` 不镜像该字段）；即便核心补齐，唤醒轮也**没有可靠媒体出口**，
+  且"模型是否调 `send_message_to_user`"不可保证 ⇒ 与本插件 at-most-once 冲突。继续用插件自管
+  （A2），并新增 `test_tool_is_not_a_core_background_task` 钉住"不置核心 flag"（防同任务双发）。
+  调研报告：dev lane `research/20261025-native-core-background-route.md`。
+- **版本 bump 的连带**：`PLUGIN_VERSION` 是结果缓存与 L1 探测的键分量 ⇒ 0.4.1 首次使用会
+  **再次冷启动**（旧缓存不命中、视频位首用多一次 L1 探测）。
+
 ## v0.4.0 — 2026-10-25（**实现完成，待评审 / 待推送 `main` / 待部署**）
 
 两个变更：**① GIF 以视频解析**（`Image` 与群文件里的 GIF 一律先用 ffmpeg 归一成 mp4，

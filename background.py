@@ -9,6 +9,13 @@ flag **恒为 False**（`/tmp` 探针实测：仍同步执行）。即便把 fla
 回执文案被核心写死、多一次整段历史的 agent 回合、而且**投递由模型决定**
 （`core/astr_agent_tool_exec.py:677-684` 只记 WARNING）⇒ 拿不到"恰好一次"。
 
+**v0.4.1 复核**（路线 C 调研，`research/20261025-native-core-background-route.md`）：核心侧
+只要在 `_PermissionGuardedTool.__init__` 里补一行镜像就能让 flag 生效，但**仍不 adopt**——
+① 唤醒轮的唯一可靠出口是模型自己调 `send_message_to_user`，没调只 WARNING，与 at-most-once
+冲突；② 本插件的成果是**带媒体**的（转写/摘要 + 可能的帧），C 模式下没有可靠媒体出口；
+③ 每任务多一轮完整主 Agent 调用。`tests/test_registration.py` 的
+`test_tool_is_not_a_core_background_task` 把"不置 flag"钉死，防止将来"顺手开原生"造成双发。
+
 本模块的三条纪律（每条都在评审清单上）：
 
 1. **受理即返回**：`submit()` 只做类型判定（`media.find_media`，至多 6 字节本地读）

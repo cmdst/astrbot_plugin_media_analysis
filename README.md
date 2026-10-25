@@ -15,6 +15,23 @@
 就是本地文件、群文件一行 `file_`/`url` 就能拿到 —— 硬件条件齐了，缺的只是
 "把视频降维成模型能吃的东西"这一段编排。
 
+## v0.4.1 修了什么
+
+**0 新配置键 / 0 参数变更 / 0 错误码变更**，只清 v0.4.0 登记的残留：
+
+- **`File` 无 `.gif` 后缀的 GIF**：取件后对 `File` **一律验魔数**（后缀只决定"要不要先当候选"）
+  ⇒ 无后缀 GIF 也归一成 mp4，不再把原始 GIF 字节贴 `data:video/mp4` 直送。
+- **`File` 里的图片**（PNG / APNG / JPEG / 动画 WebP）按图片魔数**显式**拒绝
+  `UNSUPPORTED_MEDIA_TYPE`（旧行为靠 ffprobe"碰巧没时长"这个副作用）。
+- **N2/N3 清理**：5 处旧 `-r 1` 注释改成 `tpad` 口径、删无用的 `import shutil`、
+  移除 `_gif_product_size` 的死参。
+- **原生后台路线 C 不采用**：核心 `is_background_task` 仍对 `@filter.llm_tool` 不可达
+  （包装器不镜像），即便修好也**没有可靠媒体出口**、且"模型是否调用 `send_message_to_user`"
+  不可保证 ⇒ 与本插件 at-most-once 冲突。保留插件自管（A2），并新增测试钉住
+  "不置核心 flag"（防一条任务双发）。调研报告：dev lane
+  `research/20261025-native-core-background-route.md`。
+- **版本 0.4.1 的连带**：结果缓存与 L1 探测再次冷启动（`PLUGIN_VERSION` 是两者键分量）。
+
 ## v0.4 改了什么
 
 | # | 变更 | 一句话 |

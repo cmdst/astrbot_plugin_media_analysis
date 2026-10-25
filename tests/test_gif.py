@@ -1287,17 +1287,62 @@ async def test_file_segment_gif_is_treated_as_video_not_as_raw_bytes(
     assert not raw.startswith(b"GIF8")
 
 
+def test_image_content_kind_covers_png_apng_jpeg_and_webp(tmp_path) -> None:
+    """v0.4.1：`File` 的图片识别覆盖 PNG/APNG/JPEG/WebP；GIF 由 `has_gif_magic` 单独判定。"""
+    from _gif import jpeg_bytes, png_bytes, webp_bytes
+
+    cases = {
+        "a.png": (png_bytes(), "png"),
+        "b.png": (png_bytes(apng=True), "png"),
+        "c.jpg": (jpeg_bytes(), "jpeg"),
+        "d.webp": (webp_bytes(), "webp"),
+    }
+    for name, (data, expected) in cases.items():
+        path = tmp_path / name
+        path.write_bytes(data)
+        assert media.image_content_kind(str(path)) == expected
+
+    gif_path = write_gif(tmp_path / "e.gif", width=8, height=8, frames=1)
+    assert media.image_content_kind(str(gif_path)) is None
+
+
 @pytest.mark.asyncio
-async def test_file_lookalike_gif_falls_back_to_the_old_ladder(
+async def test_file_lookalike_gif_with_image_content_is_rejected(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    """`File` + `.gif` 但魔数不符 ⇒ **降回** v0.3 的三段梯子（行为不变，不是 GIF 错码）。
+    """`File` + `.gif` 但内容是 PNG ⇒ **显式** `UNSUPPORTED_MEDIA_TYPE`（v0.4.1）。
 
-    这里用假 `classify`（`_stub_media` 提供）断言：classify 被调了 1 次、`source:gif`
-    没有出现、kind 由 classify 决定（audio）。这条守的是"改名党不该改变既有行为"。
+    旧口径靠"ffprobe 没时长"碰巧拒绝；APNG / 动画 WebP 有视频流也可能有时长，
+    所以这里在 `[3.5]` 用图片魔数直接拦，`classify` / provider 一次都不该跑。
     """
     path = tmp_path / "fake.gif"
     path.write_bytes(png_bytes())
+    rig = build_rig(
+        monkeypatch,
+        tmp_path,
+        kind="audio",
+        event=make_event(current=[make_file("fake.gif", file=str(path))]),
+    )
+
+    with pytest.raises(envelope.ToolError) as exc_info:
+        await rig.run()
+
+    assert exc_info.value.code == envelope.ERR_UNSUPPORTED_MEDIA_TYPE
+    assert "image" in exc_info.value.log_detail
+    assert rig.media_calls["classify"] == 0
+
+
+@pytest.mark.asyncio
+async def test_file_lookalike_gif_with_garbage_falls_back_to_the_old_ladder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """`File` + `.gif` 但既非 GIF、也非已知图片 ⇒ 仍降回 v0.3 三段梯子（行为不变）。
+
+    这里用假 `classify`（`_stub_media` 提供）断言：classify 被调了 1 次、`source:gif`
+    没有出现。这条守的是"改名党/垃圾字节不该被误判成 GIF"。
+    """
+    path = tmp_path / "fake.gif"
+    path.write_bytes(b"not an image at all, just bytes")
     rig = build_rig(
         monkeypatch,
         tmp_path,

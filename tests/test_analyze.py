@@ -1916,6 +1916,64 @@ async def test_gif_cache_key_uses_source_bytes_on_both_sides(
 
 
 @pytest.mark.asyncio
+async def test_file_without_gif_suffix_is_promoted_by_magic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """v0.4.1 §5.4 补漏：`File` 没有 `.gif` 后缀，但内容魔数是 GIF ⇒ 也要转正。
+
+    旧行为只认后缀 ⇒ 群文件里的无后缀 GIF 走 v0.3 梯子、把原始字节贴 `data:video/mp4`
+    直送。现在 `[3.5]` 对 `File` 一律验魔数；后缀只决定"要不要先当候选"。
+    """
+    from _fakes import native_video
+    from _gif import write_gif
+
+    path = write_gif(tmp_path / "sticker.bin", width=32, height=32, frames=1, delay_cs=4)
+    event = make_event(current=[make_file("sticker.bin", file=str(path))])
+    rig = build_rig(
+        monkeypatch, tmp_path, kind="video", event=event, native=native_video()
+    )
+    calls = _stub_gif_convert(monkeypatch, frames=1, product_duration=1.0)
+
+    payload = await rig.run()
+
+    assert payload["ok"] is True
+    assert payload["kind"] == "video"
+    notes = list(payload["notes"])
+    assert "source:gif" in notes
+    assert "gif_static" in notes
+    assert calls["normalize"] == 1
+    assert rig.media_calls["classify"] == 0, "GIF 内容必须跳过 classify"
+
+
+@pytest.mark.asyncio
+async def test_file_with_png_content_is_rejected_as_unsupported(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """v0.4.1：`File` 里是图片（PNG/APNG/WebP/JPEG）⇒ 显式拒绝，不再靠"ffprobe 没时长"。
+
+    APNG / 动画 WebP 在 ffprobe 里也是 `codec_type=video` 且可能带时长；不显式拦，
+    原始图片字节会被贴 `data:video/mp4` 送进原生链。
+    """
+    from _fakes import native_video
+    from _gif import png_bytes
+
+    path = tmp_path / "photo.bin"
+    path.write_bytes(png_bytes())
+    event = make_event(current=[make_file("photo.bin", file=str(path))])
+    rig = build_rig(
+        monkeypatch, tmp_path, kind="video", event=event, native=native_video()
+    )
+
+    with pytest.raises(envelope.ToolError) as exc_info:
+        await rig.run()
+
+    assert exc_info.value.code == envelope.ERR_UNSUPPORTED_MEDIA_TYPE
+    assert "image" in exc_info.value.log_detail
+    assert rig.media_calls["classify"] == 0
+    assert rig.prov_calls.get("vision", 0) == 0
+
+
+@pytest.mark.asyncio
 async def test_image_gif_and_file_gif_with_same_bytes_share_one_cache_entry(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

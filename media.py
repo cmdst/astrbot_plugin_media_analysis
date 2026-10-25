@@ -33,7 +33,6 @@ import contextlib
 import hashlib
 import json
 import os
-import shutil
 import time
 from dataclasses import dataclass, replace
 from urllib.parse import unquote
@@ -126,10 +125,20 @@ GIF_MAX_FPS = 12  # GIF 常见 10–25 fps；12 保留动感、帧数砍半
 GIF_MAX_WIDTH_PX = 640  # 长边封顶（表情/短视频足够让模型说清"发生了什么"）
 GIF_CRF = 26  # 体积优先；GIF 源已是索引色
 GIF_CONVERT_TIMEOUT_S = 10.0  # 护栏不是产品参数（实测 0.62 s，16× 余量）
-# 单帧 GIF 走**静止变体**（`gif_static_argv`）：不套 `fps` 滤镜、输出 `-r 1` ⇒ 1.0 s 单帧。
-# 为什么不是"抬 GCE 保持时长再重试"：那套只在源里**有 GCE** 时可用（`ffmpeg -frames:v 1` 之外
-# 的老式 GIF87a 连 GCE 都没有），而且要把 0.04 s 抬到 1 s 才能过上游的最小可读时长；静止变体
-# 对**全部**单帧形态（含 GCE-less）一步到位，且不改用户字节、不需要第二次 ffmpeg。
+#: 图片魔数的**显式**判据（v0.4.1）：`File` 段里出现这些内容时直接拒绝，避免
+#: "ffprobe 把它当视频流 + 有时长"的 APNG/动画 WebP 被贴 `video/mp4` 送进原生链。
+#: 只覆盖常见静态/动图容器；GIF 单独由 `has_gif_magic` 判定。
+IMAGE_SNIFF_BYTES = 12
+IMAGE_MAGIC_PREFIXES = (
+    (b"\x89PNG\r\n\x1a\n", "png"),
+    (b"\xff\xd8\xff", "jpeg"),
+)
+# 单帧 GIF 走**静止变体**（`gif_static_argv`）：在冻结滤镜前加
+# `tpad=stop_mode=clone:stop_duration=1`，把唯一一帧克隆成 1 s，再按 `fps=12` 取样
+# ⇒ 1.0–1.083 s / 12–13 帧（`-r 1` 只有 1 帧、`-r 12` 不复制帧，两者都实测无效）。
+# 为什么不是"抬 GCE 保持时长再重试"：那套只在源里**有 GCE** 时可用（`ffmpeg -frames:v 1`
+# 之外的老式 GIF87a 连 GCE 都没有）；静止变体对**全部**单帧形态一步到位，且不改用户字节、
+# 不需要第二次 ffmpeg。
 
 
 # 扩展名白名单（SPEC-v0.2 §3.3，大小写不敏感）。表外**不是拒绝**，是转内容探测（§3.4）。
@@ -377,6 +386,29 @@ def has_gif_magic(path: str) -> bool:
     except OSError:
         return False
     return head in GIF_MAGICS
+
+
+def image_content_kind(path: str) -> str | None:
+    """`File` 内容是否是图片（`"png"` / `"jpeg"` / `"webp"`），否则 `None`。
+
+    v0.4.1 的补漏：`File` 段里没有后缀的图片（尤其 **APNG / 动画 WebP**）在旧梯子上会被
+    `ffprobe` 判成"有视频流"、且可能带时长 ⇒ 原始图片字节被贴 `data:video/mp4` 送进原生链。
+    这里在判型前显式识别并拒绝，让"普通图片不进本插件"的契约对 `File` 也成立。
+
+    APNG 就是 PNG 容器（`acTL` 块只在 IHDR 之后），因此按 PNG 处理即可；动画 WebP 是
+    RIFF 容器（`RIFF....WEBP`）。读不出来一律 `None`（拿不到证据就不下结论）。
+    """
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(IMAGE_SNIFF_BYTES)
+    except OSError:
+        return None
+    for prefix, kind in IMAGE_MAGIC_PREFIXES:
+        if head.startswith(prefix):
+            return kind
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "webp"
+    return None
 
 
 def _looks_like_gif(*values: object) -> bool:
@@ -1160,12 +1192,13 @@ async def normalize_gif(
     闸④ 的"时长"一侧有一个**唯一放行口**（真机 F2 裁决）：产物**有视频流但没有可度量时长**
     ⇒ 按 `0.0` 收（一行 LOG，不加 note）；产物缺失/0 字节/ffprobe 真坏仍 `GIF_CONVERT_FAILED`。
 
-    **argv 按帧数分派**（真机 F2/F2-R 的最终修法）：
-    - `frames == 1` ⇒ `gif_static_argv`（静止变体：不套 `fps` 取样、输出 `-r 1`）⇒ 恰好 1 帧 /
-      1.0 s 的 mp4，覆盖**全部**单帧形态（含**没有 GCE** 的老式 GIF87a，那类连"抬保持时长"
-      都无从下手）；冻结 argv 的 `fps=12` 会把 0.04 s 的唯一一帧**整帧丢掉**（262 字节 / 0 流），
-      即便侥幸出 1 帧也只有 0.083 s、会被上游 400 拒收；
-    - `frames > 1` ⇒ 冻结的 `gif_argv` **一字不动**（静止变体不按帧率取样，多帧会被压成 2 帧）。
+    **argv 按帧数分派**（真机 F2/F2-R/F2-S 的最终修法）：
+    - `frames == 1` ⇒ `gif_static_argv`（在冻结滤镜前加 `tpad=stop_mode=clone:
+      stop_duration=1`，把唯一一帧克隆成 1 s 再按 `fps=12` 取样）⇒ 1.0–1.083 s /
+      12–13 帧的 mp4，覆盖**全部**单帧形态（含**没有 GCE** 的老式 GIF87a）。冻结 argv 的
+      `fps=12` 会把 0.04 s 的唯一一帧**整帧丢掉**（262 字节 / 0 流）；早先试过的 `-r 1`
+      只有 1 帧（上游回空文本、抽帧 0/6），`-r 12` 不复制帧，两者都被真机否决；
+    - `frames > 1` ⇒ 冻结的 `gif_argv` **一字不动**（`tpad` 只对单帧使用，多帧走原路径）。
     产物时长报**真实值**（单帧 ≈1.0 s），`static=True` 由源帧数决定（`GifResult.static`）。
 
     产物落 `<workdir>/gif.mp4`：`workdir` 是 `analyze` 的 `/tmp/media_analysis_*`，
@@ -1188,7 +1221,7 @@ async def normalize_gif(
 
     frames = await gif_frame_count(source)
     out_path = os.path.join(workdir, "gif.mp4")
-    # 单帧 ⇒ 静止变体（不取样、`-r 1`）；多帧 ⇒ 冻结的 `gif_argv` 一字不动（SPEC-v0.4 §5.6）
+    # 单帧 ⇒ `tpad` 静止变体；多帧 ⇒ 冻结的 `gif_argv` 一字不动（SPEC-v0.4 §5.6）
     argv = (
         gif_static_argv(source, out_path)
         if frames == 1
@@ -1235,19 +1268,19 @@ async def normalize_gif(
     )
 
 
-def _gif_product_size(out_path: str, *, rc: int, max_media_bytes: int, stage: str = "") -> int:
+def _gif_product_size(out_path: str, *, rc: int, max_media_bytes: int) -> int:
     """闸④ 前半：产物**非空**且不超 `max_media_bytes`（失败一律 `_unlink` 不留残渣）。"""
     size = _size_of(out_path) or 0
     if size <= 0:
         _unlink(out_path)
         raise envelope.ToolError(
-            envelope.ERR_GIF_CONVERT_FAILED, log_detail=f"empty output{stage} (rc={rc})"
+            envelope.ERR_GIF_CONVERT_FAILED, log_detail=f"empty output (rc={rc})"
         )
     if max_media_bytes > 0 and size > max_media_bytes:
         _unlink(out_path)
         raise envelope.ToolError(
             envelope.ERR_MEDIA_TOO_LARGE,
-            log_detail=f"gif output size={size} max_media_bytes={max_media_bytes}{stage}",
+            log_detail=f"gif output size={size} max_media_bytes={max_media_bytes}",
         )
     return size
 
@@ -1261,7 +1294,7 @@ async def _gif_product_duration(out_path: str) -> float | None:
     | --- | --- |
     | 有时长 | 时长 |
     | **有视频流**但没有可度量时长（`format.duration=N/A`） | `0.0` + 一行 LOG（**唯一放行口**） |
-    | **没有任何流**（`fps` 网格把唯一一帧吃掉，262 字节空 mp4） | `None`（调用方决定是否重试） |
+    | **没有任何流**（`fps` 网格把唯一一帧吃掉，262 字节空 mp4） | `None`（调用方按 0 流失败处理，不重试） |
     | 其余（ffprobe 真坏 / 探不出流） | `GIF_CONVERT_FAILED` |
 
     `0.0` 是安全的：下游只把它用在压缩码率公式（产物小到不用压）与抽帧网格（单帧源只有

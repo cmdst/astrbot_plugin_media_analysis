@@ -287,6 +287,18 @@ def test_registered_schema_descriptions_are_nonempty() -> None:
         assert spec.get("description"), f"{name} 缺 description"
 
 
+def test_tool_is_not_a_core_background_task() -> None:
+    """v0.4.1 防双发：`media_analyze` 必须继续由**插件自管**后台，不置核心 flag。
+
+    若哪天有人把 `is_background_task` 置 True（核心修好包装层后"顺手开原生"），
+    同一条任务会同时走核心唤醒轮与插件的 `send_message` ⇒ **两条消息**。
+    本用例把"不置 flag"钉成契约；迁移原生路线（C）必须同时重写信封语义。
+    """
+    tool = llm_tools.get_func("media_analyze")
+    assert tool is not None
+    assert tool.is_background_task is False
+
+
 def test_tool_name_is_not_shadowed_by_another_plugin() -> None:
     """名字唯一性：注册表里 `media_analyze` 只有这一份（父手册 §5 的占用普查）。"""
     tool = llm_tools.get_func("media_analyze")

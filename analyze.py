@@ -248,8 +248,21 @@ async def analyze(
 
         # 3.5 —— GIF 魔数**二次确认**（SPEC-v0.4 §5.3/§5.12）：File 在此转正或降回，
         #        Image 非 GIF 直接 MEDIA_NOT_FOUND（远程 `.gif` 那条路的收口点）
+        #        v0.4.1：`File` **一律**验魔数（后缀只是候选线索）⇒ 无后缀 GIF 也转正；
+        #        非 GIF 的图片（PNG/APNG/WebP/JPEG）显式拒绝，不再靠"ffprobe 碰巧没时长"。
         digest_source = path  # 缓存 digest 取【源】字节（GIF 归一前后都不变）
-        if handle.gif:
+        if handle.from_file:
+            handle = media.confirm_gif(handle, path)
+            if not handle.gif:
+                image_kind = media.image_content_kind(path)
+                if image_kind is not None:
+                    raise envelope.ToolError(
+                        envelope.ERR_UNSUPPORTED_MEDIA_TYPE,
+                        log_detail=(
+                            f"file content is {image_kind}; images are not supported"
+                        ),
+                    )
+        elif handle.gif:
             handle = media.confirm_gif(handle, path)
 
         # 4-pre —— GIF 分支（SPEC-v0.4 §5.12）：时长闸（**源**）→ 归一 mp4 → 产物当视频用
