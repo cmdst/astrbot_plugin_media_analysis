@@ -43,6 +43,11 @@
   只有 GIF 带 `format.duration`；靠"时长缺失"当判据是个随时会塌的副作用。
 - **普通图片仍然不进链**：`Image` + JPEG/PNG/WebP/APNG 在**受理路径**就返回
   `MEDIA_NOT_FOUND`（同步、不建任务）；改名党（`.gif` 后缀 + 非 GIF 内容）也过不了魔数。
+- **远程 GIF（只有 URL、没有本地文件）走插件自己的有界下载**：边读边数、超
+  `limits.max_media_bytes` 立刻放弃（`MEDIA_TOO_LARGE`）、产物只落本任务的
+  `/tmp/media_analysis_*` 并随 `finally` 删除。**绝不用**核心的
+  `Image.convert_to_file_path()` —— 那条路没有字节上限、落 `<ASTRBOT_ROOT>/data/temp`
+  且调用后残留（v0.4 的 R1 回归，已修）。
 - **冻结的 ffmpeg 参数**（代码常量，不新增配置键）：
   `-an` · `fps=12` · `scale='trunc(min(640,iw)/2)*2':-2` · `yuv420p` ·
   libx264 `veryfast` / `crf 26` · `-threads 1` · `+faststart` · `-f mp4`。

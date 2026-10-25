@@ -508,6 +508,11 @@ async def resolve_media_path(
     - `File`：① `file_` 命中就零 IO 复用（核心多半已 `get_file()` 下好并回写）
       ② `file_` 空但 `url` 有 ⇒ 我们自己的**有界下载**（落 `<workdir>`，随 `finally` 删）
       ③ 两者都空 ⇒ `MEDIA_UNRESOLVABLE`；
+    - **`Image` 的 GIF 候选（`handle.gif`）且无本地文件**：同样走**有界下载**
+      （`_resolve_remote_gif_path`，落 `<workdir>`、受 `max_media_bytes` 约束）；
+      **绝不**回落到 `Image.convert_to_file_path()` —— 那条路无字节上限、落
+      `<ASTRBOT_ROOT>/data/temp`、调用后残留（评审 R1，v0.4 回归；SPEC-v0.4 §5.4 与
+      AGENTS §8 都要求"任务内有界下载、字节只落 /tmp"）；
     - `Record` / `Video`：v0.1 原样（`path` 优先，`convert_to_file_path()` 兜底）。
 
     `workdir` / `max_media_bytes` 是**必填关键字参数**而不是默认值：`max_media_bytes`
@@ -522,6 +527,13 @@ async def resolve_media_path(
     path = getattr(handle.comp, "path", None)
     if isinstance(path, str) and path and os.path.isfile(path):
         return os.path.abspath(path)
+
+    if handle.gif:
+        # 远程 GIF 候选：**有界**下载（评审 R1）。放在 `convert_to_file_path` 之前，
+        # 且下面那条兜底对 `handle.gif` 不会被执行到 —— 见 `_resolve_remote_gif_path`。
+        return await _resolve_remote_gif_path(
+            handle.comp, workdir=workdir, max_media_bytes=max_media_bytes
+        )
 
     converter = getattr(handle.comp, "convert_to_file_path", None)
     if callable(converter):
@@ -545,6 +557,50 @@ async def resolve_media_path(
     raise envelope.ToolError(
         envelope.ERR_MEDIA_UNRESOLVABLE,
         log_detail=f"kind={handle.kind} quoted={handle.quoted}",
+    )
+
+
+def _http_url_of(comp) -> str | None:
+    """组件上第一个 `http(s)://` 地址（`url` 优先，再看 `file`）；没有就 `None`。
+
+    为什么两个字段都看：QQ 的图片组件有时只填 `url`、有时把地址塞在 `file` 里
+    （`file` 也可能是 `file://` / `base64://` / 相对路径 —— 这些都不是可下载地址）。
+    **只放行 http(s)**：其它 scheme 交给 `download_bounded` 抛 `MEDIA_UNRESOLVABLE`，
+    而不是在这里猜。
+    """
+    for field_name in ("url", "file"):
+        value = getattr(comp, field_name, "")
+        if isinstance(value, str) and value.startswith(("http://", "https://")):
+            return value
+    return None
+
+
+async def _resolve_remote_gif_path(
+    comp, *, workdir: str, max_media_bytes: int
+) -> str:
+    """远程 GIF 候选（`handle.gif` 且无本地文件）的**有界**取件（评审 R1）。
+
+    为什么不能用 `Image.convert_to_file_path()`：它把响应**整段**落进
+    `<ASTRBOT_ROOT>/data/temp`，**没有**字节上限（绕过 `limits.max_media_bytes`）、
+    也不归调用方清理 —— 评审 R1 实测：`max_media_bytes=1024` 时仍把 6,253 B 全量写进
+    `data/temp/media_image_*.gif` 并残留。这同时违反 SPEC-v0.4 §5.4「任务内有界下载」与
+    AGENTS §8「下载字节只落 /tmp」。
+
+    本函数只做三件事：解析 http(s) 地址 → `download_bounded`（**边读边数**、超限立刻放弃、
+    落 `<workdir>`）→ 返回该路径。工作目录由 `analyze` 的 `finally: rmtree` 负责删。
+    """
+    url = _http_url_of(comp)
+    if url is None:
+        raise envelope.ToolError(
+            envelope.ERR_MEDIA_UNRESOLVABLE,
+            log_detail="gif image: no http(s) url and no local file",
+        )
+    return await download_bounded(
+        url,
+        workdir=workdir,
+        max_bytes=max_media_bytes,
+        timeout=FILE_DOWNLOAD_TIMEOUT_S,
+        suffix=".gif",
     )
 
 

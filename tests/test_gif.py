@@ -20,14 +20,21 @@
 from __future__ import annotations
 
 import base64
+import contextlib
+import http.server
 import inspect
+import os
 import shutil
 import subprocess
+import tempfile
+import threading
+from pathlib import Path
 
 import pytest
 
 from astrbot.api.message_components import Image
 
+from astrbot_plugin_media_analysis import analyze as analyze_mod
 from astrbot_plugin_media_analysis import envelope, media
 from _fakes import (
     make_event,
@@ -61,6 +68,62 @@ def _require_ffmpeg() -> None:
 def _code(exc_info: pytest.ExceptionInfo) -> str:
     assert isinstance(exc_info.value, envelope.ToolError), type(exc_info.value)
     return exc_info.value.code
+
+
+@contextlib.contextmanager
+def _http_gif_server(payload: bytes, *, delay_s: float = 0.0):
+    """起一个**真的**本地 http 服务（`127.0.0.1:0`），返回 `(base_url, hit)`。
+
+    为什么必须是真的：R1 的问题就出在"下载走谁"这件事上 —— 一旦把下载桩掉，这条回归
+    永远测不出来。所以这里用真 `http.server` + 真 socket，测的是"字节从哪来、落到哪、
+    有没有上限"。`delay_s > 0` 用来造超时；`/missing.gif` 恒 404。
+    """
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self) -> None:  # noqa: N802 —— BaseHTTPRequestHandler 的约定名
+            if self.path.startswith("/missing"):
+                self.send_error(404)
+                return
+            if delay_s:
+                import time
+
+                time.sleep(delay_s)
+            self.send_response(200)
+            self.send_header("Content-Type", "image/gif")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_args: object) -> None:  # 静音（测试输出要干净）
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def _data_temp_media_images() -> set[str]:
+    """`<ASTRBOT_ROOT>/data/temp` 里的 `media_image_*`（R1 的残留面；目录不在就是空集）。"""
+    root = os.environ.get("ASTRBOT_ROOT") or ""
+    if not root:
+        return set()
+    temp_dir = os.path.join(root, "data", "temp")
+    if not os.path.isdir(temp_dir):
+        return set()
+    return {name for name in os.listdir(temp_dir) if name.startswith("media_image_")}
+
+
+def _remote_gif_image(url: str) -> Image:
+    """一个**只有 URL**（无本地文件）的 `Image` —— 正是 R1 的触发形态。"""
+    return Image(file=url, url=url)
 
 
 def _probe(path: str) -> dict[str, str]:
@@ -887,6 +950,172 @@ async def test_gif_retry_runs_exactly_once(
     assert len(prepared) == 1, f"拷贝只该准备 1 次，实际 {len(prepared)} 次：{prepared}"
     assert not (tmp_path / "gif_static.gif").exists(), "重试用的拷贝必须被清掉"
     assert not (tmp_path / "gif.mp4").exists(), "失败必须 unlink 半成品"
+
+
+# --------------------------------------------------------------------------- #
+# R1（评审 medium，v0.4 回归）：远程 GIF `Image` 必须走**有界下载**
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_remote_gif_image_download_is_bounded_by_max_media_bytes(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R1：`max_media_bytes` 必须对远程 GIF 生效，且**不落** `data/temp`。
+
+    修复前的形态（t5 实测）：远程 `Image` + `.gif` 走 `Image.convert_to_file_path()` ⇒
+    **无字节上限**地写进 `<ASTRBOT_ROOT>/data/temp/media_image_*.gif`（6,253 B 全量落地，
+    `max_media_bytes=1024` 形同虚设），并且调用后**残留**。修复后：走插件自己的
+    `download_bounded`（边读边数、超限立刻放弃、落 analyze 的 `/tmp` 工作目录）。
+
+    这条同时钉住三件事：错误码不变（`MEDIA_TOO_LARGE`）、`data/temp` 零新增、
+    工作目录零残渣。
+    """
+    payload = gif_bytes(width=200, height=150, frames=8, delay_cs=10)
+    assert len(payload) > 1024, len(payload)  # 必须真的超过上限，才谈得上"被拦住"
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    before = _data_temp_media_images()
+
+    with _http_gif_server(payload) as base:
+        handle = media.MediaHandle(
+            comp=_remote_gif_image(f"{base}/clip.gif"), quoted=False, gif=True
+        )
+        with pytest.raises(envelope.ToolError) as exc_info:
+            await media.resolve_media_path(
+                handle, workdir=str(workdir), max_media_bytes=1024
+            )
+
+    assert _code(exc_info) == envelope.ERR_MEDIA_TOO_LARGE
+    assert "downloaded >1024 bytes" in exc_info.value.log_detail
+    assert _data_temp_media_images() == before, "不许在 data/temp 造文件（R1 的缺陷面）"
+    assert list(workdir.iterdir()) == [], "超限后工作目录不许留半成品"
+
+
+@pytest.mark.asyncio
+async def test_remote_gif_image_downloads_into_the_workdir(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """上限内 ⇒ 字节落在**调用方给的 workdir**、内容逐字节一致、且不走 `convert_to_file_path`。"""
+    payload = gif_bytes(width=200, height=150, frames=8, delay_cs=10)
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    before = _data_temp_media_images()
+
+    # 硬守卫：`convert_to_file_path` 一次都不许被调用（R1 的原始形态）
+    converted: list[str] = []
+    real_convert = Image.convert_to_file_path
+
+    async def _spy_convert(self):
+        converted.append(str(getattr(self, "file", "")))
+        return await real_convert(self)
+
+    monkeypatch.setattr(Image, "convert_to_file_path", _spy_convert)
+
+    with _http_gif_server(payload) as base:
+        handle = media.MediaHandle(
+            comp=_remote_gif_image(f"{base}/clip.gif"), quoted=False, gif=True
+        )
+        resolved = await media.resolve_media_path(
+            handle, workdir=str(workdir), max_media_bytes=1 << 20
+        )
+
+    path = Path(resolved)
+    assert path.parent == workdir, f"下载物必须落在调用方的工作目录：{resolved}"
+    assert path.name == "file.gif"
+    assert path.read_bytes() == payload
+    assert converted == [], f"GIF 候选不许回落 convert_to_file_path：{converted}"
+    assert _data_temp_media_images() == before
+
+
+@pytest.mark.asyncio
+async def test_remote_gif_image_workdir_is_removed_after_analyze(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """端到端：远程 GIF 经 `analyze` 跑完整条链，**工作目录随 `finally` 消失**。
+
+    R1 的另一半是"调用后文件残留"：`convert_to_file_path` 落 `data/temp` 且不清理。
+    修复后下载物只活在这条任务自己的 `/tmp/media_analysis_*` 里，`analyze` 收尾即删。
+    """
+    _require_ffmpeg()
+    payload = gif_bytes(width=64, height=48, frames=4, delay_cs=10)
+    before = _data_temp_media_images()
+
+    created: list[str] = []
+    real_tempfile = analyze_mod.tempfile
+
+    class _TempfileSpy:
+        def __getattr__(self, name: str) -> object:
+            return getattr(real_tempfile, name)
+
+        def mkdtemp(self, *args: object, **kwargs: object) -> str:
+            path = real_tempfile.mkdtemp(*args, **kwargs)
+            created.append(path)
+            return path
+
+    monkeypatch.setattr(analyze_mod, "tempfile", _TempfileSpy())
+
+    with _http_gif_server(payload) as base:
+        native = native_video(text="一张会动的图。")
+        rig = build_rig(
+            monkeypatch,
+            tmp_path,
+            kind="video",
+            event=make_event(current=[_remote_gif_image(f"{base}/clip.gif")]),
+            native=native,
+        )
+        result = await rig.run()
+
+    assert result["ok"] is True, result
+    assert "source:gif" in result["notes"]
+    assert any(str(note).startswith("gif_converted:") for note in result["notes"])
+    assert created, "analyze 必须建过工作目录"
+    assert not os.path.exists(created[-1]), f"工作目录必须被 finally 删掉：{created[-1]}"
+    assert _data_temp_media_images() == before
+
+
+@pytest.mark.asyncio
+async def test_remote_gif_image_http_errors_map_to_media_unresolvable(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R1 的错误面：404 / 超时 / 非 http 地址 ⇒ 既有 `MEDIA_UNRESOLVABLE`（不新增码）。"""
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+
+    # ① 404
+    with _http_gif_server(b"irrelevant") as base:
+        handle = media.MediaHandle(
+            comp=_remote_gif_image(f"{base}/missing.gif"), quoted=False, gif=True
+        )
+        with pytest.raises(envelope.ToolError) as exc_info:
+            await media.resolve_media_path(
+                handle, workdir=str(workdir), max_media_bytes=1 << 20
+            )
+    assert _code(exc_info) == envelope.ERR_MEDIA_UNRESOLVABLE
+    assert "http status 404" in exc_info.value.log_detail
+
+    # ② 超时（把总时长压到 0.2 s 造一个**真**超时；服务端故意睡 1 s）
+    monkeypatch.setattr(media, "FILE_DOWNLOAD_TIMEOUT_S", 0.2)
+    with _http_gif_server(b"late", delay_s=1.0) as base:
+        handle = media.MediaHandle(
+            comp=_remote_gif_image(f"{base}/clip.gif"), quoted=False, gif=True
+        )
+        with pytest.raises(envelope.ToolError) as exc_info:
+            await media.resolve_media_path(
+                handle, workdir=str(workdir), max_media_bytes=1 << 20
+            )
+    assert _code(exc_info) == envelope.ERR_MEDIA_UNRESOLVABLE
+    assert "timeout" in exc_info.value.log_detail
+
+    # ③ 既没有本地文件、也没有 http(s) 地址（`file://` 不算可下载地址）
+    handle = media.MediaHandle(
+        comp=_remote_gif_image("file:///tmp/nope.gif"), quoted=False, gif=True
+    )
+    with pytest.raises(envelope.ToolError) as exc_info:
+        await media.resolve_media_path(
+            handle, workdir=str(workdir), max_media_bytes=1 << 20
+        )
+    assert _code(exc_info) == envelope.ERR_MEDIA_UNRESOLVABLE
+    assert "no http(s) url" in exc_info.value.log_detail
+    assert list(workdir.iterdir()) == [], "三次失败都不许在工作目录留残渣"
 
 
 def test_png_and_apng_probe_as_video_but_are_still_not_gif(tmp_path) -> None:

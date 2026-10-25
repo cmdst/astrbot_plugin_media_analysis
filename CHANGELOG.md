@@ -65,6 +65,12 @@ v0.3 的 `File` + `.gif` 已经"进链"了，但是错的那种：`_classify_fil
   （`GIF_STATIC_HOLD_CS=100`；只改 2 字节，源文件只读），用**同一份 argv** 重试**一次**；
   重试仍失败 ⇒ `GIF_CONVERT_FAILED`。单帧源的保持时长与画面/帧数无关 ⇒ 语义恒等；
   多帧 GIF 一律不碰。
+- **修复 R1（评审 medium，v0.4 回归）**：远程 `Image`（只有 URL、无本地文件）的 GIF 候选
+  以前回落核心 `Image.convert_to_file_path()` ⇒ **无字节上限**地下到
+  `<ASTRBOT_ROOT>/data/temp/media_image_*.gif`、绕过 `limits.max_media_bytes`、调用后残留。
+  现在改走插件自己的 `download_bounded`（边读边数、超限 `MEDIA_TOO_LARGE`、只落本任务的
+  `/tmp` 工作目录并随 `finally` 删除），**不再回落** `convert_to_file_path()`；
+  非 GIF 的 `Image` 与 `Video` 分支不变。
 - **为什么抬到 1.0 s 而不是 1/12 s（F2-R，t8 复验）**：0.083 s 的产物会被上游视频通道
   直接 **400 拒收**（Gemini `BadRequestError`，两次独立复现），1.0 s 的同一份画面可正常受理。
   "能不能过 `fps` 网格"（触发阈值 9 cs）与"能不能被上游读"（抬到 100 cs）是**两个**常量，
