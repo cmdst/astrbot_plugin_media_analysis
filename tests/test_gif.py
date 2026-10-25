@@ -785,6 +785,103 @@ def test_prepare_static_gif_copy_patches_only_the_delay_field(tmp_path) -> None:
     assert media.prepare_static_gif_copy(str(junk), str(tmp_path / "junk2.gif")) is False
 
 
+# --------------------------------------------------------------------------- #
+# F2 的"最小修法"守卫：**只对单帧**、**只重试一次**（t7 变异检验补的两条）
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_gif_retry_only_fires_for_single_frame_sources(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """条件①：产物 0 流时，**多帧源绝不许触发**保时长重试（改输入只对单帧成立）。
+
+    为什么多帧必须拦住：抬高 GCE 保持时长对单帧源是**语义恒等**（那张静态图被展示多久
+    与画面/帧数无关）；对多帧源它会改变**每一帧的时长** ⇒ 等于篡改用户动图的节奏。
+    所以 `_gif_retry_single_frame` 的第一行就是 `frames != 1 ⇒ 直接失败`。
+
+    变异守卫（t7 实测的两个未捕获变异）：删掉 `frames != 1` 守卫 ⇒ `prepare_static_gif_copy`
+    被调用 ⇒ 本用例红；把重试加宽成"0 流就跑" ⇒ 同上。断言刻意用 **spy + 计数**，
+    不依赖 `log_detail` 的措辞（那正是 t7 用子串断言漏掉这条变异的根因）。
+    """
+    source = write_gif(tmp_path / "multi.gif", width=16, height=16, frames=4, delay_cs=4)
+    calls = _patch_convert(monkeypatch, duration=None, frames=4)
+
+    async def _no_streams(_path: str):
+        return False, False
+
+    prepared: list[tuple[str, str]] = []
+
+    def _spy_prepare(src: str, dest: str) -> bool:
+        # 若守卫被删，这里会真的被调到；返回 True 让"多帧也重试"这条路走通（更狠）
+        prepared.append((src, dest))
+        return True
+
+    monkeypatch.setattr(media, "probe_streams", _no_streams)
+    monkeypatch.setattr(media, "prepare_static_gif_copy", _spy_prepare)
+
+    with pytest.raises(envelope.ToolError) as exc_info:
+        await media.normalize_gif(
+            str(source), workdir=str(tmp_path), max_media_bytes=1 << 20
+        )
+
+    assert _code(exc_info) == envelope.ERR_GIF_CONVERT_FAILED
+    assert prepared == [], f"多帧源不许触发保时长重试：{prepared}"
+    assert calls["run_capture"] == 1, (
+        f"多帧源只该跑 1 次 ffmpeg（首轮），实际 {calls['run_capture']} 次"
+    )
+    assert not (tmp_path / "gif_static.gif").exists()
+    assert not (tmp_path / "gif.mp4").exists(), "失败必须 unlink 半成品"
+
+
+@pytest.mark.asyncio
+async def test_gif_retry_runs_exactly_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """条件①：**只重试一次**。首轮与重试都 0 流 ⇒ 恰好 2 次 ffmpeg，然后失败。
+
+    为什么钉"恰好一次"：重试是**补救**不是重试策略。第 3 次、第 4 次只会在同一个确定性
+    输入上重复同样的空产物（白花 CPU、把 30 s 的预算碎成一堆 10 s 超时），而且违背
+    "失败要可见、不要磨"的口径。守卫是终态断言（不是措辞断言）：
+
+    | 变异 | 期望 |
+    | --- | --- |
+    | 重试跑两次（复制一行） | `run_capture == 3` ⇒ 红 |
+    | 重试被加成循环/退避 | 同上 ⇒ 红 |
+    | 只在单帧才重试（当前实现） | `run_capture == 2` ⇒ 绿 |
+
+    另外钉两件事：拷贝**只准备一次**（不能每轮都重新拷/改源），以及重试失败仍走
+    `GIF_CONVERT_FAILED` 且不留残渣。
+    """
+    source = write_gif(tmp_path / "short.gif", width=16, height=16, frames=1, delay_cs=4)
+    calls = _patch_convert(monkeypatch, duration=None, frames=1)
+
+    async def _no_streams(_path: str):
+        return False, False
+
+    real_prepare = media.prepare_static_gif_copy
+    prepared: list[str] = []
+
+    def _spy_prepare(src: str, dest: str) -> bool:
+        prepared.append(dest)
+        return real_prepare(src, dest)
+
+    monkeypatch.setattr(media, "probe_streams", _no_streams)
+    monkeypatch.setattr(media, "prepare_static_gif_copy", _spy_prepare)
+
+    with pytest.raises(envelope.ToolError) as exc_info:
+        await media.normalize_gif(
+            str(source), workdir=str(tmp_path), max_media_bytes=1 << 20
+        )
+
+    assert _code(exc_info) == envelope.ERR_GIF_CONVERT_FAILED
+    assert "retried output still has no video stream" in exc_info.value.log_detail
+    assert calls["run_capture"] == 2, (
+        f"首轮 + 1 次重试 = 2 次 ffmpeg，实际 {calls['run_capture']} 次"
+    )
+    assert len(prepared) == 1, f"拷贝只该准备 1 次，实际 {len(prepared)} 次：{prepared}"
+    assert not (tmp_path / "gif_static.gif").exists(), "重试用的拷贝必须被清掉"
+    assert not (tmp_path / "gif.mp4").exists(), "失败必须 unlink 半成品"
+
+
 def test_png_and_apng_probe_as_video_but_are_still_not_gif(tmp_path) -> None:
     """M6 的事实守卫：PNG/APNG 的 `codec_type` 也是 `video`，但它们**没有时长**、更不是 GIF。
 
