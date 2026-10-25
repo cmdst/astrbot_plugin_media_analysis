@@ -773,9 +773,11 @@ async def test_normalize_gif_single_frame_is_static(tmp_path) -> None:
 
     assert result.frames == 1
     assert result.static is True
-    # 静止变体：`-r 1` ⇒ 恰好 1 帧 / 1.0 s（不是 12 fps 网格的 0.083 s）
-    assert result.duration_s == pytest.approx(1.0, abs=0.05)
-    assert "mp4" in _probe(result.path)["format_name"]
+    # 静止变体：`tpad` 克隆 1 s + `fps=12` ⇒ 1.0–1.1 s 且**可抽帧**（≥12 帧）
+    assert 1.0 <= result.duration_s <= 1.1, result.duration_s
+    info = _probe(result.path)
+    assert "mp4" in info["format_name"]
+    assert int(info["nb_read_frames"]) >= 12, info
     assert await media.probe_streams(result.path) == (False, True)
 
 
@@ -805,8 +807,9 @@ async def test_single_frame_short_delay_gif_uses_the_static_variant(tmp_path) ->
         str(source), workdir=str(tmp_path), max_media_bytes=1 << 20
     )
     assert result.frames == 1 and result.static is True
-    assert result.duration_s == pytest.approx(1.0, abs=0.05)
+    assert 1.0 <= result.duration_s <= 1.1, result.duration_s
     assert await media.probe_streams(result.path) == (False, True)
+    assert int(_probe(result.path)["nb_read_frames"]) >= 12, _probe(result.path)
     assert source.read_bytes() == original, "源文件只读"
 
 
@@ -827,42 +830,47 @@ async def test_static_gif_variant_covers_every_single_frame_shape(tmp_path) -> N
         )
         assert result.frames == 1, delay_cs
         assert result.static is True, delay_cs
-        assert result.duration_s == pytest.approx(1.0, abs=0.05), (delay_cs, result.duration_s)
+        # F2-S：`tpad` 克隆 + `fps=12` ⇒ 1.0–1.1 s 且**可抽帧**（12–13 帧，不再是 1 帧）
+        assert 1.0 <= result.duration_s <= 1.1, (delay_cs, result.duration_s)
         assert await media.probe_streams(result.path) == (False, True), delay_cs
-        assert _probe(result.path)["nb_read_frames"] == "1", (delay_cs, _probe(result.path))
+        info = _probe(result.path)
+        assert int(info["nb_read_frames"]) >= 12, (delay_cs, info)
 
 
 def test_gif_static_argv_is_frozen_verbatim() -> None:
-    """静止变体 argv 逐字符快照：**不取样**（无 `fps=`）、`-r 1`，其余与冻结 argv 同参。"""
+    """静止变体 argv 逐字符快照：**先 `tpad` 克隆 1 s、再 `fps=12` 取样**，且没有 `-r 1`。
+
+    F2-S 的教训：`-r 1`（1 帧 / 1.0 s）与 `-r 12`（仍 1 帧，输出帧率不复制帧）都救不了抽帧，
+    必须**先把帧克隆出来**。所以定稿的滤镜开头是 `tpad=stop_mode=clone:stop_duration=1`，
+    然后才是 `fps=12` 与偶数宽 `scale`。
+    """
     static_argv = media.gif_static_argv("in.gif", "out.mp4")
     assert static_argv == [
         "ffmpeg", "-nostdin", "-y", "-v", "error",
         "-i", "in.gif",
         "-an",
-        "-vf", "scale='trunc(min(640,iw)/2)*2':-2:flags=lanczos",
+        "-vf",
+        "tpad=stop_mode=clone:stop_duration=1,fps=12,"
+        "scale='trunc(min(640,iw)/2)*2':-2:flags=lanczos",
         "-pix_fmt", "yuv420p",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
         "-threads", "1",
-        "-r", "1",
         "-movflags", "+faststart",
         "-f", "mp4", "out.mp4",
     ]
-    # 与冻结 argv 的差别**只有两处**：滤镜里没有 `fps=12`、多了 `-r 1`
+    assert "-r" not in static_argv, "F2-S 定稿去掉了 `-r 1`（帧由 tpad 克隆，不由输出帧率造）"
+    assert "tpad=stop_mode=clone" in static_argv[static_argv.index("-vf") + 1]
+    # 与冻结 argv 的差别**只在滤镜**：多一个 `tpad` 前置，其余元素逐字相同（也没有 `-r 1`）
     frozen = media.gif_argv("in.gif", "out.mp4")
     assert static_argv[:8] == frozen[:8], "输入侧（含 `-an`）必须逐字相同"
     assert frozen[8:10] == ["-vf", "fps=12,scale='trunc(min(640,iw)/2)*2':-2:flags=lanczos"]
-    assert static_argv[8:10] == ["-vf", "scale='trunc(min(640,iw)/2)*2':-2:flags=lanczos"]
-    assert "-r" not in frozen
-    after_vf_static = static_argv[10:]
-    assert after_vf_static == [
-        "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
-        "-threads", "1", "-r", "1", "-movflags", "+faststart", "-f", "mp4", "out.mp4",
+    assert static_argv[8:10] == [
+        "-vf",
+        "tpad=stop_mode=clone:stop_duration=1,fps=12,"
+        "scale='trunc(min(640,iw)/2)*2':-2:flags=lanczos",
     ]
-    # 按位置摘掉插入的 `-r 1` 这一对之后，编码参数与冻结 argv 逐字相同
-    #（注意 `-threads 1` 的值也是字符串 "1"，所以只能按位置摘，不能按值过滤）
-    at_r = after_vf_static.index("-r")
-    assert after_vf_static[at_r + 1] == "1"
-    assert after_vf_static[:at_r] + after_vf_static[at_r + 2 :] == frozen[10:]
+    assert static_argv[10:] == frozen[10:], "滤镜之后的编码参数与冻结 argv 逐字相同"
+    assert "-r" not in frozen
 
 
 @pytest.mark.asyncio
@@ -1232,7 +1240,7 @@ async def test_short_delay_static_gif_is_accepted_and_marked_static(
     assert payload["ok"] is True, payload
     assert payload["kind"] == "video"
     # F2-R：信封里的时长是**产物真实时长**（1.0 s），不是 1/12 s 也不是 0.0
-    assert payload["duration_s"] == pytest.approx(1.0, abs=0.05)
+    assert 1.0 <= payload["duration_s"] <= 1.1, payload["duration_s"]
     assert "source:gif" in payload["notes"]
     assert "gif_static" in payload["notes"]
     assert any(note.startswith("gif_converted:") for note in payload["notes"])

@@ -62,10 +62,13 @@ v0.3 的 `File` + `.gif` 已经"进链"了，但是错的那种：`_classify_fil
 修法（**多帧的冻结 argv、错误码、notes 词表都不动**）：
 - 闸④ 的时长一侧分档：**有视频流但没有可度量时长** ⇒ 按 `0.0` 放行（唯一放行口，写一行 LOG）；
   `ffprobe` 真坏 / 探不出流 ⇒ 仍 `GIF_CONVERT_FAILED`。
-- **单帧源走「1 s 静止变体」**（`gif_static_argv`）：**去掉 `fps` 取样、输出 `-r 1`**，其余参数
-  与冻结 argv 逐字相同 ⇒ 恰好 1 帧 / **1.0 s** 的 mp4。实测四档（`delay_cs` 0 / 4 / 10 与真
-  `ffmpeg -frames:v 1` 造的静态 GIF）统一 `1 流 / duration=1.000000`；**多帧源仍用冻结
-  `gif_argv`**（静止变体不按帧率取样，4 帧会被压成 2 帧）。
+- **单帧源走「1 s + 12 fps 克隆帧」的静止变体**（`gif_static_argv`）：滤镜改成
+  `tpad=stop_mode=clone:stop_duration=1,fps=12,scale='trunc(min(640,iw)/2)*2':-2`
+  —— 先 `tpad` 把唯一一帧**克隆成 1 s**，再 `fps=12` 均匀取样 ⇒ **12–13 帧 / 1.00–1.08 s**
+  的 mp4（真 ffmpeg 实测 `delay_cs` 0 / 4 / 10 ⇒ 13 / 12 / 13 帧、1.08 / 1.00 / 1.08 s、1 流）。
+  **`-r 1` 与 `-r 12` 都不行**（F2-S）：前者得到 1 帧 ⇒ 原生空文本 + 抽帧 0/6 ⇒
+  `FRAME_EXTRACT_FAILED`；后者输出帧率**不复制帧**、仍 1 帧 / 0.083 s。
+  **多帧源仍用冻结 `gif_argv`**（`tpad` 只该给"只有一帧"的源补帧；对多帧源会多造 1 s 尾巴）。
 - **为什么**不再用"抬 GCE 保持时长 + 重试"（v0.4 早期做法，本版**删除** `prepare_static_gif_copy`
   / `gif_gce_delay` / `_gif_retry_single_frame` 与两个 `GIF_STATIC_*` 常量）：那套只对**有 GCE**
   的源可用，而 `ffmpeg -frames:v 1` 之外的老式图（GIF87a）**连 GCE 都没有**；且 0.083 s 的

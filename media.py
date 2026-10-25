@@ -1057,18 +1057,30 @@ def gif_argv(source: str, out_path: str) -> list[str]:
 
 
 def gif_static_argv(source: str, out_path: str) -> list[str]:
-    """**单帧 GIF** 的静止变体 argv：不套 `fps` 滤镜，输出 `-r 1`（`SPEC-v0.4 §5.6` 的邻接面）。
+    """**单帧 GIF** 的静止变体 argv：先 `tpad` 克隆出 1 s，再按 `fps=12` 取样（§5.6 的邻接面）。
 
-    为什么单帧要单独一条 argv（真机 F2 / F2-R 的最终修法）：
+    为什么单帧要单独一条 argv（真机 F2 / F2-R / F2-S 的最终修法）：
     - 冻结 argv 里的 `fps=12` 按输出帧间隔的**中点**取帧，源帧只保持 0.04 s 时**整帧被跳过**
       ⇒ 产物是 262 字节、**0 个流**的空 mp4（`ffmpeg -frames:v 1` 造的静态 GIF 正是 0.04 s）；
-    - 就算勉强产出 1 帧，0.083 s 的产物也会被上游视频通道 **400 拒收**。
-    单帧源没有帧率可言 —— 去掉 `fps` 采样、直接 `-r 1` 输出，得到**恰好 1 帧 / 1.0 s** 的 mp4：
-    真 ffmpeg 实测 `delay_cs=0 / 4 / 10` 三档全部 `1 流 / duration=1.000000`。
+    - 就算勉强产出 1 帧（早先的 `-r 1` 写法），0.083 s 的产物会被上游视频通道 **400 拒收**；
+    - 而 1 s 但**只有 1 帧**的产物（`-r 1` 的真实结果）在原生通道上会回**空文本**、回退抽帧
+      又抽不满（0/6）⇒ `FRAME_EXTRACT_FAILED`（t12 的 F2-S 实测）。
+      `-r 12` 也救不了：输出帧率**不复制帧**，实测仍 1 帧 / 0.083 s。
 
-    与 `gif_argv` 的差别**只有两处**：没有 `fps=12`、多了 `-r 1`；其余（`-an`、偶数宽 `scale`、
-    `yuv420p`、libx264 veryfast / crf 26、`-threads 1`、`+faststart`、`-f mp4`）逐字相同。
-    **多帧源仍然用 `gif_argv`**：静止变体不按帧率取样，多帧会被压成 2 帧（实测 4 帧 2.0 s）。
+    解法是**先把帧克隆出来**再交给 `fps`：`tpad=stop_mode=clone:stop_duration=1` 把唯一一帧
+    延展到 1 s，`fps=12` 便能均匀取到 **12–13 帧**。真 ffmpeg 实测（320x240 单帧）：
+
+    | 源 `delay_cs` | 产物 | 流 | `nb_read_frames` | `duration` |
+    | --- | --- | --- | --- | --- |
+    | 0（GCE-less） | 23,768 B | 1 | **13** | **1.0833 s** |
+    | 4（0.04 s） | 23,735 B | 1 | **12** | **1.0000 s** |
+    | 10（0.1 s） | 23,768 B | 1 | **13** | **1.0833 s** |
+
+    与 `gif_argv` 的差别**只在滤镜**（多一个 `tpad` 前置）；其余（`-an`、偶数宽 `scale`、
+    `yuv420p`、libx264 veryfast / crf 26、`-threads 1`、`+faststart`、`-f mp4`）逐字相同，
+    也**不再**需要 `-r 1`。
+    **多帧源仍然用 `gif_argv`**：`tpad` 是给"只有一帧"的源补帧的，对多帧源只会多造 1 s 尾巴
+    （实测 4 帧 10 cs ⇒ 17 帧 / 1.4167 s），而且帧率取样会丢帧。
     """
     return [
         "ffmpeg",
@@ -1080,6 +1092,8 @@ def gif_static_argv(source: str, out_path: str) -> list[str]:
         source,
         "-an",
         "-vf",
+        "tpad=stop_mode=clone:stop_duration=1,"
+        f"fps={GIF_MAX_FPS},"
         f"scale='trunc(min({GIF_MAX_WIDTH_PX},iw)/2)*2':-2:flags=lanczos",
         "-pix_fmt",
         "yuv420p",
@@ -1090,8 +1104,6 @@ def gif_static_argv(source: str, out_path: str) -> list[str]:
         "-crf",
         str(GIF_CRF),
         "-threads",
-        "1",
-        "-r",
         "1",
         "-movflags",
         "+faststart",
