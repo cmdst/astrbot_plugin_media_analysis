@@ -589,8 +589,12 @@ def test_configview_flag_accepts_only_real_booleans(monkeypatch: pytest.MonkeyPa
     assert log.records == []
 
 
-def test_main_settings_assembles_all_twenty_one_keys() -> None:
-    """`main._settings()` 的 21 个字段都能从一份配置里取到（含钳位与去空白）。"""
+def test_main_settings_assembles_all_twenty_two_keys() -> None:
+    """`main._settings()` 的 22 个字段都能从一份配置里取到（含钳位、去空白与枚举归一）。
+
+    v0.4.2 把第 22 个键（`background.mode`）也塞进同一份快照：这里显式传 `core` 并要求
+    原样读回 —— 只断言"默认值恰好是 plugin"是不够的（那字段不读配置也能过）。
+    """
     plugin = main.MediaAnalysisPlugin(
         context=None,
         config={
@@ -617,6 +621,7 @@ def test_main_settings_assembles_all_twenty_one_keys() -> None:
             },
             "limits": {"max_media_seconds": 1, "max_frames": 99, "max_media_bytes": 1},
             "cache": {"ttl_seconds": -5},
+            "background": {"mode": "core"},
         },
     )
     snapshot = plugin._settings()
@@ -640,6 +645,7 @@ def test_main_settings_assembles_all_twenty_one_keys() -> None:
         prompt_summary="S{material}",
         prompt_video_native="N{focus_clause}",
         cache_ttl_seconds=settings.MIN_CACHE_TTL_SECONDS,
+        background_mode=settings.MODE_CORE,
     )
     # 未给的键回空串（`prompts.video` / `prompts.frame` 没配）
     assert snapshot.prompt_video == "" and snapshot.prompt_frame == ""

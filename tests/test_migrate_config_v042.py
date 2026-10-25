@@ -372,6 +372,46 @@ def test_bom_prefixed_config_is_readable(tmp_path: Path, capsys) -> None:
     assert written["background"]["mode"] == "plugin"
 
 
+def test_bom_config_apply_keeps_every_value_and_rollback_restores_the_bytes(
+    tmp_path: Path, capsys
+) -> None:
+    """BOM 配置的**值**保证：干跑不写、`--apply` 只多一个键、`--rollback` 逐字节还原。
+
+    BOM 本身不是契约的一部分（核心读 `utf-8-sig`；v0.2 遗留 F3 登记过"`--apply` 会丢
+    BOM"）。真正必须守住的是**值**：用户已有的 21 个键一个都不许被改写 —— 这里用
+    "删掉新键后与原 dict 全等"来钉（强于抽查几个键），再用备份的逐字节比对把回滚锚点
+    钉住（备份里连 BOM 都原样保留）。
+    """
+    original = b"\xef\xbb\xbf" + json.dumps(
+        _V041_CONFIG, ensure_ascii=False, indent=2
+    ).encode("utf-8")
+    root = tmp_path / "astrbot_root"
+    path = root / _CFG_REL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(original)
+    before = json.loads(original.decode("utf-8-sig"))
+
+    code, out, _err = _run(capsys, "--root", str(root))  # 干跑
+    assert code == 0 and "changed=1" in out
+    assert path.read_bytes() == original, "干跑必须一个字节都不写"
+
+    code, out, _err = _run(capsys, "--root", str(root), "--apply")
+    assert code == 0 and "changed=1" in out
+    assert "background" not in before, "这份 v0.4.1 形态的夹具本来就没有新组"
+    after = json.loads(path.read_text(encoding="utf-8-sig"))
+    assert after["background"] == {"mode": "plugin"}, "新键必须补上默认值"
+    after.pop("background")
+    assert after == before, "既有 21 键的值被改写了"
+
+    backups = _backups(root)
+    assert len(backups) == 1, backups
+    assert backups[0].read_bytes() == original, "备份必须是逐字节原文（含 BOM）"
+
+    code, out, _err = _run(capsys, "--rollback", str(backups[0]))
+    assert code == 0, out
+    assert path.read_bytes() == original, "回滚必须逐字节还原（含 BOM）"
+
+
 def test_missing_root_and_env_is_an_error(tmp_path: Path, monkeypatch, capsys) -> None:
     monkeypatch.delenv("ASTRBOT_ROOT", raising=False)
     code, _out, err = _run(capsys)
