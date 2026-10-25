@@ -48,33 +48,36 @@ v0.3 的 `File` + `.gif` 已经"进链"了，但是错的那种：`_classify_fil
 `Image` + `.gif` 更糟：被判成 `kind=audio`（`has_audio=True`）。
 本版两者一并修掉：**所有 GIF 一律先归一成 mp4**，从不把原始 GIF 字节送给模型。
 
-### ②b 修复（真机 F2，medium）：单帧 GIF 的"唯一一帧被 fps 网格吃掉"
+### ②b 修复（真机 F2 / F2-R，medium）：单帧 GIF 改走「1 s 静止变体」
 
 `VERIFY-v0.4.md` §12-F2 报的现象是"单帧 GIF（源帧保持 0.04 s，即 `ffmpeg -frames:v 1` 的默认值）
-归一后 `format.duration=N/A` ⇒ 用户看到 `GIF_CONVERT_FAILED`"。追到根因是**两件事**：
+归一后 `format.duration=N/A` ⇒ 用户看到 `GIF_CONVERT_FAILED`"；t8 复验又发现"即便出 1 帧，
+0.083 s 的产物也被上游 **400 拒收**"。根因是**两件事**：
 
 1. 冻结 argv 里的 `fps=12` 按输出帧间隔的**中点**取帧（实测边界 = 0.0417 s）⇒ 源帧只保持
    0.04 s 时**整帧被跳过**，产物是 **262 字节、0 个流**的空 mp4（不是"有时长读不出"，
    而是"根本没有流"）；
 2. `normalize_gif` 的闸④把"产物时长读不出来"一律当失败。
 
-修法（**不改 argv、不改错误码、不改 notes 词表**）：
+修法（**多帧的冻结 argv、错误码、notes 词表都不动**）：
 - 闸④ 的时长一侧分档：**有视频流但没有可度量时长** ⇒ 按 `0.0` 放行（唯一放行口，写一行 LOG）；
   `ffprobe` 真坏 / 探不出流 ⇒ 仍 `GIF_CONVERT_FAILED`。
-- **单帧源**遇到"0 流产物"时，把**一份拷贝**的 GCE 保持时长抬到 **1.0 s**
-  （`GIF_STATIC_HOLD_CS=100`；只改 2 字节，源文件只读），用**同一份 argv** 重试**一次**；
-  重试仍失败 ⇒ `GIF_CONVERT_FAILED`。单帧源的保持时长与画面/帧数无关 ⇒ 语义恒等；
-  多帧 GIF 一律不碰。
+- **单帧源走「1 s 静止变体」**（`gif_static_argv`）：**去掉 `fps` 取样、输出 `-r 1`**，其余参数
+  与冻结 argv 逐字相同 ⇒ 恰好 1 帧 / **1.0 s** 的 mp4。实测四档（`delay_cs` 0 / 4 / 10 与真
+  `ffmpeg -frames:v 1` 造的静态 GIF）统一 `1 流 / duration=1.000000`；**多帧源仍用冻结
+  `gif_argv`**（静止变体不按帧率取样，4 帧会被压成 2 帧）。
+- **为什么**不再用"抬 GCE 保持时长 + 重试"（v0.4 早期做法，本版**删除** `prepare_static_gif_copy`
+  / `gif_gce_delay` / `_gif_retry_single_frame` 与两个 `GIF_STATIC_*` 常量）：那套只对**有 GCE**
+  的源可用，而 `ffmpeg -frames:v 1` 之外的老式图（GIF87a）**连 GCE 都没有**；且 0.083 s 的
+  产物必须抬到 1 s 才能过上游。静止变体不改用户字节、不要第二次 ffmpeg，对全部单帧形态一步到位。
 - **修复 R1（评审 medium，v0.4 回归）**：远程 `Image`（只有 URL、无本地文件）的 GIF 候选
   以前回落核心 `Image.convert_to_file_path()` ⇒ **无字节上限**地下到
   `<ASTRBOT_ROOT>/data/temp/media_image_*.gif`、绕过 `limits.max_media_bytes`、调用后残留。
   现在改走插件自己的 `download_bounded`（边读边数、超限 `MEDIA_TOO_LARGE`、只落本任务的
   `/tmp` 工作目录并随 `finally` 删除），**不再回落** `convert_to_file_path()`；
   非 GIF 的 `Image` 与 `Video` 分支不变。
-- **为什么抬到 1.0 s 而不是 1/12 s（F2-R，t8 复验）**：0.083 s 的产物会被上游视频通道
-  直接 **400 拒收**（Gemini `BadRequestError`，两次独立复现），1.0 s 的同一份画面可正常受理。
-  "能不能过 `fps` 网格"（触发阈值 9 cs）与"能不能被上游读"（抬到 100 cs）是**两个**常量，
-  刻意不合并。`include_frames=false` 且原生返回空文本仍按设计失败（`VIDEO_FAILED`，不抽帧）。
+- `include_frames=false` 且原生返回空文本仍按设计失败（`VIDEO_FAILED`，不抽帧、不回退成
+  "原始 GIF 直送"）；`auto` 下按既有回退链抽帧。
 
 ### ③ 工具调用改为后台异步（受理即返回 + 唯一投递）
 

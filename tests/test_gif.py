@@ -773,183 +773,146 @@ async def test_normalize_gif_single_frame_is_static(tmp_path) -> None:
 
     assert result.frames == 1
     assert result.static is True
-    assert result.duration_s > 0  # 12 fps ⇒ 约 0.08 s
+    # 静止变体：`-r 1` ⇒ 恰好 1 帧 / 1.0 s（不是 12 fps 网格的 0.083 s）
+    assert result.duration_s == pytest.approx(1.0, abs=0.05)
     assert "mp4" in _probe(result.path)["format_name"]
+    assert await media.probe_streams(result.path) == (False, True)
 
 
 @pytest.mark.asyncio
-async def test_single_frame_short_delay_gif_is_retried_into_a_real_mp4(tmp_path) -> None:
-    """**F2（medium）**：单帧 GIF 的保持时长 < 1/12 s ⇒ 冻结 argv 产 **0 流空 mp4** ⇒ 重试一次。
+async def test_single_frame_short_delay_gif_uses_the_static_variant(tmp_path) -> None:
+    """**F2 / F2-R（medium）**：单帧 GIF 走**静止变体**，`delay_cs=4` 也得到 1 帧 / 1.0 s 的 mp4。
 
-    真机（`VERIFY-v0.4.md` §12-F2）报的是"产物 `format.duration=N/A` 被误判
-    `GIF_CONVERT_FAILED`"；本用例把**根因**钉成可执行事实：先证明同一份 argv 跑在源上
-    确实只得到 262 字节、**一个流都没有**的空容器（`fps=12` 按输出帧间隔中点取帧，源帧
-    只有 0.04 s ⇒ 唯一一帧被跳过），再断言 `normalize_gif` 会抬高保持时长重试并成功。
+    先把**根因**钉成可执行事实：同一份源用冻结 `gif_argv`（`fps=12`）直接跑 ⇒ 容器正常但
+    **一个流都没有**（`fps` 按输出帧间隔中点取样，0.04 s 的唯一一帧被整帧跳过）。
+    再断言 `normalize_gif` 会按帧数选 `gif_static_argv`（不取样 + `-r 1`）⇒ 1 流 / 1.0 s。
 
-    修法刻意**不动冻结 argv**（SPEC §5.4/§5.6 的 argv 有逐字符快照）：只在一份**拷贝**上
-    改 GCE 的 2 字节 delay，源文件只读。
+    变异守卫：若单帧错误地继续走冻结 argv ⇒ 产物 0 流 ⇒ 本用例红（真机 F2 的原形态）。
     """
     _require_ffmpeg()
     source = write_gif(tmp_path / "f2.gif", width=200, height=150, frames=1, delay_cs=4)
     original = source.read_bytes()
 
-    # ① 根因证据：冻结 argv 直接跑源 ⇒ 容器正常但**没有任何流**
+    # ① 根因：冻结 argv（fps=12）直接跑源 ⇒ 容器是 mp4、但**没有任何流**
     naive = tmp_path / "naive.mp4"
     proc = subprocess.run(media.gif_argv(str(source), str(naive)), capture_output=True)
     assert proc.returncode == 0, proc.stderr
-    naive_info = _probe(str(naive))
-    assert "codec_type" not in naive_info, naive_info  # 0 个流
+    assert "codec_type" not in _probe(str(naive)), _probe(str(naive))
     assert naive.stat().st_size < 1024, naive.stat().st_size
 
-    # ② 归一：抬高保持时长重试一次 ⇒ 真 mp4（1 帧 @12 fps）
+    # ② 静止变体：1 流 / 1.0 s / 1 帧
     result = await media.normalize_gif(
         str(source), workdir=str(tmp_path), max_media_bytes=1 << 20
     )
-    assert result.size > 0
     assert result.frames == 1 and result.static is True
-    # F2-R：抬到 1.0 s（不是 1/12 s）—— 0.083 s 的产物会被上游视频通道 400 拒收
-    assert result.duration_s == pytest.approx(media.GIF_STATIC_HOLD_CS / 100.0, abs=0.1)
-    assert result.duration_s >= 0.5, "必须明显高于上游最小可读时长（≈1 s）"
+    assert result.duration_s == pytest.approx(1.0, abs=0.05)
     assert await media.probe_streams(result.path) == (False, True)
-    # 重试用的拷贝已清掉、源只读（SPEC §5.8）
-    assert not (tmp_path / "gif_static.gif").exists()
-    assert source.read_bytes() == original
-
-
-def test_prepare_static_gif_copy_patches_only_the_delay_field(tmp_path) -> None:
-    """`prepare_static_gif_copy` 的粒度：**只改 GCE 的 2 字节**，且三种情形不动手。
-
-    这条守的是"修法最小"：如果哪天有人改成重编码/改 argv/改源文件，这里会红。
-    同时钉住 **F2-R 的双数纪律**：触发阈值（9 cs，由 fps 网格决定）与"抬到多少"
-    （100 cs = 1.0 s，由上游最小可读时长决定）是**两个**常量，不能合并、不能一起改大。
-    """
-    assert media.GIF_STATIC_MIN_DELAY_CS == 9, "触发阈值只由 fps 网格决定，不许为凑上游时长改大"
-    assert media.GIF_STATIC_HOLD_CS == 100, "单帧重试写入的保持时长 = 1.00 s（上游可读）"
-    source = write_gif(tmp_path / "short.gif", width=20, height=20, frames=1, delay_cs=4)
-    found = media.gif_gce_delay(source.read_bytes())
-    assert found is not None
-    offset, delay = found
-    assert delay == 4
-
-    dest = tmp_path / "patched.gif"
-    assert media.prepare_static_gif_copy(str(source), str(dest)) is True
-
-    before, after = source.read_bytes(), dest.read_bytes()
-    assert len(before) == len(after)
-    diff = [i for i, (x, y) in enumerate(zip(before, after)) if x != y]
-    assert diff == [offset], (diff, offset)  # 高字节本来就是 0，只动低字节
-    # 写进去的是"抬到多少"（`GIF_STATIC_HOLD_CS` = 1.00 s），不是触发阈值（9 cs）
-    assert after[offset] == media.GIF_STATIC_HOLD_CS
-    assert source.read_bytes() == before, "源文件必须只读"
-
-    # ① 已经够长的保持时长 ⇒ 不动手（不然会无谓改用户字节）
-    long = write_gif(tmp_path / "long.gif", width=20, height=20, frames=1, delay_cs=10)
-    assert media.prepare_static_gif_copy(str(long), str(tmp_path / "long2.gif")) is False
-    # ② 没有 GCE 的 GIF87a（delay 0）⇒ 不动手（它本来就能正常归一）
-    no_gce = write_gif(tmp_path / "nogce.gif", width=20, height=20, frames=1, delay_cs=0)
-    assert media.gif_gce_delay(no_gce.read_bytes()) is None
-    assert media.prepare_static_gif_copy(str(no_gce), str(tmp_path / "nogce2.gif")) is False
-    # ③ 不是 GIF ⇒ 不动手
-    junk = tmp_path / "junk.bin"
-    junk.write_bytes(b"not a gif at all")
-    assert media.prepare_static_gif_copy(str(junk), str(tmp_path / "junk2.gif")) is False
-
-
-# --------------------------------------------------------------------------- #
-# F2 的"最小修法"守卫：**只对单帧**、**只重试一次**（t7 变异检验补的两条）
-# --------------------------------------------------------------------------- #
-@pytest.mark.asyncio
-async def test_gif_retry_only_fires_for_single_frame_sources(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
-) -> None:
-    """条件①：产物 0 流时，**多帧源绝不许触发**保时长重试（改输入只对单帧成立）。
-
-    为什么多帧必须拦住：抬高 GCE 保持时长对单帧源是**语义恒等**（那张静态图被展示多久
-    与画面/帧数无关）；对多帧源它会改变**每一帧的时长** ⇒ 等于篡改用户动图的节奏。
-    所以 `_gif_retry_single_frame` 的第一行就是 `frames != 1 ⇒ 直接失败`。
-
-    变异守卫（t7 实测的两个未捕获变异）：删掉 `frames != 1` 守卫 ⇒ `prepare_static_gif_copy`
-    被调用 ⇒ 本用例红；把重试加宽成"0 流就跑" ⇒ 同上。断言刻意用 **spy + 计数**，
-    不依赖 `log_detail` 的措辞（那正是 t7 用子串断言漏掉这条变异的根因）。
-    """
-    source = write_gif(tmp_path / "multi.gif", width=16, height=16, frames=4, delay_cs=4)
-    calls = _patch_convert(monkeypatch, duration=None, frames=4)
-
-    async def _no_streams(_path: str):
-        return False, False
-
-    prepared: list[tuple[str, str]] = []
-
-    def _spy_prepare(src: str, dest: str) -> bool:
-        # 若守卫被删，这里会真的被调到；返回 True 让"多帧也重试"这条路走通（更狠）
-        prepared.append((src, dest))
-        return True
-
-    monkeypatch.setattr(media, "probe_streams", _no_streams)
-    monkeypatch.setattr(media, "prepare_static_gif_copy", _spy_prepare)
-
-    with pytest.raises(envelope.ToolError) as exc_info:
-        await media.normalize_gif(
-            str(source), workdir=str(tmp_path), max_media_bytes=1 << 20
-        )
-
-    assert _code(exc_info) == envelope.ERR_GIF_CONVERT_FAILED
-    assert prepared == [], f"多帧源不许触发保时长重试：{prepared}"
-    assert calls["run_capture"] == 1, (
-        f"多帧源只该跑 1 次 ffmpeg（首轮），实际 {calls['run_capture']} 次"
-    )
-    assert not (tmp_path / "gif_static.gif").exists()
-    assert not (tmp_path / "gif.mp4").exists(), "失败必须 unlink 半成品"
+    assert source.read_bytes() == original, "源文件只读"
 
 
 @pytest.mark.asyncio
-async def test_gif_retry_runs_exactly_once(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
-) -> None:
-    """条件①：**只重试一次**。首轮与重试都 0 流 ⇒ 恰好 2 次 ffmpeg，然后失败。
+async def test_static_gif_variant_covers_every_single_frame_shape(tmp_path) -> None:
+    """静止变体覆盖**全部**单帧形态：`delay_cs=0`（无 GCE）/ 4（0.04 s）/ 10（0.1 s）。
 
-    为什么钉"恰好一次"：重试是**补救**不是重试策略。第 3 次、第 4 次只会在同一个确定性
-    输入上重复同样的空产物（白花 CPU、把 30 s 的预算碎成一堆 10 s 超时），而且违背
-    "失败要可见、不要磨"的口径。守卫是终态断言（不是措辞断言）：
-
-    | 变异 | 期望 |
-    | --- | --- |
-    | 重试跑两次（复制一行） | `run_capture == 3` ⇒ 红 |
-    | 重试被加成循环/退避 | 同上 ⇒ 红 |
-    | 只在单帧才重试（当前实现） | `run_capture == 2` ⇒ 绿 |
-
-    另外钉两件事：拷贝**只准备一次**（不能每轮都重新拷/改源），以及重试失败仍走
-    `GIF_CONVERT_FAILED` 且不留残渣。
+    这三档在冻结 argv 下分别是"能出 1 帧但只有 0.083 s"（0 / 10）与"0 流空容器"（4），
+    而上游对 0.083 s 的产物直接 400。静止变体让三档统一成 **1 流 / 1.0 s**。
     """
-    source = write_gif(tmp_path / "short.gif", width=16, height=16, frames=1, delay_cs=4)
-    calls = _patch_convert(monkeypatch, duration=None, frames=1)
-
-    async def _no_streams(_path: str):
-        return False, False
-
-    real_prepare = media.prepare_static_gif_copy
-    prepared: list[str] = []
-
-    def _spy_prepare(src: str, dest: str) -> bool:
-        prepared.append(dest)
-        return real_prepare(src, dest)
-
-    monkeypatch.setattr(media, "probe_streams", _no_streams)
-    monkeypatch.setattr(media, "prepare_static_gif_copy", _spy_prepare)
-
-    with pytest.raises(envelope.ToolError) as exc_info:
-        await media.normalize_gif(
+    _require_ffmpeg()
+    for delay_cs in (0, 4, 10):
+        source = write_gif(
+            tmp_path / f"static_{delay_cs}.gif", width=120, height=90, frames=1, delay_cs=delay_cs
+        )
+        result = await media.normalize_gif(
             str(source), workdir=str(tmp_path), max_media_bytes=1 << 20
         )
+        assert result.frames == 1, delay_cs
+        assert result.static is True, delay_cs
+        assert result.duration_s == pytest.approx(1.0, abs=0.05), (delay_cs, result.duration_s)
+        assert await media.probe_streams(result.path) == (False, True), delay_cs
+        assert _probe(result.path)["nb_read_frames"] == "1", (delay_cs, _probe(result.path))
 
-    assert _code(exc_info) == envelope.ERR_GIF_CONVERT_FAILED
-    assert "retried output still has no video stream" in exc_info.value.log_detail
-    assert calls["run_capture"] == 2, (
-        f"首轮 + 1 次重试 = 2 次 ffmpeg，实际 {calls['run_capture']} 次"
-    )
-    assert len(prepared) == 1, f"拷贝只该准备 1 次，实际 {len(prepared)} 次：{prepared}"
-    assert not (tmp_path / "gif_static.gif").exists(), "重试用的拷贝必须被清掉"
-    assert not (tmp_path / "gif.mp4").exists(), "失败必须 unlink 半成品"
+
+def test_gif_static_argv_is_frozen_verbatim() -> None:
+    """静止变体 argv 逐字符快照：**不取样**（无 `fps=`）、`-r 1`，其余与冻结 argv 同参。"""
+    static_argv = media.gif_static_argv("in.gif", "out.mp4")
+    assert static_argv == [
+        "ffmpeg", "-nostdin", "-y", "-v", "error",
+        "-i", "in.gif",
+        "-an",
+        "-vf", "scale='trunc(min(640,iw)/2)*2':-2:flags=lanczos",
+        "-pix_fmt", "yuv420p",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+        "-threads", "1",
+        "-r", "1",
+        "-movflags", "+faststart",
+        "-f", "mp4", "out.mp4",
+    ]
+    # 与冻结 argv 的差别**只有两处**：滤镜里没有 `fps=12`、多了 `-r 1`
+    frozen = media.gif_argv("in.gif", "out.mp4")
+    assert static_argv[:8] == frozen[:8], "输入侧（含 `-an`）必须逐字相同"
+    assert frozen[8:10] == ["-vf", "fps=12,scale='trunc(min(640,iw)/2)*2':-2:flags=lanczos"]
+    assert static_argv[8:10] == ["-vf", "scale='trunc(min(640,iw)/2)*2':-2:flags=lanczos"]
+    assert "-r" not in frozen
+    after_vf_static = static_argv[10:]
+    assert after_vf_static == [
+        "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+        "-threads", "1", "-r", "1", "-movflags", "+faststart", "-f", "mp4", "out.mp4",
+    ]
+    # 按位置摘掉插入的 `-r 1` 这一对之后，编码参数与冻结 argv 逐字相同
+    #（注意 `-threads 1` 的值也是字符串 "1"，所以只能按位置摘，不能按值过滤）
+    at_r = after_vf_static.index("-r")
+    assert after_vf_static[at_r + 1] == "1"
+    assert after_vf_static[:at_r] + after_vf_static[at_r + 2 :] == frozen[10:]
+
+
+@pytest.mark.asyncio
+async def test_single_frame_uses_static_argv_multiframe_keeps_the_frozen_argv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """argv 分派的**唯一判据是帧数**：单帧 ⇒ 静止变体；多帧 ⇒ 冻结 argv（快照相等）。
+
+    多帧必须留在冻结 argv 上：静止变体不按帧率取样，4 帧会被压成 2 帧（实测 2.0 s）。
+    """
+    used: list[list[str]] = []
+    real_run_capture = media._run_capture
+
+    async def _spy(argv, *, timeout):
+        used.append(list(argv))
+        return await real_run_capture(argv, timeout=timeout)
+
+    monkeypatch.setattr(media, "_run_capture", _spy)
+    # 产物链路用桩（这里只关心"选了哪条 argv"，不跑真 ffmpeg）
+    async def _frame_count(_path: str) -> int:
+        return _frame_count.frames  # type: ignore[attr-defined]
+
+    async def _duration(_path: str) -> float:
+        return 1.0
+
+    async def _product(_path: str):
+        return False, True
+
+    monkeypatch.setattr(media, "gif_frame_count", _frame_count)
+    monkeypatch.setattr(media, "probe_duration_s", _duration)
+    monkeypatch.setattr(media, "probe_streams", _product)
+
+    async def _run_capture(argv, *, timeout):
+        used.append(list(argv))
+        with open(argv[-1], "wb") as handle:
+            handle.write(b"\x00\x00\x00\x18ftypisom" + b"\x00" * 32)
+        return 0, b"", False
+
+    monkeypatch.setattr(media, "_run_capture", _run_capture)
+
+    single = write_gif(tmp_path / "one.gif", width=20, height=20, frames=1, delay_cs=4)
+    multi = write_gif(tmp_path / "many.gif", width=20, height=20, frames=4, delay_cs=10)
+
+    _frame_count.frames = 1  # type: ignore[attr-defined]
+    await media.normalize_gif(str(single), workdir=str(tmp_path), max_media_bytes=1 << 20)
+    assert used[-1] == media.gif_static_argv(str(single), str(tmp_path / "gif.mp4"))
+
+    _frame_count.frames = 4  # type: ignore[attr-defined]
+    await media.normalize_gif(str(multi), workdir=str(tmp_path), max_media_bytes=1 << 20)
+    assert used[-1] == media.gif_argv(str(multi), str(tmp_path / "gif.mp4"))
 
 
 # --------------------------------------------------------------------------- #
@@ -1269,7 +1232,7 @@ async def test_short_delay_static_gif_is_accepted_and_marked_static(
     assert payload["ok"] is True, payload
     assert payload["kind"] == "video"
     # F2-R：信封里的时长是**产物真实时长**（1.0 s），不是 1/12 s 也不是 0.0
-    assert payload["duration_s"] == pytest.approx(media.GIF_STATIC_HOLD_CS / 100.0, abs=0.1)
+    assert payload["duration_s"] == pytest.approx(1.0, abs=0.05)
     assert "source:gif" in payload["notes"]
     assert "gif_static" in payload["notes"]
     assert any(note.startswith("gif_converted:") for note in payload["notes"])

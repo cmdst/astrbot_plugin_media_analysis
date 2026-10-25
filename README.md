@@ -52,17 +52,22 @@
   `-an` · `fps=12` · `scale='trunc(min(640,iw)/2)*2':-2` · `yuv420p` ·
   libx264 `veryfast` / `crf 26` · `-threads 1` · `+faststart` · `-f mp4`。
   **`trunc(.../2)*2` 必不可少**：奇数宽 + `yuv420p` + libx264 ⇒ `rc=187`、**0 字节产物**。
+  两条 argv：上面的冻结版给**多帧**源；**单帧**源用静止变体（`gif_static_argv`，同样的参数
+  但**没有 `fps`**、多一个 `-r 1`），见下一条。
 - **四道闸**：源字节（`limits.max_media_bytes`）/ 源时长（`limits.max_media_seconds`，
   复用源时长探测 `probe_gif_duration_s`）/ 整次 ffmpeg **≤ 10 s** / 产物非空、不超上限、
   **时长可度量**。失败码：体积 `MEDIA_TOO_LARGE`、时长 `MEDIA_TOO_LONG`、转换 `GIF_CONVERT_FAILED`。
-- **单帧 GIF 的保持时长会被"抬高一次"**（真机 F2/F2-R 的修法）：冻结 argv 的 `fps=12` 按输出
-  帧间隔的**中点**取帧，源帧只保持 **0.04 s**（`ffmpeg -frames:v 1` 的默认值，也就是绝大多数
-  静态 GIF）时**整帧被跳过** ⇒ 产物是 262 字节、**0 个流**的空 mp4。此时插件会把**一份拷贝**
-  的 GCE 保持时长抬到 **1.0 s**（`GIF_STATIC_HOLD_CS=100`；只改 2 字节、源文件只读），用
-  **同一份 argv** 重试**一次**：单帧源的保持时长与画面/帧数无关 ⇒ 语义恒等；多帧 GIF 一律不碰。
-  **为什么是 1 s 而不是 1/12 s**：0.083 s 的产物会被上游视频通道直接 **400 拒收**
-  （真机 F2-R，Gemini `BadRequestError`，两次独立复现），1.0 s 的同一份画面能被正常受理。
-  所以"能不能过 `fps` 网格"（触发阈值 9 cs）与"能不能被上游读"（抬到 100 cs）是**两个**数。
+- **单帧 GIF 走「1 s 静止变体」**（真机 F2/F2-R 的最终修法，`gif_static_argv`）：冻结 argv 的
+  `fps=12` 按输出帧间隔的**中点**取帧，源帧只保持 **0.04 s**（`ffmpeg -frames:v 1` 的默认值，
+  也就是绝大多数静态 GIF）时**整帧被跳过** ⇒ 产物是 262 字节、**0 个流**的空 mp4；即便侥幸
+  出 1 帧也只有 0.083 s，会被上游视频通道直接 **400 拒收**（Gemini `BadRequestError`，两次
+  独立复现）。单帧源**没有帧率可言**，所以给它一条专门 argv：**去掉 `fps` 取样、输出 `-r 1`**，
+  其余参数与冻结 argv 逐字相同 ⇒ **恰好 1 帧 / 1.0 s** 的 mp4。实测四档（`delay_cs` 0 / 4 / 10
+  与真 `ffmpeg -frames:v 1` 造的静态 GIF）统一 `1 流 / duration=1.000000`。
+  **多帧源仍然用冻结 argv**（静止变体不按帧率取样，4 帧会被压成 2 帧），`frames>1` 一字不动。
+  **为什么不"抬 GCE 保持时长再重试"**（v0.4 早期的做法，已删除）：那套只对**有 GCE** 的源可用，
+  而 `ffmpeg -frames:v 1` 之外的老式图（GIF87a，`/usr/share/doc/**` 里常见）**连 GCE 都没有**；
+  静止变体不改用户字节、不需要第二次 ffmpeg，对全部单帧形态一步到位。
   另有一档放行口：产物**有视频流但没有可度量时长** ⇒ 按 `0.0` 收（一行日志、不加 note）；
   `ffprobe` 真坏或产物连流都没有 ⇒ 仍旧 `GIF_CONVERT_FAILED`。
   **仍然按设计失败**：`include_frames=false` 且原生通道返回空文本 ⇒ `VIDEO_FAILED`（不抽帧、
