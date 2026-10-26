@@ -447,12 +447,38 @@ def test_plan_does_not_mutate_the_input_config() -> None:
     assert config == snapshot
 
 
+#: §2.2-A 的三条**改名**（字节 → MB）。只在这一处列，供"历史键表 vs 当前键表"的投影用。
+_RENAMES_V051: dict[str, str] = {
+    "video.max_direct_bytes": "video.max_direct_mb",
+    "video.compress_target_bytes": "video.compress_target_mb",
+    "limits.max_media_bytes": "limits.max_media_mb",
+}
+
+
+def _frozen_v042_keys() -> set[str]:
+    """`tools/migrate_config_v042.py:KEY_ORDER` —— **冻结的 22 键历史快照**（v0.4.2 口径）。"""
+    path = _TOOLS_DIR / "migrate_config_v042.py"
+    assert path.is_file(), f"v0.4.2 迁移器（冻结快照）不见了：{path}"
+    spec = importlib.util.spec_from_file_location("migrate_config_v042_snapshot", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return {key for key, _type in module.KEY_ORDER}
+
+
 def test_v02_key_order_is_the_frozen_eleven_keys() -> None:
     """v0.2 迁移器报告的 **11** 个键是**冻结**的（它承诺的是 v0.1→v0.2，不跟着新版本长）。
 
-    v0.3 的 21 键由 `tools/migrate_config_v03.py:KEY_ORDER` 负责（守卫在
-    `tests/test_migrate_config_v03.py` 与 `tests/test_config_map.py` 的四处一致里）。
-    这里只需要两条：① 11 条逐字不动；② 它们**都是**当前 21 键的子集（v0.3 没删没改名）。
+    v0.3/v0.4.2/v0.5.1 的键表各有自己的守卫（`tests/test_migrate_config_v03.py` /
+    `tests/test_migrate_config_v042.py` / `test_config_map.py` 的四处一致）。这里只要三条：
+
+    ① 11 条**逐字不动**（冻结元组描述的是历史，不是现状）；
+    ② 它们仍是 **v0.4.2 那份冻结 22 键快照**的逐字子集（两份历史之间没有删/改名）；
+    ③ 投影到 §2.2-A 的**改名表**之后，仍是**当前 21 键**的子集。
+
+    ⚠ ③ 为什么必须投影：v0.5.1 把 `limits.max_media_bytes` 改名成 `limits.max_media_mb`
+    （还有另外两个字节键）⇒ "v0.2 的键 ⊆ 当前键表"**这条旧断言在 v0.5.1 已不成立**。
+    不投影就等于要求"版本号升了、历史键名不许改"，与 §2.2-A 直接冲突。
     """
     frozen_v02 = {
         "provider_settings.audio_provider_id",
@@ -469,7 +495,19 @@ def test_v02_key_order_is_the_frozen_eleven_keys() -> None:
     }
     script_keys = {key for key, _type in migrator.KEY_ORDER}
     assert script_keys == frozen_v02, script_keys ^ frozen_v02
-    assert script_keys <= set(settings.KEY_MAP), "v0.2 的键在 v0.3 里被删/改名了"
+
+    # ② 历史 ↔ 历史：逐字子集（与 v0.5.1 的改名无关，永远成立）
+    missing_in_v042 = script_keys - _frozen_v042_keys()
+    assert not missing_in_v042, f"v0.2 的键在 v0.4.2 快照里不见了：{sorted(missing_in_v042)}"
+
+    # ③ 历史 → 现状：先按改名表投影，再比子集
+    projected = {_RENAMES_V051.get(key, key) for key in script_keys}
+    leftover = projected - set(settings.KEY_MAP)
+    assert not leftover, f"v0.2 的键经 §2.2-A 改名表投影后仍不在当前键表里：{sorted(leftover)}"
+
+    # 反向：改名表里的**旧名**一个都不许还躺在当前键表里（否则核心会把它当 stale 删并落盘）
+    still_there = set(_RENAMES_V051) & set(settings.KEY_MAP)
+    assert not still_there, f"旧字节键还留在当前键表里：{sorted(still_there)}"
 
 
 def test_legacy_key_is_present_and_never_removed() -> None:

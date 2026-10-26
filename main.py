@@ -10,22 +10,26 @@
 2. `Star.__init__` **不保存** `config`（`star/base.py:26-29`）⇒ 自己存。
 3. 工具方法**只挂** `@filter.llm_tool`：叠加 `@filter.permission_type` 会让它被当成
    消息处理器，权限不符就丢用户消息（AGENTS §3 装饰器纪律）。
-4. `_settings()` 是**唯一配置读取点**，22 个键逐条显式读（`settings.KEY_MAP` ↔
-   `_conf_schema.json` ↔ 迁移器 `KEY_ORDER` ↔ 这里四方一致）。漏一个键 ＝ 生产链路上
-   **静默丢弃**设置。
+4. `_settings()` 是**唯一配置读取点**，21 个键逐条显式读（`settings.KEY_MAP` ↔
+   `_conf_schema.json` ↔ 迁移器 `migrate_config_v05.py:KEY_ORDER` ↔ 这里四方一致）。
+   漏一个键 ＝ 生产链路上**静默丢弃**设置（SPEC-v0.5.1 §10）。
+5. **加载期一致性告警**（`_config_check`，SPEC-v0.5.1 §8.1）与**静默读 provider**
+   （`_silent_provider`，§8.2）都在本文件：前者只 WARN 不改配置，后者替代
+   `context.get_provider_by_id()` 以消掉冷启动的 `Provider … was not found` 噪声。
 """
 
 from __future__ import annotations
 
 import asyncio
 import re
+import time
 import traceback
 
 from astrbot.api import AstrBotConfig, logger as LOG
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 
-from . import analyze, background, cache, core_mode, envelope, media, settings
+from . import analyze, background, cache, core_mode, envelope, media, settings, video_native
 
 # --------------------------------------------------------------------------- #
 # 核心**内部面**加固（`error_redaction` 不在 `astrbot.api.*` 的公开导出里）。
@@ -88,6 +92,73 @@ def _as_mode(value: object) -> str:
     return mode
 
 
+def _native_timeout_s() -> float:
+    """原生视频单次调用的**生效上限**（该配置键已在 v0.5.1 删除，值进 `analyze` 常量）。
+
+    唯一事实源是运行面的 `analyze.NATIVE_TIMEOUT_S`（SPEC-v0.5.1 §2.2-B）；`settings`
+    里那份是**配置面的镜像**（`tests/test_config_map.py` 钉相等），只在这份常量尚未
+    落地时兜底 —— 一个 `ready` 行字段**不许**让插件加载失败。
+    """
+    value = getattr(analyze, "NATIVE_TIMEOUT_S", None)
+    return float(settings.NATIVE_TIMEOUT_S if value is None else value)
+
+
+def _silent_provider(context, provider_id: str):
+    """只读注册表取 provider，**不触发核心告警**（SPEC-v0.5.1 §8.2，修启动期噪声）。
+
+    为什么不能用 `context.get_provider_by_id()`：它在目标缺失时**自己**打一条
+    `logger.warning("Provider <id> was not found. …")`（`star/context.py:466`），而
+    冷启动时插件先于 provider 注册 ⇒ 每次冷启动一条噪声（生产实测 02:03:05 / 02:38:03；
+    重载那次 0 条）。加载期**禁止**调用任何"目标缺失就打 WARN"的核心 API，改为静默读注册表；
+    取不到就 `None`（fail-open：允许把检查顺延到首次调用）。
+
+    任何异常都吞掉 ⇒ 本函数**永不抛**（它在一个日志字段的路径上）。
+    """
+    try:
+        manager = getattr(context, "provider_manager", None)
+        inst_map = getattr(manager, "inst_map", None)
+        if not isinstance(inst_map, dict):
+            return None
+        return inst_map.get(str(provider_id))
+    except BaseException:  # noqa: BLE001 —— 读注册表失败绝不影响加载
+        return None
+
+
+def _elapsed_ms(started: float) -> int:
+    """受理期耗时的毫秒数（只给 `stage=accept` 的 `route=` 行用；实测 0–2 ms）。"""
+    return int((time.monotonic() - started) * 1000)
+
+
+def _provider_model(provider) -> str:
+    """从 provider 实例上取模型名（`provider_config["model"]` → `get_model()` → `""`）。"""
+    try:
+        config = getattr(provider, "provider_config", None)
+        if isinstance(config, dict):
+            model = str(config.get("model") or "")
+            if model:
+                return model
+        getter = getattr(provider, "get_model", None)
+        return str(getter()) if callable(getter) else ""
+    except BaseException:  # noqa: BLE001
+        return ""
+
+
+#: 加载期一致性告警的**去重集合**（SPEC-v0.5.1 §8.1：每个 id 每进程**至多**一条 WARNING）。
+#: 测试可以 `main._CONFIG_CHECK_DONE.clear()` 复现（本模块不提供别的重置入口）。
+_CONFIG_CHECK_DONE: set[str] = set()
+
+
+def _warn_config_once(check_id: str, template: str, *args: object) -> None:
+    """打一条 `media_analysis: config-check warn=<id> …`（WARNING，每 id 每进程至多一次）。
+
+    **只告警，不改用户配置**（SPEC-v0.5.1 §8）：配置是运营方的资产，插件只报告怀疑。
+    """
+    if check_id in _CONFIG_CHECK_DONE:
+        return
+    _CONFIG_CHECK_DONE.add(check_id)
+    LOG.warning("media_analysis: config-check warn=%s " + template, check_id, *args)
+
+
 class MediaAnalysisPlugin(Star):
     """`media_analyze` 工具的唯一实现体。"""
 
@@ -111,10 +182,14 @@ class MediaAnalysisPlugin(Star):
         摘要行只打 **provider id 与数字**（provider id 是配置值不是凭据）；
         弃用键 `stt_provider_id` 只"是否非空"，**不打值**。
 
+        v0.5.1 起 `ready:` 行打**有效值**（SPEC-v0.5.1 §7）：三个字节键改 MB 名，
+        两个已删键打**代码常量**，并给出两个"能被兑现的上界"（`native_timeout_cap_s` =
+        `DEADLINE_S − NATIVE_RESERVE_S`、`audio_timeout_cap_s` = `AUDIO_HONOR_MAX_S`）。
+        仍然是**单行**、前缀不变、可 grep。
+
         最后一步 `core_mode.activate()` 是 v0.4.2 加的（SPEC-v0.4.2 §8.1/§8.2）：`FuncTool`
         对象随每次 import **重建** ⇒ flag 必须**每次加载都重放**，探测也随之重跑。
-        `ready:` 行**逐字不动**（运维口径"与 v0.3 同形"继续有效）；引擎判据走**独立一行**：
-        `plugin` ⇒ DEBUG（生产零噪音）、`core` ⇒ INFO、被拒 ⇒ **ERROR**。
+        引擎判据走**独立一行**：`plugin` ⇒ DEBUG（生产零噪音）、`core` ⇒ INFO、被拒 ⇒ **ERROR**。
         """
         self._settings_cache = self._settings()
         current = self._settings_cache
@@ -124,26 +199,31 @@ class MediaAnalysisPlugin(Star):
         LOG.info(
             "media_analysis ready: audio_provider_id=%r video_provider_id=%r "
             "vision_provider_id=%r max_media_seconds=%d max_frames=%d "
-            "max_media_bytes=%d video.max_direct_bytes=%d native_timeout_s=%d "
-            "native_max_tokens=%d compress=%s target=%d probe=%s ttl=%d "
-            "cache_ttl_seconds=%d cache_dir=%s",
+            "max_media_mb=%d video.max_direct_mb=%d video.compress_target_mb=%d "
+            "native_timeout_s=%d native_timeout_cap_s=%d native_max_tokens=%d "
+            "compress=%s probe=%s probe_ttl=%d audio_timeout_s=%d "
+            "audio_timeout_cap_s=%d cache_ttl_seconds=%d cache_dir=%s",
             current.audio_provider_id,
             current.video_provider_id,
             current.vision_provider_id,
             current.max_media_seconds,
             current.max_frames,
-            current.max_media_bytes,
-            current.video_max_direct_bytes,
-            current.video_native_timeout_seconds,
-            current.video_native_max_tokens,
+            current.max_media_mb,
+            current.video_max_direct_mb,
+            current.video_compress_target_mb,
+            int(_native_timeout_s()),
+            int(analyze.DEADLINE_S - analyze.NATIVE_RESERVE_S),
+            int(video_native.NATIVE_MAX_TOKENS),
             "on" if current.video_compress_enabled else "off",
-            current.video_compress_target_bytes,
             "on" if current.video_probe_enabled else "off",
             current.video_probe_ttl_seconds,
+            current.audio_timeout_seconds,
+            int(settings.AUDIO_HONOR_MAX_S),
             current.cache_ttl_seconds,
             self._cache.directory or "(disabled)",
         )
-        self._log_direct_bytes_hint(current)
+        # 加载期一致性告警（SPEC-v0.5.1 §8.1）：只 WARN、不改配置；三条各有固定 id
+        self._config_check(current)
         if current.legacy_stt_provider_id:
             LOG.warning(
                 "media_analysis: 配置项 provider_settings.stt_provider_id 已弃用且不生效"
@@ -173,36 +253,72 @@ class MediaAnalysisPlugin(Star):
             )
             return None
 
-    def _log_direct_bytes_hint(self, current: settings.Settings) -> None:
-        """按 §4 的建议表提示一句（**只打数字，不覆盖配置**）。
+    def _config_check(self, current: settings.Settings) -> None:
+        """加载期一致性告警三条（SPEC-v0.5.1 §8.1）：**只 WARN，绝不改用户配置**。
 
-        为什么要有：直送门槛是"按延迟"定的，配得比模型实测的舒服值高就会周期性超时；
-        但**不能**自动改（否决项 §16.2-6：第二事实源）。所以这里只打一行 INFO，
-        且整段 try/except —— 拿不到 provider/model 时静默跳过，绝不因为一句提示拒载。
+        | id | 判据 | 为什么这么判 |
+        | --- | --- | --- |
+        | `timeout_over_budget` | **raw** `audio_timeout_seconds` > `MAX_AUDIO_TIMEOUT_SECONDS`(95) | 钳位后恒 ≤ 95，拿钳位值比就是死代码；越界只可能来自"手改 JSON" |
+        | `compress_target_ge_075_direct` | `4 × compress_target_mb > 3 × max_direct_mb`（整数比较） | 预算贴着门槛 = 压完仍会被直送闸拒；用整数乘避浮点 |
+        | `max_direct_over_suggested` | `max_direct_mb × 1048576 > suggest_direct_bytes(model)` | 门槛高于该模型的延迟舒服值 ⇒ 周期性超时 |
+
+        前两条不需要 provider ⇒ 加载期必打；第三条要 provider（见 `_config_check_provider`）。
         """
-        try:
-            provider_id = current.video_provider_id
-            if not provider_id:
-                return
-            provider = self.context.get_provider_by_id(provider_id)
-            model = ""
-            config = getattr(provider, "provider_config", None)
-            if isinstance(config, dict):
-                model = str(config.get("model") or "")
-            if not model:
-                getter = getattr(provider, "get_model", None)
-                model = str(getter()) if callable(getter) else ""
-            suggested = settings.suggest_direct_bytes(model)
-            if current.video_max_direct_bytes > suggested:
-                LOG.info(
-                    "media_analysis: 提示 —— video.max_direct_bytes=%d 高于该模型的延迟建议值 %d"
-                    "（实测口径，见 README「视频能力探测」）；若经常超时请下调，或先用"
-                    "tools/probe_video_capability.py 校准",
-                    current.video_max_direct_bytes,
-                    suggested,
-                )
-        except Exception as exc:  # noqa: BLE001 —— 一句提示不许影响加载
-            LOG.debug("media_analysis: 直送门槛提示跳过（%s）", type(exc).__name__)
+        if current.raw_audio_timeout > settings.MAX_AUDIO_TIMEOUT_SECONDS:
+            _warn_config_once(
+                "timeout_over_budget",
+                "key=%s configured_s=%d honorable_s=%d",
+                settings.KEY_AUDIO_TIMEOUT_SECONDS,
+                current.raw_audio_timeout,
+                int(settings.AUDIO_HONOR_MAX_S),
+            )
+        if 4 * int(current.video_compress_target_mb) > 3 * int(
+            current.video_max_direct_mb
+        ):
+            _warn_config_once(
+                "compress_target_ge_075_direct",
+                "compress_target_mb=%d max_direct_mb=%d",
+                current.video_compress_target_mb,
+                current.video_max_direct_mb,
+            )
+        self._config_check_provider(current)
+
+    def _config_check_provider(self, current: settings.Settings) -> None:
+        """告警③ `max_direct_over_suggested`（唯一的 provider 相关检查）。
+
+        **静默读注册表**（`_silent_provider`，§8.2）：冷启动时 provider 还没注册 ⇒
+        退化为 DEBUG `skip=… reason=provider_unresolved`（**WARNING 数为 0**），并把
+        这条检查顺延到首次 `analyze()`（`media_analyze` 入口再调一次本方法；去重集合
+        保证每个 id 每进程至多一条 WARNING）。⇒ 冷启动**既不丢告警、也不污染日志**。
+        """
+        if "max_direct_over_suggested" in _CONFIG_CHECK_DONE:
+            return
+        provider_id = current.video_provider_id
+        if not provider_id:
+            # 明确没配视频位 ⇒ 原生视频链路不会跑，门槛值无意义（不是坏配，不打告警）
+            LOG.debug(
+                "media_analysis: config-check skip=max_direct_over_suggested "
+                "reason=no_video_provider"
+            )
+            return
+        provider = _silent_provider(self.context, provider_id)
+        if provider is None:
+            LOG.debug(
+                "media_analysis: config-check skip=max_direct_over_suggested "
+                "reason=provider_unresolved"
+            )
+            return
+        suggested = settings.suggest_direct_bytes(_provider_model(provider))
+        if current.video_max_direct_bytes > suggested:
+            _warn_config_once(
+                "max_direct_over_suggested",
+                "max_direct_mb=%d suggested_mb=%d",
+                current.video_max_direct_mb,
+                settings.bytes_to_mb(suggested),
+            )
+        else:
+            # 已在建议值内 ⇒ 记录"查过了"，后续调用不再重复读注册表
+            _CONFIG_CHECK_DONE.add("max_direct_over_suggested")
 
     async def terminate(self) -> None:
         """卸载：取消全部后台任务 → 丢掉配置快照 → 关闭缓存（条目按 TTL 自然过期）。
@@ -230,19 +346,53 @@ class MediaAnalysisPlugin(Star):
             await store.close()
 
     def _settings(self) -> settings.Settings:
-        """唯一配置读取点：22 个键逐条显式读（SPEC-v0.3 §8.1 + SPEC-v0.4.2 §3.1 键表），
+        """唯一配置读取点：21 个键逐条显式读（SPEC-v0.5.1 §2.3 键表 / §10 四处互钉），
         禁止散落到别处。
 
         漏一个键 ＝ 生产链路上**静默丢弃**设置（父手册 §3 第 8 条）；
         `tests/test_config_map.py` 用四方一致守卫钉住这里。
         布尔走 `ConfigView.flag()`（非 `bool` ⇒ 告警回默认），整数走 `bounded_int`（钳位）。
+
+        v0.5.1 的两处细节：
+        - 三个字节键**读的是 MB**，钳位也在 MB 域（`[lo_mb, hi_mb]`），字节只在 `Settings`
+          的派生 property 里出现（§2.1「禁止先乘后钳」）；
+        - `audio_timeout_seconds` 读**两次**：钳位值（运行期/`ready` 用）+ 原值
+          `raw_audio_timeout`（加载期告警①用；钳位后恒 ≤ 95，拿钳位值判越界是死代码）。
         """
         view = settings.ConfigView(self.config)
         return settings.Settings(
+            # v0.5.1 第 1 键（组序置顶）：枚举归一（坏值回 plugin + 一条 WARNING）
+            background_mode=settings.normalize_background_mode(
+                view.get(
+                    settings.KEY_BACKGROUND_MODE, settings.DEFAULT_BACKGROUND_MODE
+                )
+            ),
             audio_provider_id=view.text(settings.KEY_AUDIO_PROVIDER_ID),
             video_provider_id=view.text(settings.KEY_VIDEO_PROVIDER_ID),
             vision_provider_id=view.text(settings.KEY_VISION_PROVIDER_ID),
             legacy_stt_provider_id=view.text(settings.KEY_LEGACY_STT_PROVIDER_ID),
+            video_max_direct_mb=view.bounded_int(
+                settings.KEY_VIDEO_MAX_DIRECT_MB,
+                default=settings.DEFAULT_VIDEO_MAX_DIRECT_MB,
+                lo=settings.MIN_VIDEO_MAX_DIRECT_MB,
+                hi=settings.MAX_VIDEO_MAX_DIRECT_MB,
+            ),
+            video_compress_enabled=view.flag(
+                settings.KEY_VIDEO_COMPRESS_ENABLED,
+                default=settings.DEFAULT_VIDEO_COMPRESS_ENABLED,
+            ),
+            video_compress_target_mb=view.bounded_int(
+                settings.KEY_VIDEO_COMPRESS_TARGET_MB,
+                default=settings.DEFAULT_VIDEO_COMPRESS_TARGET_MB,
+                lo=settings.MIN_VIDEO_COMPRESS_TARGET_MB,
+                hi=settings.MAX_VIDEO_COMPRESS_TARGET_MB,
+            ),
+            video_compress_timeout_seconds=view.bounded_int(
+                settings.KEY_VIDEO_COMPRESS_TIMEOUT_SECONDS,
+                default=settings.DEFAULT_VIDEO_COMPRESS_TIMEOUT_SECONDS,
+                lo=settings.MIN_VIDEO_COMPRESS_TIMEOUT_SECONDS,
+                hi=settings.MAX_VIDEO_COMPRESS_TIMEOUT_SECONDS,
+            ),
             video_probe_enabled=view.flag(
                 settings.KEY_VIDEO_PROBE_ENABLED,
                 default=settings.DEFAULT_VIDEO_PROBE_ENABLED,
@@ -252,40 +402,6 @@ class MediaAnalysisPlugin(Star):
                 default=settings.DEFAULT_VIDEO_PROBE_TTL_SECONDS,
                 lo=settings.MIN_VIDEO_PROBE_TTL_SECONDS,
                 hi=settings.MAX_VIDEO_PROBE_TTL_SECONDS,
-            ),
-            video_max_direct_bytes=view.bounded_int(
-                settings.KEY_VIDEO_MAX_DIRECT_BYTES,
-                default=settings.DEFAULT_VIDEO_MAX_DIRECT_BYTES,
-                lo=settings.MIN_VIDEO_MAX_DIRECT_BYTES,
-                hi=settings.MAX_VIDEO_MAX_DIRECT_BYTES,
-            ),
-            video_native_timeout_seconds=view.bounded_int(
-                settings.KEY_VIDEO_NATIVE_TIMEOUT_SECONDS,
-                default=settings.DEFAULT_VIDEO_NATIVE_TIMEOUT_SECONDS,
-                lo=settings.MIN_VIDEO_NATIVE_TIMEOUT_SECONDS,
-                hi=settings.MAX_VIDEO_NATIVE_TIMEOUT_SECONDS,
-            ),
-            video_native_max_tokens=view.bounded_int(
-                settings.KEY_VIDEO_NATIVE_MAX_TOKENS,
-                default=settings.DEFAULT_VIDEO_NATIVE_MAX_TOKENS,
-                lo=settings.MIN_VIDEO_NATIVE_MAX_TOKENS,
-                hi=settings.MAX_VIDEO_NATIVE_MAX_TOKENS,
-            ),
-            video_compress_enabled=view.flag(
-                settings.KEY_VIDEO_COMPRESS_ENABLED,
-                default=settings.DEFAULT_VIDEO_COMPRESS_ENABLED,
-            ),
-            video_compress_target_bytes=view.bounded_int(
-                settings.KEY_VIDEO_COMPRESS_TARGET_BYTES,
-                default=settings.DEFAULT_VIDEO_COMPRESS_TARGET_BYTES,
-                lo=settings.MIN_VIDEO_COMPRESS_TARGET_BYTES,
-                hi=settings.MAX_VIDEO_COMPRESS_TARGET_BYTES,
-            ),
-            video_compress_timeout_seconds=view.bounded_int(
-                settings.KEY_VIDEO_COMPRESS_TIMEOUT_SECONDS,
-                default=settings.DEFAULT_VIDEO_COMPRESS_TIMEOUT_SECONDS,
-                lo=settings.MIN_VIDEO_COMPRESS_TIMEOUT_SECONDS,
-                hi=settings.MAX_VIDEO_COMPRESS_TIMEOUT_SECONDS,
             ),
             max_media_seconds=view.bounded_int(
                 settings.KEY_MAX_MEDIA_SECONDS,
@@ -299,28 +415,33 @@ class MediaAnalysisPlugin(Star):
                 lo=settings.MIN_MAX_FRAMES,
                 hi=settings.MAX_MAX_FRAMES,
             ),
-            max_media_bytes=view.bounded_int(
-                settings.KEY_MAX_MEDIA_BYTES,
-                default=settings.DEFAULT_MAX_MEDIA_BYTES,
-                lo=settings.MIN_MAX_MEDIA_BYTES,
-                hi=settings.MAX_MAX_MEDIA_BYTES,
+            max_media_mb=view.bounded_int(
+                settings.KEY_MAX_MEDIA_MB,
+                default=settings.DEFAULT_MAX_MEDIA_MB,
+                lo=settings.MIN_MAX_MEDIA_MB,
+                hi=settings.MAX_MAX_MEDIA_MB,
             ),
-            prompt_audio=view.text(settings.KEY_PROMPTS_AUDIO),
-            prompt_video=view.text(settings.KEY_PROMPTS_VIDEO),
-            prompt_frame=view.text(settings.KEY_PROMPTS_FRAME),
-            prompt_summary=view.text(settings.KEY_PROMPTS_SUMMARY),
-            prompt_video_native=view.text(settings.KEY_PROMPTS_VIDEO_NATIVE),
+            audio_timeout_seconds=view.bounded_int(
+                settings.KEY_AUDIO_TIMEOUT_SECONDS,
+                default=settings.DEFAULT_AUDIO_TIMEOUT_SECONDS,
+                lo=settings.MIN_AUDIO_TIMEOUT_SECONDS,
+                hi=settings.MAX_AUDIO_TIMEOUT_SECONDS,
+            ),
             cache_ttl_seconds=view.bounded_int(
                 settings.KEY_CACHE_TTL_SECONDS,
                 default=settings.DEFAULT_CACHE_TTL_SECONDS,
                 lo=settings.MIN_CACHE_TTL_SECONDS,
                 hi=settings.MAX_CACHE_TTL_SECONDS,
             ),
-            # v0.4.2 第 22 键：枚举归一（坏值回 plugin + 一条 WARNING），不走 ConfigView
-            background_mode=settings.normalize_background_mode(
-                view.get(
-                    settings.KEY_BACKGROUND_MODE, settings.DEFAULT_BACKGROUND_MODE
-                )
+            prompt_audio=view.text(settings.KEY_PROMPTS_AUDIO),
+            prompt_video=view.text(settings.KEY_PROMPTS_VIDEO),
+            prompt_frame=view.text(settings.KEY_PROMPTS_FRAME),
+            prompt_summary=view.text(settings.KEY_PROMPTS_SUMMARY),
+            prompt_video_native=view.text(settings.KEY_PROMPTS_VIDEO_NATIVE),
+            # 非键字段：同一配置键（limits.audio_timeout_seconds）的**原值**，只服务告警①
+            raw_audio_timeout=view.raw_int(
+                settings.KEY_AUDIO_TIMEOUT_SECONDS,
+                default=settings.DEFAULT_AUDIO_TIMEOUT_SECONDS,
             ),
         )
 
@@ -372,6 +493,9 @@ class MediaAnalysisPlugin(Star):
             str: 受理信封（4 键）或失败信封（3 键）的 JSON 文本；分析结果由后台任务
             单独发送给用户，不经由本返回值。
         """
+        # 加载期没能解析到 provider 的告警③在这里顺延（SPEC-v0.5.1 §8.2）：
+        # 冷启动时 provider 尚未注册，首次调用时再去注册表静默看一眼（每 id 至多一条 WARNING）。
+        self._config_check_provider(self._settings_cache or self._settings())
         mode = self._bg.effective  # ① 入口快照：一次调用只认一个引擎（§5.2）
         if mode == core_mode.MODE_CORE:  # ② 单值分支；C 分支**必然 return**
             if self._bg_recheck_pending:  # ③ 一次性复检（§4.5）：只影响**后续**调用
@@ -388,8 +512,27 @@ class MediaAnalysisPlugin(Star):
         # —— 以下逐字沿用 v0.4.1 的 A2 门面（try/except 三出口不变）——
         # 注意：`mode` 这个名字在这里被**有意复用**（下面两行是 v0.4.1 原文）—— A2 分支
         # 用的是 `include_frames` 的三态；引擎快照已在上面那个 if 里用完（C 分支必然 return）。
+        accept_started = time.monotonic()
         try:
             mode = _as_mode(include_frames)
+            # D2 唤醒轮短路（SPEC-v0.5.1 §5.2）：位置在 `mode` 归一之后、`find_media` 之前。
+            # 合成事件（核心 `CronMessageEvent` / 后台任务结果轮）**本来就不该**带媒体 ⇒
+            # 立刻回一条**专用 hint** 的失败信封，**不**进 `background.submit()`
+            # （⇒ 不产生 `task_id`，也不会有"唤醒轮里又跑一次分析"）。
+            # `is_wake_round` 永不抛（fail-open）；`chain_has_media` 只做类型判定
+            # （0 下载 / 0 ffmpeg / 0 provider），链里**真有**媒体 ⇒ 走正常路径（退路）。
+            if analyze.is_wake_round(event) and not await analyze.chain_has_media(
+                event, target
+            ):
+                analyze.log_route(
+                    route=analyze.ROUTE_NONE,
+                    stage=analyze.STAGE_ACCEPT,
+                    engine=analyze.ENGINE_PLUGIN,
+                    error=envelope.ERR_MEDIA_NOT_FOUND,
+                    elapsed_ms=_elapsed_ms(accept_started),
+                    wake_round=True,
+                )
+                return envelope.dumps(envelope.fail_envelope_wake())
             # 受理路径：类型判定 + 至多 6 字节魔数读（0 下载、0 转换、0 ffmpeg、0 provider）
             await media.find_media(event, target)
             payload = await background.submit(
@@ -411,12 +554,29 @@ class MediaAnalysisPlugin(Star):
                 exc.code,
                 redact_sensitive_text(exc.log_detail)[:200],
             )
+            # 受理期拒绝 = `stage=accept` 那一行（SPEC-v0.5.1 §6.2/§6.3）：BAD_TARGET /
+            # MEDIA_NOT_FOUND / TOO_MANY_TASKS 都从这里出去。链路没开跑 ⇒ kind=`-`、
+            # fallback=`-`、cached=0、duration_s=0.00、frames=0、transcript_chars=0。
+            analyze.log_route(
+                route=analyze.ROUTE_NONE,
+                stage=analyze.STAGE_ACCEPT,
+                engine=analyze.ENGINE_PLUGIN,
+                error=exc.code,
+                elapsed_ms=_elapsed_ms(accept_started),
+            )
             return envelope.dumps(envelope.fail_envelope(exc.code))
         except BaseException as exc:  # noqa: BLE001 —— 工具永不把异常抛给模型
             LOG.error(
                 "media_analyze internal error: %s\n%s",
                 redact_sensitive_text(str(exc))[:200],
                 redact_sensitive_text(traceback.format_exc())[:4000],
+            )
+            analyze.log_route(
+                route=analyze.ROUTE_NONE,
+                stage=analyze.STAGE_ACCEPT,
+                engine=analyze.ENGINE_PLUGIN,
+                error=envelope.ERR_INTERNAL_ERROR,
+                elapsed_ms=_elapsed_ms(accept_started),
             )
             return envelope.dumps(envelope.fail_envelope(envelope.ERR_INTERNAL_ERROR))
 

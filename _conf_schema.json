@@ -1,4 +1,25 @@
 {
+  "background": {
+    "description": "后台执行（实验）",
+    "hint": "默认 plugin＝插件自管：受理即返回，分析完成后由插件自己发一条结果消息（恰好一次，含失败终态、去重、并发上限）。core＝把本工具交给 AstrBot 原生后台任务，由核心在完成后唤醒主模型转述；该模式需要核心先打一行补丁并重启（否则插件会拒绝并回落到 plugin），且投递由模型决定、不保证发声。除非你在做灰度验证，保持 plugin。",
+    "type": "object",
+    "items": {
+      "mode": {
+        "description": "后台执行模式",
+        "hint": "plugin（默认）＝插件自管，投递确定（at-most-once）。core＝核心原生后台（实验）：需要核心已补 _PermissionGuardedTool 镜像一行并重启；未修时插件会打 ERROR 并回落到 plugin（不写配置、不改你的选择）。",
+        "type": "string",
+        "options": [
+          "plugin",
+          "core"
+        ],
+        "labels": [
+          "插件自管（默认，投递确定）",
+          "核心原生后台（实验，需核心补丁+重启）"
+        ],
+        "default": "plugin"
+      }
+    }
+  },
   "provider_settings": {
     "description": "模型提供商",
     "hint": "留空＝回落 AstrBot 当前的对话 provider。不在此处填 API key。",
@@ -6,14 +27,14 @@
     "items": {
       "audio_provider_id": {
         "description": "音频模型（多模态对话）",
-        "hint": "转写语音/视频音轨用的对话模型，模型能力里必须勾了「音频」。留空＝回落 AstrBot 当前的对话 provider（若它不支持音频会返回 AUDIO_UNAVAILABLE）。",
+        "hint": "转写语音/视频音轨用的对话模型，模型能力里必须勾了「音频」。留空＝回落 AstrBot 当前的对话 provider（若它不支持音频会返回 AUDIO_UNAVAILABLE）。单次调用的超时在「上限」组里（limits.audio_timeout_seconds）。",
         "type": "string",
         "_special": "select_provider",
         "default": ""
       },
       "video_provider_id": {
         "description": "视频模型（原生视频）",
-        "hint": "把整段视频直接送给多模态模型（一次调用同时看画面、听声音）。需要选一个 OpenAI 兼容适配器（openai_chat_completion）的对话模型，且它真的接受视频输入；插件首次使用时会用小样片实测它能不能“看见”（结果缓存 7 天，见 video.probe_*）。留空＝不走原生视频，视频改用“视觉模型抽帧”的老路径。",
+        "hint": "把整段视频直接送给多模态模型（一次调用同时看画面、听声音）。需要选一个 OpenAI 兼容适配器（openai_chat_completion）的对话模型，且它真的接受视频输入；插件首次使用时会用小样片实测它能不能“看见”（结果缓存 7 天）。留空＝不走原生视频，视频改用“视觉模型抽帧”的老路径。",
         "type": "string",
         "_special": "select_provider",
         "default": ""
@@ -27,71 +48,152 @@
       },
       "stt_provider_id": {
         "description": "【已弃用】语音识别模型",
-        "hint": "v0.2 起音频改走多模态对话模型（见上面的「音频模型」），本项不再生效；仅为保留历史设置而保留，请勿再填。迁移脚本会把旧值搬到 audio_provider_id。",
+        "hint": "v0.2 起音频改走多模态对话模型（见上面的「音频模型」），本项不再生效；仅为保留历史设置而保留（默认整行隐藏，值不会被清掉），请勿再填。迁移脚本会把旧值搬到 audio_provider_id。",
         "type": "string",
         "_special": "select_provider_stt",
-        "default": ""
+        "default": "",
+        "invisible": true
       }
     }
   },
   "video": {
-    "description": "视频（原生直送 / 压缩 / 探测）",
-    "hint": "视频默认整段直送多模态模型；超过直送门槛先本地压缩，压不动才回退抽帧。这里没有“体积上限阶梯”——实测两条通道到 47.2 MiB / 36.5 MiB 都没拒，真正先撞的是延迟。",
+    "description": "视频（原生直送 / 压缩）",
+    "hint": "视频默认整段直送多模态模型；超过直送门槛先本地压缩，压不动才回退抽帧。这里没有“体积上限阶梯”——实测两条通道到 47.2 MiB / 36.5 MiB 都没拒，真正先撞的是延迟，所以门槛是按**延迟**定的。",
     "type": "object",
     "items": {
-      "probe_enabled": {
-        "description": "自动探测视频能力（L1）",
-        "hint": "开启时：每个「视频模型 + 模型名 + 插件版本」每 7 天最多自动用一段 4 秒合成小样片实测一次“模型能不能看见画面”（会真的调一次、约 3–20 秒）。关闭＝跳过探测，直接信任你显式配置的视频模型（省一次调用，但配错就每次都白花一次视频请求）。",
-        "type": "bool",
-        "default": true
-      },
-      "probe_ttl_seconds": {
-        "description": "探测结果有效期（秒）",
-        "hint": "默认 604800（7 天）。0＝完全关闭探测（既不读缓存也不探测，等价于 probe_enabled=false）。允许 0–2592000。",
+      "max_direct_mb": {
+        "description": "原生直送体积门槛（MB）",
+        "hint": "按**延迟**定的门槛，不是 provider 的上限：默认 8（MB）。超过就先本地压缩到门槛内再直送；压缩也不行才回退抽帧。1 MB = 1,048,576 字节（二进制 MB）。32 MB 同时是内存硬上限。原生调用还会与「剩余预算 − NATIVE_RESERVE_S」取小（该预留是 analyze.py 的常量：抽帧最小预算 + 余量），所以门槛调得比模型的舒服值高，代价是周期性超时而不是报错。（允许范围：1–32）",
         "type": "int",
-        "default": 604800
-      },
-      "max_direct_bytes": {
-        "description": "原生直送体积门槛（字节）",
-        "hint": "按**延迟**定的门槛，不是 provider 的上限：默认 8388608（8 MiB）。超过就先本地压缩到门槛内再直送；压缩也不行才回退抽帧。允许 1048576–33554432（1–32 MiB，32 MiB 同时是内存硬上限）。",
-        "type": "int",
-        "default": 8388608
-      },
-      "native_timeout_seconds": {
-        "description": "原生视频单次调用超时（秒）",
-        "hint": "默认 60。实测 1 MiB≈10–32 s、4 MiB≈23–86 s、8 MiB≈43–75 s；超时不是 bug，是回退链的下一个触发点。会再与“剩余预算−15 s”取小。允许 20–110。",
-        "type": "int",
-        "default": 60
-      },
-      "native_max_tokens": {
-        "description": "原生视频调用的 max_tokens",
-        "hint": "默认 2048，**只能调大**（1024–4096，低于 1024 会被强制拉回 1024）。实测有模型在 64 时返回 200 但正文为空（全被推理吃掉），那会把“没看见”记成成功；mimo 在 8 MiB + 长提示词下要 4096 才有正文 ⇒ 用 mimo 当视频模型时建议直接设 4096。",
-        "type": "int",
-        "default": 2048
+        "default": 8,
+        "slider": {
+          "min": 1,
+          "max": 32,
+          "step": 1
+        }
       },
       "compress_enabled": {
         "description": "超门槛时先压缩",
-        "hint": "默认开。压缩比抽帧便宜得多（实测 48.9 秒视频压到 4 MiB 用 4.8 秒、0 token；抽帧要 6 次视觉调用）。关闭＝超门槛直接走抽帧回退。",
+        "hint": "默认开。压缩比抽帧便宜得多（实测 48.9 秒视频压到 4 MB 用 4.8 秒、0 token；抽帧要 6 次视觉调用）。关闭＝超门槛直接走抽帧回退。",
         "type": "bool",
         "default": true
       },
-      "compress_target_bytes": {
-        "description": "压缩目标字节数",
-        "hint": "默认 8388608（8 MiB）。实际预算取它和 max_direct_bytes 的**小者**（压到比门槛还大等于没压）。目标码率 = 预算×8/时长−64 kbps 音频；低于 64 kbps 判“不可行”不硬转。允许 524288–33554432。",
+      "compress_target_mb": {
+        "description": "压缩目标体积（MB）",
+        "hint": "默认 6（MB）。实际预算取它和「原生直送体积门槛」的**小者**（压到比门槛还大等于没压）。目标码率 = 预算×8/时长−64 kbps 音频；低于 64 kbps 判“不可行”不硬转。1 MB = 1,048,576 字节。默认 6 是为了不触发「压缩目标 ≥ 直送门槛的 75%」这条加载期告警（6/8 = 75%）。（允许范围：1–32）",
         "type": "int",
-        "default": 8388608
+        "default": 6,
+        "slider": {
+          "min": 1,
+          "max": 32,
+          "step": 1
+        }
       },
       "compress_timeout_seconds": {
         "description": "压缩整块超时（秒）",
-        "hint": "默认 30，两趟转码共享这一个预算（实测单趟 4.5–6.9 秒）。允许 10–60。",
+        "hint": "默认 30，两趟转码共享这一个预算（实测单趟 4.5–6.9 秒）。默认整行隐藏（值照旧保留）。（允许范围：10–60）",
         "type": "int",
-        "default": 30
+        "default": 30,
+        "slider": {
+          "min": 10,
+          "max": 60,
+          "step": 5
+        },
+        "invisible": true
+      },
+      "probe_enabled": {
+        "description": "自动探测视频能力（L1）",
+        "hint": "开启时：每个「视频模型 + 模型名 + 插件版本」每 7 天最多自动用一段 4 秒合成小样片实测一次“模型能不能看见画面”（会真的调一次、约 3–20 秒）。关闭＝跳过探测，直接信任你显式配置的视频模型（省一次调用，但配错就每次都白花一次视频请求）。默认整行隐藏（值照旧保留）。",
+        "type": "bool",
+        "default": true,
+        "invisible": true
+      },
+      "probe_ttl_seconds": {
+        "description": "探测结果有效期（秒）",
+        "hint": "默认 604800（7 天）。0＝完全关闭探测（既不读缓存也不探测，等价于 probe_enabled=false）。默认整行隐藏（值照旧保留）。（允许范围：0–2592000）",
+        "type": "int",
+        "default": 604800,
+        "slider": {
+          "min": 0,
+          "max": 2592000,
+          "step": 86400
+        },
+        "invisible": true
+      }
+    }
+  },
+  "limits": {
+    "description": "上限",
+    "hint": "成本闸门。超限一律返回明确错误码，不做静默截断。",
+    "type": "object",
+    "items": {
+      "max_media_seconds": {
+        "description": "单条媒体最长秒数",
+        "hint": "超过即返回 MEDIA_TOO_LONG。默认 60。（允许范围：5–300）",
+        "type": "int",
+        "default": 60,
+        "slider": {
+          "min": 5,
+          "max": 300,
+          "step": 5
+        }
+      },
+      "max_frames": {
+        "description": "最多抽帧数",
+        "hint": "include_frames=true 时最多抽几帧、调几次视觉模型。默认 6。（允许范围：1–12）",
+        "type": "int",
+        "default": 6,
+        "slider": {
+          "min": 1,
+          "max": 12,
+          "step": 1
+        }
+      },
+      "max_media_mb": {
+        "description": "媒体文件体积上限（MB）",
+        "hint": "群文件（File 段）下载/读取的硬闸，超过即返回 MEDIA_TOO_LARGE。默认 64（MB）。1 MB = 1,048,576 字节（二进制 MB）。远程 GIF 的有界下载同样受这一项约束。（允许范围：1–512）",
+        "type": "int",
+        "default": 64,
+        "slider": {
+          "min": 1,
+          "max": 512,
+          "step": 1
+        }
+      },
+      "audio_timeout_seconds": {
+        "description": "单次音频调用超时（秒）",
+        "hint": "转写语音/视频音轨时，单次多模态调用的超时；超时后**只重试一次**，总耗时仍受全局预算约束（不会超）。默认 60。超过 95 的值不可能被兑现（全局预算 100 秒 − 5 秒余量），所以滑块只给到 95；手改 JSON 写超了会在加载期打一条 config-check 告警并按 95 生效。（允许范围：10–95）",
+        "type": "int",
+        "default": 60,
+        "slider": {
+          "min": 10,
+          "max": 95,
+          "step": 5
+        }
+      }
+    }
+  },
+  "cache": {
+    "description": "缓存",
+    "hint": "解析结果本地缓存（同一媒体第二次引用不再花 token）。缓存只存信封文本，不存媒体。",
+    "type": "object",
+    "items": {
+      "ttl_seconds": {
+        "description": "缓存有效期（秒）",
+        "hint": "默认 86400（1 天）。0＝关闭缓存。越界钳位并告警。（允许范围：0–2592000）",
+        "type": "int",
+        "default": 86400,
+        "slider": {
+          "min": 0,
+          "max": 2592000,
+          "step": 3600
+        }
       }
     }
   },
   "prompts": {
     "description": "提示词",
-    "hint": "留空使用内置默认值。可用占位符见 README；写坏（非法花括号/未知占位符）会回退默认值并告警。",
+    "hint": "留空使用内置默认值。可用占位符见 README；写坏（非法花括号/未知占位符）会回退默认值并告警。五份长文本放在最后，前面的开关与上限先看。",
     "type": "object",
     "items": {
       "audio": {
@@ -123,65 +225,6 @@
         "hint": "视频整段直送多模态模型时用的提示词（一次调用同时要“画面 + 声音”）。可用占位符：{focus_clause}。留空使用内置默认值。",
         "type": "text",
         "default": "这是一段视频。请综合画面和声音回答下面的要求：\n1) 先客观描述画面里发生了什么（人物/动作/场景/画面上的文字）；\n2) 再简要复述声音里说的话（听不清就写 [听不清]）；\n3) 不要猜测画面或声音里没有的信息；\n4) 只输出结果本身，不要前言、标题或解释。\n如果画面和声音都没有可用内容，只输出：[无可用内容]\n{focus_clause}"
-      }
-    }
-  },
-  "limits": {
-    "description": "上限",
-    "hint": "成本闸门。超限一律返回明确错误码，不做静默截断。",
-    "type": "object",
-    "items": {
-      "max_media_seconds": {
-        "description": "单条媒体最长秒数",
-        "hint": "超过即返回 MEDIA_TOO_LONG。默认 60。允许 5–300。",
-        "type": "int",
-        "default": 60
-      },
-      "max_frames": {
-        "description": "最多抽帧数",
-        "hint": "include_frames=true 时最多抽几帧、调几次视觉模型。默认 6。允许 1–12。",
-        "type": "int",
-        "default": 6
-      },
-      "max_media_bytes": {
-        "description": "媒体文件最大字节数",
-        "hint": "群文件（File 段）下载/读取的硬闸，超过即返回 MEDIA_TOO_LARGE。默认 67108864（64 MiB）。允许 1048576–536870912。",
-        "type": "int",
-        "default": 67108864
-      }
-    }
-  },
-  "cache": {
-    "description": "缓存",
-    "hint": "解析结果本地缓存（同一媒体第二次引用不再花 token）。缓存只存信封文本，不存媒体。",
-    "type": "object",
-    "items": {
-      "ttl_seconds": {
-        "description": "缓存有效期（秒）",
-        "hint": "默认 86400（1 天）。0＝关闭缓存。允许 0–2592000（30 天），越界钳位并告警。",
-        "type": "int",
-        "default": 86400
-      }
-    }
-  },
-  "background": {
-    "description": "后台执行（实验）",
-    "hint": "默认 plugin＝插件自管：受理即返回，分析完成后由插件自己发一条结果消息（恰好一次，含失败终态、去重、并发上限）。core＝把本工具交给 AstrBot 原生后台任务，由核心在完成后唤醒主模型转述；该模式需要核心先打一行补丁并重启（否则插件会拒绝并回落到 plugin），且投递由模型决定、不保证发声。除非你在做灰度验证，保持 plugin。",
-    "type": "object",
-    "items": {
-      "mode": {
-        "description": "后台执行模式",
-        "hint": "plugin（默认）＝插件自管，投递确定（at-most-once）。core＝核心原生后台（实验）：需要核心已补 _PermissionGuardedTool 镜像一行并重启；未修时插件会打 ERROR 并回落到 plugin（不写配置、不改你的选择）。",
-        "type": "string",
-        "options": [
-          "plugin",
-          "core"
-        ],
-        "labels": [
-          "插件自管（默认，投递确定）",
-          "核心原生后台（实验，需核心补丁+重启）"
-        ],
-        "default": "plugin"
       }
     }
   }

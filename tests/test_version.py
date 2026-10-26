@@ -29,7 +29,7 @@ METADATA = REPO_DIR / "metadata.yaml"
 CHANGELOG = REPO_DIR / "CHANGELOG.md"
 
 #: 用户要求的版本面（与 `metadata.yaml` / `settings.PLUGIN_VERSION` 三方一致）
-EXPECTED_VERSION = "0.4.2"
+EXPECTED_VERSION = "0.5.1"
 #: 用户要求补齐的上游仓库（逐字）
 EXPECTED_REPO = "https://github.com/cmdst/astrbot_plugin_media_analysis"
 

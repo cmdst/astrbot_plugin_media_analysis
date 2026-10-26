@@ -36,6 +36,8 @@ from pathlib import Path
 
 import pytest
 
+from astrbot.core.provider import func_tool_manager as ftm
+
 from astrbot_plugin_media_analysis import analyze as analyze_mod
 from astrbot_plugin_media_analysis import background, cache as cache_mod, core_mode
 from astrbot_plugin_media_analysis import envelope, main, settings
@@ -128,6 +130,26 @@ def _patch_analyze(monkeypatch, outcome) -> None:
     monkeypatch.setattr(analyze_mod, "analyze", _fake)
 
 
+class _UnpatchedGuardedTool(ftm._PermissionGuardedTool):  # type: ignore[misc,valid-type]
+    """核心 4.29.1 的**原装**包装器形态：镜像区**没有** `is_background_task`。
+
+    为什么自己造"未修真身"：本机核心树可能已被（部署单/运营方）打过那一行镜像补丁 ——
+    那时"未修世界"在真机上就不存在了，这一格会随宿主状态假红/假绿。这里在真类之上把那个
+    **实例属性**摘掉，读数回落到 `FunctionTool.is_background_task` 的类默认 `False`，
+    与 4.29.1 原装行为逐字等价，且与宿主树是否被打过补丁无关
+    （与 `tests/test_core_mode.py::unpatched_core` 同一套做法）。
+    """
+
+    def __init__(self, tool, manager) -> None:  # noqa: D107 —— 与父类同签名
+        super().__init__(tool, manager)
+        self.__dict__.pop("is_background_task", None)
+
+
+def unpatched_core(monkeypatch) -> None:
+    """把"未修核心"这个世界**显式**装好（`monkeypatch` 结束时自动复原）。"""
+    monkeypatch.setattr(ftm, "_PermissionGuardedTool", _UnpatchedGuardedTool)
+
+
 def _log(monkeypatch, module) -> RecordingLogger:
     logger = RecordingLogger()
     monkeypatch.setattr(module, "LOG", logger)
@@ -149,7 +171,11 @@ async def test_initialize_rejects_core_when_the_wrapper_does_not_mirror(monkeypa
     一行镜像时，插件必须"响亮失败 + 按 A2 跑"，而不是"看起来正常、实际同步阻塞 30–100 s"。
     同时用户的**选择**必须原样留在磁盘上（`_ReadOnlyConfig` 写一下就炸）—— 否则下次加载
     会变成"插件自己把配置改回了 plugin"，运维会以为"开了没生效"。
+
+    "未修核心"由 `unpatched_core(monkeypatch)` **显式**构造：宿主核心树在 2026-10-26 02:01
+    已被打上那一行镜像 ⇒ 直接依赖环境就等于让本格随宿主状态漂（t5 复议里的那条红）。
     """
+    unpatched_core(monkeypatch)  # "未修核心"要**显式**装（宿主树可能自己已经带那一行镜像）
     logger = _log(monkeypatch, core_mode)
     main_log = _log(monkeypatch, main)  # `ready:` 行由 `main` 打（引擎判据走 core_mode）
     tool = make_tool()

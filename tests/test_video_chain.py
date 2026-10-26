@@ -339,7 +339,7 @@ async def test_no_audio_with_compression_unavailable_and_mode_false_is_video_too
         streams=(False, True),
         native=native_video(),
         cfg=settings.Settings(
-            video_max_direct_bytes=MiB, video_compress_target_bytes=MiB
+            video_max_direct_mb=1, video_compress_target_mb=1
         ),
     )
     _bigger_source(rig)
@@ -368,8 +368,8 @@ async def test_over_threshold_compresses_with_the_frozen_budget_then_sends(
 
     cfg = settings.Settings(
         vision_provider_id="fake-chat",
-        video_max_direct_bytes=MiB,
-        video_compress_target_bytes=8 * MiB,
+        video_max_direct_mb=1,
+        video_compress_target_mb=8,
     )
     native = native_video(text="压缩后仍然看见了")
     rig = build_rig(monkeypatch, tmp_path, kind="video", native=native, cfg=cfg)
@@ -414,8 +414,8 @@ async def test_compress_budget_follows_the_smaller_of_target_and_direct(
 
     cfg = settings.Settings(
         vision_provider_id="fake-chat",
-        video_max_direct_bytes=MiB,
-        video_compress_target_bytes=settings.MIN_VIDEO_COMPRESS_TARGET_BYTES,
+        video_max_direct_mb=1,
+        video_compress_target_mb=settings.MIN_VIDEO_COMPRESS_TARGET_MB,
     )
     rig = build_rig(monkeypatch, tmp_path, kind="video", native=native_video(), cfg=cfg)
     _bigger_source(rig)
@@ -423,7 +423,10 @@ async def test_compress_budget_follows_the_smaller_of_target_and_direct(
 
     await rig.run(include_frames="auto")
 
-    assert calls[0]["budget_bytes"] == settings.MIN_VIDEO_COMPRESS_TARGET_BYTES
+    # v0.5.1：配置存 MB（下限 1 MB），压缩器收的是**字节** ⇒ 用唯一换算点
+    assert calls[0]["budget_bytes"] == settings.mb_to_bytes(
+        settings.MIN_VIDEO_COMPRESS_TARGET_MB
+    )
 
 
 @pytest.mark.asyncio
@@ -435,7 +438,7 @@ async def test_compress_disabled_falls_back_to_frames(
 
     cfg = settings.Settings(
         vision_provider_id="fake-chat",
-        video_max_direct_bytes=MiB,
+        video_max_direct_mb=1,
         video_compress_enabled=False,
     )
     native = native_video()
@@ -461,7 +464,7 @@ async def test_compress_failure_falls_back_to_frames_with_mode_auto(
     """压缩失败 + vision 可用 + auto ⇒ **不报错**，走抽帧（§7.4 末行）。"""
     from astrbot_plugin_media_analysis import settings
 
-    cfg = settings.Settings(vision_provider_id="fake-chat", video_max_direct_bytes=MiB)
+    cfg = settings.Settings(vision_provider_id="fake-chat", video_max_direct_mb=1)
     native = native_video()
     rig = build_rig(
         monkeypatch, tmp_path, kind="video", native=native, cfg=cfg, frames=[(2.5, "unused")]
@@ -484,7 +487,7 @@ async def test_compress_infeasible_is_its_own_note(
 ) -> None:
     from astrbot_plugin_media_analysis import settings
 
-    cfg = settings.Settings(vision_provider_id="fake-chat", video_max_direct_bytes=MiB)
+    cfg = settings.Settings(vision_provider_id="fake-chat", video_max_direct_mb=1)
     rig = build_rig(
         monkeypatch,
         tmp_path,
@@ -509,7 +512,7 @@ async def test_compressed_without_audio_records_the_noaudio_note(
     """源无音轨 ⇒ 压缩去音频参 + `video_compressed_noaudio`（否则 ffmpeg 会造空音轨）。"""
     from astrbot_plugin_media_analysis import settings
 
-    cfg = settings.Settings(vision_provider_id="fake-chat", video_max_direct_bytes=MiB)
+    cfg = settings.Settings(vision_provider_id="fake-chat", video_max_direct_mb=1)
     native = native_video(text="无声视频也看见了")
     rig = build_rig(
         monkeypatch, tmp_path, kind="video", native=native, cfg=cfg, streams=(False, True)
@@ -531,7 +534,7 @@ async def test_short_budget_skips_both_compression_and_native(
     """剩余预算 < `compress_timeout + native_timeout/2` ⇒ `video_skip_budget`，两跳都不花钱。"""
     from astrbot_plugin_media_analysis import settings
 
-    cfg = settings.Settings(vision_provider_id="fake-chat", video_max_direct_bytes=MiB)
+    cfg = settings.Settings(vision_provider_id="fake-chat", video_max_direct_mb=1)
     native = native_video()
     rig = build_rig(monkeypatch, tmp_path, kind="video", native=native, cfg=cfg)
     _bigger_source(rig)
@@ -808,37 +811,40 @@ async def test_no_native_call_when_remaining_budget_is_exhausted(
 
 
 @pytest.mark.asyncio
-async def test_native_max_tokens_comes_from_settings(
+async def test_native_max_tokens_is_the_runtime_constant(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    from astrbot_plugin_media_analysis import settings
+    """v0.5.1（SPEC-v0.5.1 §2.2-B / D-1）：`native_max_tokens` 键已删 ⇒ **常量 4096** 生效。
 
-    cfg = settings.Settings(vision_provider_id="fake-chat", video_native_max_tokens=2048)
+    为什么改常量：该键只有"只能调大"一个语义，而 mimo 的 4096 需求是唯一被实测过的档位
+    （1024/2048 会 200 但正文为空 —— `VERIFY-v0.3.md` 的 mimo 行）。
+    断言**真正发出去的请求**（`call_native` 的 payload），不是读一遍模块常量自证。
+    """
+    from astrbot_plugin_media_analysis import settings, video_native
+
+    assert video_native.NATIVE_MAX_TOKENS == 4096
+    cfg = settings.Settings(vision_provider_id="fake-chat")
     native = native_video()
     rig = build_rig(monkeypatch, tmp_path, kind="video", native=native, cfg=cfg)
 
     await rig.run(include_frames="auto")
 
-    assert native.payloads()[0]["max_tokens"] == 2048
+    assert native.payloads()[0]["max_tokens"] == video_native.NATIVE_MAX_TOKENS
 
 
-@pytest.mark.asyncio
-async def test_native_max_tokens_below_the_floor_is_raised_at_call_time(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """设置层允许字段是 64（`Settings` 不做钳位，`main._settings()` 才钳），
-    `call_native` 必须自己再抬到 1024 —— 两道保险，缺一条就会踩 mimo 空文本。"""
-    from astrbot_plugin_media_analysis import settings
+def test_native_timeout_is_a_runtime_constant_mirrored_in_settings() -> None:
+    """v0.5.1（§2.2-B / D-2）：`native_timeout_seconds` 键已删 ⇒ 值进**运行面常量**。
 
-    cfg = settings.Settings(
-        vision_provider_id="fake-chat", video_native_max_tokens=64
-    )
-    native = native_video()
-    rig = build_rig(monkeypatch, tmp_path, kind="video", native=native, cfg=cfg)
+    `settings.NATIVE_TIMEOUT_S` 是**配置面的镜像**（`main._native_timeout_s()` 读它兜底），
+    两者必须相等 —— 否则就是"第二事实源"，`ready` 行与运行期会各说一套。
+    """
+    from astrbot_plugin_media_analysis import analyze, settings
 
-    await rig.run(include_frames="auto")
-
-    assert native.payloads()[0]["max_tokens"] == 1024
+    assert analyze.NATIVE_TIMEOUT_S == 60.0
+    assert settings.NATIVE_TIMEOUT_S == analyze.NATIVE_TIMEOUT_S
+    # 旧旋钮不许"留着备用"：配置字段与常量都没了（§9.4 的静态守卫在此处的对偶）
+    assert not hasattr(settings.Settings(), "video_native_timeout_seconds")
+    assert not hasattr(settings.Settings(), "video_native_max_tokens")
 
 
 # --------------------------------------------------------------------------- #
@@ -911,7 +917,7 @@ async def test_video_fp_change_invalidates_the_cache(
     first = await rig.run(include_frames="auto")
 
     other = settings.Settings(
-        vision_provider_id="fake-chat", video_max_direct_bytes=MiB
+        vision_provider_id="fake-chat", video_max_direct_mb=1
     )
     second = await rig.run(include_frames="auto", settings_obj=other)
     third = await rig.run(include_frames="auto", settings_obj=other)
@@ -1072,7 +1078,7 @@ async def test_workdir_and_compressed_product_are_removed_after_the_run(
         return path
 
     monkeypatch.setattr(analyze_mod.tempfile, "mkdtemp", _record)
-    cfg = settings.Settings(vision_provider_id="fake-chat", video_max_direct_bytes=MiB)
+    cfg = settings.Settings(vision_provider_id="fake-chat", video_max_direct_mb=1)
     rig = build_rig(
         monkeypatch, tmp_path, kind="video", native=native_video(text="好"), cfg=cfg
     )
@@ -1121,7 +1127,7 @@ async def test_every_v03_branch_emits_only_vocabulary_notes(
     seen.update((await rig.run(include_frames="auto"))["notes"])
 
     # 压缩成功 + 无音轨压缩
-    cfg = settings.Settings(vision_provider_id="fake-chat", video_max_direct_bytes=MiB)
+    cfg = settings.Settings(vision_provider_id="fake-chat", video_max_direct_mb=1)
     rig = build_rig(
         monkeypatch,
         tmp_path,
@@ -1140,7 +1146,7 @@ async def test_every_v03_branch_emits_only_vocabulary_notes(
     ):
         cfg2 = settings.Settings(
             vision_provider_id="fake-chat",
-            video_max_direct_bytes=MiB,
+            video_max_direct_mb=1,
             video_compress_enabled=enabled,
         )
         rig = build_rig(
@@ -1266,7 +1272,7 @@ async def test_runtime_threshold_comes_from_config_not_from_the_suggestion_table
 
     assert settings.suggest_direct_bytes("gemini-3-flash-preview") == 8 * MiB
     cfg = settings.Settings(
-        vision_provider_id="fake-chat", video_max_direct_bytes=MiB
+        vision_provider_id="fake-chat", video_max_direct_mb=1
     )
     native = native_video(model_name="gemini-3-flash-preview", text="好")
     rig = build_rig(monkeypatch, tmp_path, kind="video", native=native, cfg=cfg)
@@ -1416,7 +1422,8 @@ async def test_native_burning_its_whole_budget_still_leaves_frames_usable(
     cfg = settings_mod.Settings(
         vision_provider_id="fake-chat",
         video_probe_enabled=False,  # L1 自己有预算闸，这里只测原生/抽帧的分配
-        video_native_timeout_seconds=110,  # 上限，逼出"能吃多少"的极限
+        # v0.5.1：`video.native_timeout_seconds` 键已删 ⇒ 上限是常量
+        # `analyze.NATIVE_TIMEOUT_S = 60.0`（旧值 110 与 60 在 `min(...)` 下等价）
     )
     rig = build_rig(
         monkeypatch, tmp_path, kind="video", native=native, cfg=cfg,
@@ -1437,7 +1444,9 @@ async def test_native_burning_its_whole_budget_still_leaves_frames_usable(
     payload = await rig.run(include_frames="auto")
 
     assert captured, "原生通道可用 ⇒ 必有一次调用"
-    assert captured[0]["timeout"] == pytest.approx(65.0), "100 - (25 + 10) = 65"
+    # min(NATIVE_TIMEOUT_S=60, 100 - (25 + 10)=65) = 60（v0.5.1：上限是常量 60，
+    # 不再是那个"填 110 也等于 60"的配置键）；吃完 60 s 仍剩 40 s ≥ 25 s 抽帧闸
+    assert captured[0]["timeout"] == pytest.approx(60.0)
     assert "video_skip_budget" not in payload["notes"], "抽帧没被饿死"
     assert "video_fallback_frames" in payload["notes"]
     assert len(payload["frames"]) == 1
@@ -1490,7 +1499,9 @@ async def test_budgeted_timeout_is_actually_wired_into_the_audio_stage(
     payload = await rig.run(include_frames=mode)
 
     assert calls, "生产路径必须真的调用 budgeted_timeout（评审 R2：不许再是死函数）"
-    assert calls[0][1] == pytest.approx(analyze_mod.AUDIO_TIMEOUT_S), "cap 应是音轨上限"
+    assert calls[0][1] == pytest.approx(analyze_mod.AUDIO_TIMEOUT_S), (
+        "cap 应是音轨上限（默认配置 = `limits.audio_timeout_seconds` 的默认值 60）"
+    )
     assert calls[0][2] == pytest.approx(expected_reserve), (
         f"mode={mode} 的音轨预留应为 {expected_reserve}s"
     )
@@ -1521,7 +1532,8 @@ async def test_slow_audio_with_mode_true_degrades_to_audio_timeout_and_keeps_fra
         cfg=cfg,
         frames=[(2.5, "unused")],
     )
-    monkeypatch.setattr(analyze_mod, "AUDIO_TIMEOUT_S", 0.05)
+    # v0.5.1：cap 来自配置（整数秒）⇒ 亚秒级超时从 `audio_cap_s()` 这个测试缝进
+    monkeypatch.setattr(analyze_mod, "audio_cap_s", lambda _settings: 0.05)
 
     payload = await rig.run(include_frames="true")
 
@@ -1554,7 +1566,8 @@ async def test_slow_audio_with_mode_false_is_audio_failed(
         cfg=cfg,
         frames=[(2.5, "unused")],
     )
-    monkeypatch.setattr(analyze_mod, "AUDIO_TIMEOUT_S", 0.05)
+    # v0.5.1：cap 来自配置（整数秒）⇒ 亚秒级超时从 `audio_cap_s()` 这个测试缝进
+    monkeypatch.setattr(analyze_mod, "audio_cap_s", lambda _settings: 0.05)
 
     payload = await rig.tool(include_frames="false")
 
@@ -1569,9 +1582,43 @@ async def test_voice_message_slow_audio_is_still_audio_failed(
 ) -> None:
     """语音消息（没有画面这一跳）超时 ⇒ 仍是 `AUDIO_FAILED`，不会被 R1 的降级误伤。"""
     rig = build_rig(monkeypatch, tmp_path, kind="audio", audio=audio_chat(delay=0.3))
-    monkeypatch.setattr(analyze_mod, "AUDIO_TIMEOUT_S", 0.05)
+    # v0.5.1：cap 来自配置（整数秒）⇒ 亚秒级超时从 `audio_cap_s()` 这个测试缝进
+    monkeypatch.setattr(analyze_mod, "audio_cap_s", lambda _settings: 0.05)
 
     payload = await rig.tool(include_frames="auto")
 
     assert list(payload) == list(envelope.FAIL_KEYS)
     assert payload["error"] == envelope.ERR_AUDIO_FAILED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured", [30, 95])
+async def test_audio_cap_follows_the_configured_seconds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, configured: int
+) -> None:
+    """v0.5.1 D1：`limits.audio_timeout_seconds` 必须**真的**走到 `budgeted_timeout` 的 cap。
+
+    上一版这条上限是硬编码 60；现在它是配置（slider 10–95，上界 == 兑现上界
+    `AUDIO_HONOR_MAX_S`）。这条用例断言的是**生产路径上的实参**，不是读一遍常量自证
+    （与评审 R2 的"spy 才叫接线"同一口径）。
+    """
+    from astrbot_plugin_media_analysis import settings as settings_mod
+
+    cfg = settings_mod.Settings(
+        vision_provider_id="fake-chat", audio_timeout_seconds=configured
+    )
+    rig = build_rig(monkeypatch, tmp_path, kind="audio", cfg=cfg)
+
+    real = analyze_mod.budgeted_timeout
+    caps: list[float] = []
+
+    def _spy(remaining: float, cap: float, reserve_s: float, **kwargs: float) -> float:
+        caps.append(float(cap))
+        return real(remaining, cap, reserve_s, **kwargs)
+
+    monkeypatch.setattr(analyze_mod, "budgeted_timeout", _spy)
+
+    payload = await rig.run()
+
+    assert payload["ok"] is True
+    assert caps and caps[0] == float(configured), f"cap 应取配置值 {configured}"

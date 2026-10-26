@@ -40,11 +40,20 @@ ADAPTER_TYPE = "openai_chat_completion"
 VIDEO_BLOCK_TYPE = "video_url"
 DATA_URL_PREFIX = "data:video/mp4;base64,"
 
+#: `max_tokens` 的**生效值**（v0.5.1 起是代码常量：配置键 `video.native_max_tokens` 已删除）。
+#:
+#: 为什么不再让运维填：这个旋钮只有"只能调大"一个语义，而 mimo 的 4096 需求
+#: （`SPEC-v0.3` §7.2 护栏①：8 MiB + 长提示词在 1024/2048 下会 200 但正文为空）是**唯一**
+#: 被实测过的档位 ⇒ 留着等于把一个必然要调到 4096 的旋钮交给用户
+#: （SPEC-v0.5.1 §2.2-B 的 D-1，已由 captain 确认不可否决）。
+NATIVE_MAX_TOKENS = 4096
+
 #: `max_tokens` 硬下限（§7.2 护栏①）：mimo 在 64 时 **200 但 `content` 空**
 #: （全被 reasoning 吃掉，`MEASURE §2.2`）⇒ 只看状态码会把"没看见"记成成功。
+#: v0.5.1 起它**只是下界断言**（`tokens = max(FLOOR, max_tokens)`），配置面不再暴露。
 MAX_TOKENS_FLOOR = 1024
 
-#: 直送的**内存**硬上限（§10.2-③）：与 `video.max_direct_bytes` 的钳位上限同值。
+#: 直送的**内存**硬上限（§10.2-③）：与 `video.max_direct_mb` 的钳位上限同值（32 MB）。
 #: 32 MiB 时 Python 侧 base64 峰值 ≈42.6 MiB、总峰值 ≤160 MiB。
 HARD_MAX_DIRECT_BYTES = 32 * 1024 * 1024
 
@@ -180,7 +189,7 @@ async def call_native(
     *,
     prompt: str,
     video_path: str,
-    max_tokens: int,
+    max_tokens: int = NATIVE_MAX_TOKENS,
     timeout: float,
 ) -> NativeOutcome:
     """把一段本地 mp4 以内联 base64 直送多模态模型，返回 `NativeOutcome`。
@@ -189,7 +198,7 @@ async def call_native(
     `stat` 取 size → 超 `HARD_MAX_DIRECT_BYTES` 直接失败 → 读字节 → base64 → **立即
     `del raw`** → 组 messages → 一次 `client.chat.completions.create`。
 
-    `timeout` 由调用方算好（`min(native_timeout_seconds, remaining - reserve)`）：
+    `timeout` 由调用方算好（`min(NATIVE_TIMEOUT_S, remaining - NATIVE_RESERVE_S)`）：
     **底层调用绕过了核心的超时与重试**（`retry_provider_request` 不在链上），
     所以这里必须自建 `asyncio.wait_for`（§7.2 护栏③）。
     """
@@ -207,7 +216,7 @@ async def call_native(
     if not isinstance(size, int) or size <= 0:
         return NativeOutcome(ok=False, note=NOTE_FAILED, detail="stat")
     if size > HARD_MAX_DIRECT_BYTES:
-        # 内存硬闸：调用方本应先按 `video.max_direct_bytes` 拦下（§5.1-②/§10.2-③）
+        # 内存硬闸：调用方本应先按 `video.max_direct_mb`（×1048576）拦下（§5.1-②/§10.2-③）
         return NativeOutcome(
             ok=False, note=NOTE_FAILED, detail=f"too_large {size}"
         )

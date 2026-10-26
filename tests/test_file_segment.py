@@ -36,8 +36,9 @@ from _fakes import (
     make_record,
 )
 
-#: `File` 段取件的必填关键字（`workdir` 由 caller 清理、`max_media_bytes` 来自配置）
-_MAX_BYTES = settings.DEFAULT_MAX_MEDIA_BYTES
+#: `File` 段取件的必填关键字（`workdir` 由 caller 清理、`max_media_bytes` 来自配置）。
+#: v0.5.1 起配置面存 MB（`limits.max_media_mb`）⇒ 字节只由 `settings.mb_to_bytes()` 派生。
+_MAX_BYTES = settings.mb_to_bytes(settings.DEFAULT_MAX_MEDIA_MB)
 
 
 def _code(exc_info: pytest.ExceptionInfo) -> str:

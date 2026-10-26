@@ -36,8 +36,15 @@ def test_hard_cap_is_32_mib_and_larger_than_the_default_direct_limit() -> None:
     from astrbot_plugin_media_analysis import settings
 
     assert video_native.HARD_MAX_DIRECT_BYTES == 32 * 1024 * 1024
-    assert settings.MAX_VIDEO_MAX_DIRECT_BYTES <= video_native.HARD_MAX_DIRECT_BYTES
-    assert settings.DEFAULT_VIDEO_MAX_DIRECT_BYTES < video_native.HARD_MAX_DIRECT_BYTES
+    # v0.5.1：配置面是 MB（`video.max_direct_mb`），字节由 `settings.mb_to_bytes()` 派生
+    assert (
+        settings.mb_to_bytes(settings.MAX_VIDEO_MAX_DIRECT_MB)
+        <= video_native.HARD_MAX_DIRECT_BYTES
+    )
+    assert (
+        settings.mb_to_bytes(settings.DEFAULT_VIDEO_MAX_DIRECT_MB)
+        < video_native.HARD_MAX_DIRECT_BYTES
+    )
 
 
 @pytest.mark.asyncio

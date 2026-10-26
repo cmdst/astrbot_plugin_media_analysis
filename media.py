@@ -607,7 +607,7 @@ async def _resolve_remote_gif_path(
     """远程 GIF 候选（`handle.gif` 且无本地文件）的**有界**取件（评审 R1）。
 
     为什么不能用 `Image.convert_to_file_path()`：它把响应**整段**落进
-    `<ASTRBOT_ROOT>/data/temp`，**没有**字节上限（绕过 `limits.max_media_bytes`）、
+    `<ASTRBOT_ROOT>/data/temp`，**没有**字节上限（绕过 `limits.max_media_mb`）、
     也不归调用方清理 —— 评审 R1 实测：`max_media_bytes=1024` 时仍把 6,253 B 全量写进
     `data/temp/media_image_*.gif` 并残留。这同时违反 SPEC-v0.4 §5.4「任务内有界下载」与
     AGENTS §8「下载字节只落 /tmp」。

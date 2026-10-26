@@ -20,6 +20,12 @@ v0.4（SPEC-v0.4 §7.1 / §3）**只加不改**：既有 21 条逐字不变，�
 同时把信封从"两种形状"扩到"**三种形状**"：新增**受理态** 4 键
 `{"ok","state","task_id","hint"}`（`ACCEPT_KEYS`），与既有成功 9 键 / 失败 3 键**键名不重叠**
 （除 `ok`）。这是 v0.1 以来第一次动信封形状，属**契约变更**（评审已批准）。
+
+v0.5.1（SPEC-v0.5.1 §5.3 / §2.2-A）**码数仍是 23**，只动两处：
+- `MEDIA_NOT_FOUND` 的 `hint` **分叉出一条唤醒轮变体**（`HINT_MEDIA_NOT_FOUND_WAKE`，
+  由 `fail_envelope_wake()` 构造），原 `HINTS["MEDIA_NOT_FOUND"]` **一字不改**；
+- 三条 hint 里的**配置键名**跟随 v0.5.1 键表改名（两个字节键变成 MB 键），
+  而原生超时那个键已被删除 ⇒ 那句改成不指向任何配置键（只说"换一个更快的视频模型"）。
 """
 
 from __future__ import annotations
@@ -66,7 +72,7 @@ HINTS: dict[str, str] = {
         "媒体时长超过配置上限；请用户发更短的片段，或让管理员调高 limits.max_media_seconds。"
     ),
     "MEDIA_TOO_LARGE": (
-        "文件体积超过上限；请用户发更短的片段，或让管理员调高 limits.max_media_bytes。"
+        "文件体积超过上限；请用户发更短的片段，或让管理员调高 limits.max_media_mb。"
     ),
     "UNSUPPORTED_MEDIA_TYPE": (
         "这个文件不是可解析的音频或视频；请用户改发语音条，"
@@ -94,10 +100,10 @@ HINTS: dict[str, str] = {
         "（走原生视频），或把 include_frames 设为 true 并配置「视觉模型」。"
     ),
     "VIDEO_FAILED": (
-        "视频模型调用失败或超时；请稍后重试，或让管理员调大 video.native_timeout_seconds。"
+        "视频模型调用失败或超时；请稍后重试，或让管理员换一个更快的视频模型。"
     ),
     "VIDEO_TOO_LARGE": (
-        "视频体积超过直送门槛且压不到门槛内；请让管理员调大 video.max_direct_bytes，"
+        "视频体积超过直送门槛且压不到门槛内；请让管理员调大 video.max_direct_mb，"
         "或把 include_frames 设为 auto 或 true 改走抽帧。"
     ),
     # —— v0.4 新增 2 条（SPEC-v0.4 §7.1；既有 21 条逐字不变）——
@@ -105,6 +111,17 @@ HINTS: dict[str, str] = {
     "TOO_MANY_TASKS": "当前会话或实例正在分析的媒体太多；请等前面的结果发出来再试。",
     "INTERNAL_ERROR": "插件内部错误；已记录日志，请让管理员查看插件日志。",
 }
+
+#: 唤醒轮（`CronMessageEvent` / 后台任务结果轮）专用的 `MEDIA_NOT_FOUND` 文案
+#: （SPEC-v0.5.1 §5.3，**不是新错误码**：`error` 仍是 `MEDIA_NOT_FOUND`，23 码不变）。
+#:
+#: 为什么要分叉：合成事件里**本来就不该有媒体**，把它当"用户忘了发"会让模型去劝用户重发
+#: 同一条消息（下一轮还是空）。这句话把模型引到唯一有效的动作上：如实转述 + 让用户**重新**
+#: 发一条新消息。与 `HINTS` 同一纪律：纯常量，无路径/异常文本/provider id/数字串。
+HINT_MEDIA_NOT_FOUND_WAKE = (
+    "本轮是后台任务的唤醒轮：这条消息里没有、也不会有任何媒体，重试本工具一定失败。"
+    "请把后台任务的失败结果如实转述给用户，并请用户重新发送媒体。"
+)
 
 # 成功信封的 9 个键，**顺序固定**（SPEC.md §6.1 / SPEC-v0.2 §6.3）；失败信封恰好 3 键。
 OK_KEYS: tuple[str, ...] = (
@@ -159,6 +176,17 @@ def fail_envelope(code: str) -> dict[str, object]:
     if code not in HINTS:
         code = ERR_INTERNAL_ERROR
     return {"ok": False, "error": code, "hint": HINTS[code]}
+
+
+def fail_envelope_wake() -> dict[str, object]:
+    """唤醒轮短路的失败信封：**恰好**三键、顺序不变，只有 `hint` 分叉（SPEC-v0.5.1 §5.3）。
+
+    为什么单开一个构造函数而不是给 `fail_envelope` 加 `hint` 形参：失败信封的键集合与
+    顺序是契约面（3 键），"哪一种失败用哪句话"只应有一个入口；把它做成显式的第二个
+    构造函数，`grep fail_envelope_wake` 就能看清"哪条路径改了文案"，也不会给别的码
+    开后门。
+    """
+    return {"ok": False, "error": ERR_MEDIA_NOT_FOUND, "hint": HINT_MEDIA_NOT_FOUND_WAKE}
 
 
 def ok_envelope(

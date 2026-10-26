@@ -30,7 +30,7 @@ from pathlib import Path
 
 import pytest
 
-from astrbot_plugin_media_analysis import settings
+from astrbot_plugin_media_analysis import settings, video_native
 
 _PLUGIN_DIR = Path(__file__).resolve().parents[1]
 _SCRIPT = _PLUGIN_DIR / "tools" / "migrate_config_v03.py"
@@ -62,6 +62,78 @@ NEW_KEYS = {
     "video.compress_timeout_seconds",
     "prompts.video_native",
 }
+
+#: **写死的 v0.3 快照**（SPEC-v0.5.1 §10 不变式 4）：`migrate_config_v03.py` 是
+#: v0.2→v0.3 的历史锚点（`VERIFY-v0.3.md` 与旧派单引用过它的 21 行报告）。
+#: v0.5.1 起本文件**不再读 live `settings` 的键表/默认值** —— 现行键表已经是 21 叶的
+#: 新形态（3 个字节键改名、2 个 native 键删除、`compress_target` 默认 8→6），
+#: 拿 live 值去比会让旧证据随新版自动漂（"对齐一下就好了"正是要防的那种腐化）。
+KEY_ORDER_V03: tuple[tuple[str, str], ...] = (
+    ("provider_settings.audio_provider_id", "str"),
+    ("provider_settings.video_provider_id", "str"),
+    ("provider_settings.vision_provider_id", "str"),
+    ("provider_settings.stt_provider_id", "str"),
+    ("video.probe_enabled", "bool"),
+    ("video.probe_ttl_seconds", "int"),
+    ("video.max_direct_bytes", "int"),
+    ("video.native_timeout_seconds", "int"),
+    ("video.native_max_tokens", "int"),
+    ("video.compress_enabled", "bool"),
+    ("video.compress_target_bytes", "int"),
+    ("video.compress_timeout_seconds", "int"),
+    ("prompts.audio", "text"),
+    ("prompts.video", "text"),
+    ("prompts.frame", "text"),
+    ("prompts.summary", "text"),
+    ("prompts.video_native", "text"),
+    ("limits.max_media_seconds", "int"),
+    ("limits.max_frames", "int"),
+    ("limits.max_media_bytes", "int"),
+    ("cache.ttl_seconds", "int"),
+)
+
+#: v0.3 schema 里这 21 个叶的 `type`（第二份**独立**数据：迁移器只存短标签）
+SCHEMA_TYPES_V03: dict[str, str] = {
+    "provider_settings.audio_provider_id": "string",
+    "provider_settings.video_provider_id": "string",
+    "provider_settings.vision_provider_id": "string",
+    "provider_settings.stt_provider_id": "string",
+    "video.probe_enabled": "bool",
+    "video.probe_ttl_seconds": "int",
+    "video.max_direct_bytes": "int",
+    "video.native_timeout_seconds": "int",
+    "video.native_max_tokens": "int",
+    "video.compress_enabled": "bool",
+    "video.compress_target_bytes": "int",
+    "video.compress_timeout_seconds": "int",
+    "prompts.audio": "text",
+    "prompts.video": "text",
+    "prompts.frame": "text",
+    "prompts.summary": "text",
+    "prompts.video_native": "text",
+    "limits.max_media_seconds": "int",
+    "limits.max_frames": "int",
+    "limits.max_media_bytes": "int",
+    "cache.ttl_seconds": "int",
+}
+
+#: v0.3 脚本写进配置的 10 条默认值（**v0.3 当时的字面值**，不是今天的 defaults）
+NEW_KEY_DEFAULTS_V03: dict[str, object] = {
+    "provider_settings.video_provider_id": "",
+    "video.probe_enabled": True,
+    "video.probe_ttl_seconds": 604800,
+    "video.max_direct_bytes": 8388608,
+    "video.native_timeout_seconds": 60,
+    "video.native_max_tokens": 2048,
+    "video.compress_enabled": True,
+    "video.compress_target_bytes": 8388608,
+    "video.compress_timeout_seconds": 30,
+}
+
+#: v0.2 的 11 个键（v0.3 脚本**一个都不删**）
+V02_KEYS: frozenset[str] = frozenset(
+    {key for key, _t in KEY_ORDER_V03} - NEW_KEYS
+)
 
 
 def _load_migrator():
@@ -124,103 +196,80 @@ def _run(capsys, *argv: str) -> tuple[int, str, str]:
 # --------------------------------------------------------------------------- #
 # 1. KEY_ORDER / NEW_KEY_DEFAULTS：与插件侧的对偶
 # --------------------------------------------------------------------------- #
-def test_key_order_is_the_twenty_one_keys_in_schema_order() -> None:
-    """21 键、**是 v0.4.2 键表的 21 键前缀**（SPEC-v0.4.2 §3.2）。
+def test_key_order_is_the_frozen_twenty_one_key_snapshot() -> None:
+    """21 键、顺序 == **写死的** `KEY_ORDER_V03`（SPEC-v0.5.1 §10 不变式 4）。
 
-    **v0.4.2 起本脚本冻结**（v0.2→v0.3 的历史快照）：当前键表是 22 键、第四处换成了
-    `tools/migrate_config_v042.py`，所以这里的判据从"全等"降级为"**前缀**"——集合 ==
-    全集 − `{"background.mode"}`、顺序 == 前 21 位。这几个字是 v0.4.2 唯一改动本文件的地方。
+    v0.3 脚本是 v0.2→v0.3 的历史快照；v0.5.1 的"第四处"是 `migrate_config_v05.py`，
+    而"v0.3 是 v0.4.2 的 21 键前缀"这条关系由 `tests/test_config_map.py` 钉住。
     """
     keys = [key for key, _type in migrator.KEY_ORDER]
-    current = list(settings.KEY_MAP)
+    assert tuple(migrator.KEY_ORDER) == KEY_ORDER_V03
     assert len(keys) == 21
-    assert set(keys) == set(settings.KEY_MAP) - {"background.mode"}
-    assert keys == list(_schema_leaves())[:21]
-    assert keys == current[:21], "v0.3 必须是 v0.4.2 的**21 键前缀**"
-    assert current[21:] == ["background.mode"], "新键只许追加在末尾"
 
 
-def test_key_order_type_labels_match_the_schema_types() -> None:
-    """展示用类型（`str/bool/int/text`）与 schema 的 `type`（`string/bool/int/text`）同义。
+def test_key_order_type_labels_match_the_frozen_schema_types() -> None:
+    """展示用类型（`str/bool/int/text`）与**冻结的** v0.3 schema 类型同义。
 
     迁移器刻意用短标签（它不 import 插件模块、也不读 schema），所以这里做一次**映射**后
     比对 —— 目的不是逼两边字面相同，而是防"标成 str 的键其实是 bool"这种会误导运维的漂移。
     """
-    leaves = _schema_leaves()
     same = {"str": "string", "string": "string", "int": "int", "bool": "bool", "text": "text"}
     for key, type_name in migrator.KEY_ORDER:
-        assert same[type_name] == leaves[key]["type"], f"{key} 的类型标签与 schema 不一致"
+        assert same[type_name] == SCHEMA_TYPES_V03[key], f"{key} 的类型标签与冻结 schema 不一致"
+    assert set(SCHEMA_TYPES_V03) == {key for key, _t in KEY_ORDER_V03}
 
 
 def test_new_key_defaults_are_exactly_the_ten_new_keys() -> None:
     """`NEW_KEY_DEFAULTS` 不能多也不能少：多一个 = 脚本替用户造了旧键的值。"""
     assert set(migrator.NEW_KEY_DEFAULTS) == NEW_KEYS
-    # v0.4.2：全集是 22 键 ⇒ 右边多一个 `background.mode`（12 = 11 个 v0.2 键 + 1 个 v0.4.2 键）
-    assert set(settings.KEY_MAP) - NEW_KEYS == {
-        "provider_settings.audio_provider_id",
-        "provider_settings.vision_provider_id",
-        "provider_settings.stt_provider_id",
-        "prompts.audio",
-        "prompts.video",
-        "prompts.frame",
-        "prompts.summary",
-        "limits.max_media_seconds",
-        "limits.max_frames",
-        "limits.max_media_bytes",
-        "cache.ttl_seconds",
-        "background.mode",
-    }, "v0.2 的 11 键 + v0.4.2 的 1 键集合漂了"
+    assert {key for key, _t in KEY_ORDER_V03} - NEW_KEYS == set(V02_KEYS)
+    assert len(V02_KEYS) == 11, "v0.2 的 11 键必须原样留着（v0.3 只加不改）"
 
 
-def test_new_key_defaults_match_settings_and_schema_verbatim() -> None:
-    """三处默认值逐字一致：迁移器 ⇄ `settings.py` ⇄ `_conf_schema.json`。
+def test_new_key_defaults_match_the_frozen_v03_values() -> None:
+    """10 条默认值与 **v0.3 当时的字面值**逐字一致（`prompts.video_native` 除外，见下）。
 
-    脚本是独立文件（不 import 插件模块），所以它是**手工对偶**。三处只要有一处漂了，
-    "跑完脚本以后 WebUI 上看到的默认值"就不等于"运行期真的会用的值"。
+    为什么不再比 live `settings`：v0.5.1 已经**知情地**改了两个默认值（D-1 常量 4096、
+    D-3 `compress_target` 8→6），再拿 live 值比只会逼人"为了对齐而改旧脚本"。
     """
-    leaves = _schema_leaves()
-    expected = {
-        "provider_settings.video_provider_id": settings.DEFAULT_PROMPTS and "",
-        "video.probe_enabled": settings.DEFAULT_VIDEO_PROBE_ENABLED,
-        "video.probe_ttl_seconds": settings.DEFAULT_VIDEO_PROBE_TTL_SECONDS,
-        "video.max_direct_bytes": settings.DEFAULT_VIDEO_MAX_DIRECT_BYTES,
-        "video.native_timeout_seconds": settings.DEFAULT_VIDEO_NATIVE_TIMEOUT_SECONDS,
-        "video.native_max_tokens": settings.DEFAULT_VIDEO_NATIVE_MAX_TOKENS,
-        "video.compress_enabled": settings.DEFAULT_VIDEO_COMPRESS_ENABLED,
-        "video.compress_target_bytes": settings.DEFAULT_VIDEO_COMPRESS_TARGET_BYTES,
-        "video.compress_timeout_seconds": settings.DEFAULT_VIDEO_COMPRESS_TIMEOUT_SECONDS,
-        "prompts.video_native": settings.DEFAULT_PROMPTS["video_native"],
+    numbers = {
+        key: value
+        for key, value in NEW_KEY_DEFAULTS_V03.items()
+        if key != "provider_settings.video_provider_id"
     }
-    assert migrator.NEW_KEY_DEFAULTS == expected
-    for key, value in migrator.NEW_KEY_DEFAULTS.items():
-        assert leaves[key]["default"] == value, f"{key} 的 schema 默认值与迁移器漂了"
+    for key, value in numbers.items():
+        assert migrator.NEW_KEY_DEFAULTS[key] == value, f"{key} 的冻结默认值漂了"
+    # provider 位是空串；提示词默认值仍在 live `settings` 里（文案未变，单源更安全）
+    assert migrator.NEW_KEY_DEFAULTS["provider_settings.video_provider_id"] == ""
+    assert (
+        migrator.NEW_KEY_DEFAULTS["prompts.video_native"]
+        == settings.DEFAULT_PROMPTS["video_native"]
+    )
+    # 提示词那条故意不进冻结表（正文单源在 `settings.DEFAULT_PROMPTS`）
+    assert set(migrator.NEW_KEY_DEFAULTS) == set(NEW_KEY_DEFAULTS_V03) | {
+        "prompts.video_native"
+    }
 
 
-def test_new_key_defaults_equal_settings_dataclass_defaults() -> None:
-    """再对齐一次 `Settings()`：字段默认值 == 迁移器写的值（WebUI 与实际行为同一份）。"""
-    snapshot = settings.Settings()
-    assert migrator.NEW_KEY_DEFAULTS["provider_settings.video_provider_id"] == snapshot.video_provider_id
-    assert migrator.NEW_KEY_DEFAULTS["video.probe_enabled"] == snapshot.video_probe_enabled
-    assert migrator.NEW_KEY_DEFAULTS["video.probe_ttl_seconds"] == snapshot.video_probe_ttl_seconds
-    assert migrator.NEW_KEY_DEFAULTS["video.max_direct_bytes"] == snapshot.video_max_direct_bytes
-    assert (
-        migrator.NEW_KEY_DEFAULTS["video.native_timeout_seconds"]
-        == snapshot.video_native_timeout_seconds
+def test_frozen_v03_defaults_deliberately_differ_from_todays_values() -> None:
+    """冻结快照与 v0.5.1 现行默认值**有意不同** —— 这是 §9.3 声明式变更的机器证据。
+
+    D-1：`native_max_tokens` 2048（键已删，常量 = 4096）；
+    D-3：`compress_target` 8 MiB（8388608）→ 6 MiB（6291456）；
+    未变的两条（`max_direct_bytes` 8 MiB、`probe_ttl_seconds` 604800）必须仍然相等。
+    """
+    assert NEW_KEY_DEFAULTS_V03["video.native_max_tokens"] == 2048
+    assert video_native.NATIVE_MAX_TOKENS == 4096
+    assert NEW_KEY_DEFAULTS_V03["video.compress_target_bytes"] == 8388608
+    assert settings.mb_to_bytes(settings.DEFAULT_VIDEO_COMPRESS_TARGET_MB) == 6291456
+    # 没变的：8 MiB 门槛与 7 天 TTL
+    assert NEW_KEY_DEFAULTS_V03["video.max_direct_bytes"] == settings.mb_to_bytes(
+        settings.DEFAULT_VIDEO_MAX_DIRECT_MB
     )
     assert (
-        migrator.NEW_KEY_DEFAULTS["video.native_max_tokens"]
-        == snapshot.video_native_max_tokens
+        NEW_KEY_DEFAULTS_V03["video.probe_ttl_seconds"]
+        == settings.DEFAULT_VIDEO_PROBE_TTL_SECONDS
     )
-    assert migrator.NEW_KEY_DEFAULTS["video.compress_enabled"] == snapshot.video_compress_enabled
-    assert (
-        migrator.NEW_KEY_DEFAULTS["video.compress_target_bytes"]
-        == snapshot.video_compress_target_bytes
-    )
-    assert (
-        migrator.NEW_KEY_DEFAULTS["video.compress_timeout_seconds"]
-        == snapshot.video_compress_timeout_seconds
-    )
-    assert migrator.NEW_KEY_DEFAULTS["prompts.video_native"] == settings.DEFAULT_PROMPTS["video_native"]
 
 
 # --------------------------------------------------------------------------- #

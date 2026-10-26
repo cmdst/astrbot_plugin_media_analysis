@@ -3,7 +3,8 @@
 与 v0.3 那支脚本的**性质相同**（只补默认值、不搬值、不删键），只有增量不同：
 
 - **1 个**新键（`background.mode` = `"plugin"`），不是 10 个；
-- `KEY_ORDER` 是 **22 键**，且必须**恰好**是 `settings.KEY_MAP` 的顺序；
+- `KEY_ORDER` 是 **22 键**；**v0.5.1 起本脚本冻结为历史快照** ⇒ 核对的是下面写死的
+  `KEY_ORDER_V042` 元组，**不再**比 `settings.KEY_MAP`（那份已经变成 21 叶的新键表）；
 - `tools/migrate_config_v03.py` **冻结为历史快照**（仍 21 键）⇒ 本文件同时钉住
   "v03 是本表的 21 键前缀"这条关系（另一个视角见 `tests/test_config_map.py`）。
 
@@ -46,6 +47,62 @@ _PRESENT_KEYS = 6
 
 #: v0.4.2 的**唯一**新键
 NEW_KEYS = {"background.mode"}
+
+#: **冻结快照**（SPEC-v0.5.1 §10 不变式 4）：v0.4.2 迁移器是历史锚点，
+#: `VERIFY-v0.4.2.md` 与旧派单引用过它的 22 行报告。v0.5.1 把"第四处"换成了
+#: `migrate_config_v05.py` ⇒ 本表**写死**，不再跟随 `settings.KEY_MAP`（否则每加一版
+#: 旧脚本都会被"顺手对齐"，证据失效）。
+KEY_ORDER_V042: tuple[tuple[str, str], ...] = (
+    ("provider_settings.audio_provider_id", "str"),
+    ("provider_settings.video_provider_id", "str"),
+    ("provider_settings.vision_provider_id", "str"),
+    ("provider_settings.stt_provider_id", "str"),
+    ("video.probe_enabled", "bool"),
+    ("video.probe_ttl_seconds", "int"),
+    ("video.max_direct_bytes", "int"),
+    ("video.native_timeout_seconds", "int"),
+    ("video.native_max_tokens", "int"),
+    ("video.compress_enabled", "bool"),
+    ("video.compress_target_bytes", "int"),
+    ("video.compress_timeout_seconds", "int"),
+    ("prompts.audio", "text"),
+    ("prompts.video", "text"),
+    ("prompts.frame", "text"),
+    ("prompts.summary", "text"),
+    ("prompts.video_native", "text"),
+    ("limits.max_media_seconds", "int"),
+    ("limits.max_frames", "int"),
+    ("limits.max_media_bytes", "int"),
+    ("cache.ttl_seconds", "int"),
+    ("background.mode", "str"),
+)
+
+#: v0.4.2 `_conf_schema.json` 里这 22 个叶的 `type`（写死的**第二份独立数据**：
+#: 迁移器的展示用类型 `str/bool/int/text` 只是 schema 类型的简写）。
+SCHEMA_TYPES_V042: dict[str, str] = {
+    "provider_settings.audio_provider_id": "string",
+    "provider_settings.video_provider_id": "string",
+    "provider_settings.vision_provider_id": "string",
+    "provider_settings.stt_provider_id": "string",
+    "video.probe_enabled": "bool",
+    "video.probe_ttl_seconds": "int",
+    "video.max_direct_bytes": "int",
+    "video.native_timeout_seconds": "int",
+    "video.native_max_tokens": "int",
+    "video.compress_enabled": "bool",
+    "video.compress_target_bytes": "int",
+    "video.compress_timeout_seconds": "int",
+    "prompts.audio": "text",
+    "prompts.video": "text",
+    "prompts.frame": "text",
+    "prompts.summary": "text",
+    "prompts.video_native": "text",
+    "limits.max_media_seconds": "int",
+    "limits.max_frames": "int",
+    "limits.max_media_bytes": "int",
+    "cache.ttl_seconds": "int",
+    "background.mode": "string",
+}
 
 
 def _load(path: Path, name: str):
@@ -107,31 +164,33 @@ def _run(capsys, *argv: str) -> tuple[int, str, str]:
 # --------------------------------------------------------------------------- #
 # 1. KEY_ORDER / NEW_KEY_DEFAULTS：与插件侧的对偶
 # --------------------------------------------------------------------------- #
-def test_key_order_is_the_twenty_two_keys_in_schema_order() -> None:
-    """22 键、集合 == `settings.KEY_MAP`、顺序 == schema 书写顺序 == `KEY_MAP` 顺序。"""
+def test_key_order_is_the_frozen_twenty_two_key_snapshot() -> None:
+    """22 键、顺序 == **写死的** `KEY_ORDER_V042`（SPEC-v0.5.1 §10 不变式 4）。
+
+    v0.5.1 起本脚本是**历史快照**：不再与 `settings.KEY_MAP` / schema 比对（那份已经
+    变成 21 叶的新键表）。核对目标是下面那一份写死元组 —— 想改它必须先改
+    `SPEC-v0.4.2` 与本 docstring 的理由，而不是"跑红了对齐一下"。
+    """
     keys = [key for key, _type in migrator.KEY_ORDER]
+    assert tuple(migrator.KEY_ORDER) == KEY_ORDER_V042
     assert len(keys) == 22
-    assert set(keys) == set(settings.KEY_MAP)
-    assert keys == list(_schema_leaves())
-    assert keys == list(settings.KEY_MAP)
     assert keys[-1] == "background.mode", "新组必须追加在**最末尾**（旧 21 键相对顺序不动）"
 
 
-def test_key_order_type_labels_match_the_schema_types() -> None:
-    """展示用类型（`str/bool/int/text`）与 schema 的 `type`（`string/bool/int/text`）同义。"""
-    leaves = _schema_leaves()
+def test_key_order_type_labels_match_the_frozen_schema_types() -> None:
+    """展示用类型（`str/bool/int/text`）与**冻结的** v0.4.2 schema 类型同义。"""
     same = {"str": "string", "string": "string", "int": "int", "bool": "bool", "text": "text"}
     for key, type_name in migrator.KEY_ORDER:
-        assert same[type_name] == leaves[key]["type"], f"{key} 的类型标签与 schema 不一致"
+        assert same[type_name] == SCHEMA_TYPES_V042[key], f"{key} 的类型标签与冻结 schema 不一致"
+    assert set(SCHEMA_TYPES_V042) == {key for key, _t in KEY_ORDER_V042}
 
 
 def test_new_key_defaults_are_exactly_the_background_mode() -> None:
     """`NEW_KEY_DEFAULTS` **恰好 1 条**：多一个 = 脚本替用户造了旧键的值。"""
     assert set(migrator.NEW_KEY_DEFAULTS) == NEW_KEYS
-    assert set(settings.KEY_MAP) - set(migrator.NEW_KEY_DEFAULTS) == (
-        set(settings.KEY_MAP) - NEW_KEYS
-    )
-    assert len(set(settings.KEY_MAP) - NEW_KEYS) == 21, "旧 21 键必须原样留着"
+    frozen_keys = {key for key, _type in KEY_ORDER_V042}
+    assert frozen_keys - set(migrator.NEW_KEY_DEFAULTS) == frozen_keys - NEW_KEYS
+    assert len(frozen_keys - NEW_KEYS) == 21, "旧 21 键必须原样留着"
 
 
 def test_new_key_default_matches_settings_and_schema_verbatim() -> None:

@@ -1,6 +1,6 @@
 # astrbot_plugin_media_analysis
 
-上游仓库：<https://github.com/cmdst/astrbot_plugin_media_analysis>（v0.4.0）
+上游仓库：<https://github.com/cmdst/astrbot_plugin_media_analysis>（**v0.5.1**）
 
 给 LLM 一个工具 `media_analyze`：把**当前消息或引用消息**里的语音/视频/GIF
 （**含以「群文件」形式投递的 mp4/m4a/silk/gif…**）交给多模态模型。**工具调用是异步的**：
@@ -14,6 +14,25 @@
 `video` 的 0 个），而 `Record` 到手已是本地 wav、`Video` 一行 `convert_to_file_path()`
 就是本地文件、群文件一行 `file_`/`url` 就能拿到 —— 硬件条件齐了，缺的只是
 "把视频降维成模型能吃的东西"这一段编排。
+
+## v0.5.1 改了什么（**配置面重做 + 六个运行面缺陷**）
+
+| # | 变更 | 一句话 |
+|---|---|---|
+| ① | **配置 22 叶 → 21 叶 / 6 组** | 三个字节键**改名成 MB**（`video.max_direct_mb` / `video.compress_target_mb` / `limits.max_media_mb`，**1 MB = 1,048,576 字节**）；删 `native_max_tokens` / `native_timeout_seconds`（值进代码常量 4096 / 60 s）；新增 **`limits.audio_timeout_seconds`**（默认 60，**10–95**）；**隐藏** 4 键（`stt_provider_id` / `probe_enabled` / `probe_ttl_seconds` / `compress_timeout_seconds`，键与值都保留）；`background` 组**置顶**、`prompts` 组**置末** ⇒ `video` 只剩 3 行可见 |
+| ② | **D1 音频超时可配 + 恰好重试一次** | 硬编码 60 s → 配置项；超时只重试**一次**，总耗时仍 ≤ 100 s；`log_detail` 能分辨 `first_timeout` / `retry_timeout` / `retry_skipped=budget`；**要画面时（`soft_timeout`）语义一字不变**；provider 抛错不重试 |
+| ③ | **D2 唤醒轮短路** | 后台任务失败后的「唤醒轮」消息链恒空 ⇒ 模型重试必然 `MEDIA_NOT_FOUND` 并把超时说成"文件丢了"。现在合成事件**直接返回专用 hint**（`HINT_MEDIA_NOT_FOUND_WAKE`），**不提交后台任务、不产生 task_id**；检测 **fail-open** |
+| ④ | **C7 `route=` 观测行** | 每次调用（含失败与缓存命中）**恰一行** `media_analysis: route=… stage=… engine=… kind=… fallback=… cached=… …`，A2 / C 双引擎都覆盖 ⇒ **一条 grep 取代翻缓存信封**；`delivered=` 仍只归 A2 的 `bg finished`；该行**不写 notes**（缓存中立） |
+| ⑤ | **加载期三条一致性告警** | `config-check warn=timeout_over_budget`（**raw** 值 > 95，只可能是手改 JSON）/ `compress_target_ge_075_direct` / `max_direct_over_suggested`。只 WARN、每 id 每进程至多一条、**不改配置** |
+| ⑥ | **`ready` 行打有效值 + 启动期噪声修复** | 18 个 `key=value`，含收敛上限 `native_timeout_cap_s=65` 与 `audio_timeout_cap_s=95`（都由公式算）；旧字节字段 4 个全删。加载期不再调 `context.get_provider_by_id()`（它会自己 WARN）⇒ 冷启动 `Provider … was not found` **归零** |
+
+**声明式变更（知情改变，别写成"语义不变"）**：`native_max_tokens` **2048 → 4096**（常量）／
+native 生效超时 **61.4 → 60.0 s**（常量）／`compress_target_mb` 默认 **8 → 6**、下限 **0.5 → 1**／
+**压缩跳门槛 115 → 90 s**（生产串；默认串 60 s **不变** —— 详见 `CHANGELOG.md` 的 D-1…D-5）。
+
+**升级顺序变了**：本版**必须**「备份 → 覆盖代码 → **跑 `tools/migrate_config_v05.py`** → 重载一次」。
+**漏做迁移那一步 = 运营方的 32 MB 直接退回 8 MB、29 退回 6**，日志只留一条 `Config key removed`。
+见「部署与迁移 → v0.4.2 → v0.5.1」。
 
 ## v0.4.2 改了什么（**默认行为与 v0.4.1 逐字相同**）
 
@@ -110,7 +129,7 @@
 - **普通图片仍然不进链**：`Image` + JPEG/PNG/WebP/APNG 在**受理路径**就返回
   `MEDIA_NOT_FOUND`（同步、不建任务）；改名党（`.gif` 后缀 + 非 GIF 内容）也过不了魔数。
 - **远程 GIF（只有 URL、没有本地文件）走插件自己的有界下载**：边读边数、超
-  `limits.max_media_bytes` 立刻放弃（`MEDIA_TOO_LARGE`）、产物只落本任务的
+  `limits.max_media_mb` 立刻放弃（`MEDIA_TOO_LARGE`）、产物只落本任务的
   `/tmp/media_analysis_*` 并随 `finally` 删除。**绝不用**核心的
   `Image.convert_to_file_path()` —— 那条路没有字节上限、落 `<ASTRBOT_ROOT>/data/temp`
   且调用后残留（v0.4 的 R1 回归，已修）。
@@ -120,7 +139,7 @@
   **`trunc(.../2)*2` 必不可少**：奇数宽 + `yuv420p` + libx264 ⇒ `rc=187`、**0 字节产物**。
   两条 argv：上面的冻结版给**多帧**源；**单帧**源用静止变体（`gif_static_argv`，滤镜里多一个
   `tpad` 前置），见下两条。
-- **四道闸**：源字节（`limits.max_media_bytes`）/ 源时长（`limits.max_media_seconds`，
+- **四道闸**：源字节（`limits.max_media_mb`）/ 源时长（`limits.max_media_seconds`，
   复用源时长探测 `probe_gif_duration_s`）/ 整次 ffmpeg **≤ 10 s** / 产物非空、不超上限、
   **时长可度量**。失败码：体积 `MEDIA_TOO_LARGE`、时长 `MEDIA_TOO_LONG`、转换 `GIF_CONVERT_FAILED`。
 - **单帧 GIF 走「1 s + 12 fps 克隆帧」静止变体**（真机 F2/F2-R/F2-S 的最终修法，`gif_static_argv`）：
@@ -152,6 +171,30 @@
   "模型只看见一帧"与"整段都看了"——`gif_converted` / `gif_static` 只反映归一参数与**源**帧数。
   帧间隔与"模型看得见什么"之间没有可判定的映射 ⇒ 登记为观测局限，**不做自动补偿**
   （要"逐帧都被看见"请发视频，或把 `include_frames` 设为 `true` 走抽帧回退）。
+
+#### 这张 GIF 到底能不能到插件？（**v0.5.1 实测口径**）
+
+旧派单里曾写过「本平台 GIF 结构不可达」—— **那是错的**，实测证伪：
+
+| 事实 | 判据 |
+|---|---|
+| **平台会把真动图原样落盘** | `/root/AstrBot/data/temp/media_image_20261026044400746_affe.gif` = **1,331,920 B**，前 6 字节 `474946383761`（= `GIF87a`），`ffprobe -count_frames` ⇒ **15 帧 / 402x570 / 0.900 s** ⇒ `Image(GIF)` 的**魔数候选结构可达** |
+| **"这次没分析"不是插件拒收** | 同一轮的 core 日志里**没有** `使用工具：media_analyze` ⇒ **模型没调用工具**（插件只记录被调用的轮次，没被调用时日志里连 `media_analysis: route=` 都没有） |
+| **也有"被平台压成静态图"的情形** | 2026-10-26 02:46 那两条是 `media_image_*.jpg`（5,695 / 5,938 B）⇒ 那时按普通图片 `MEDIA_NOT_FOUND`，**属设计**（图片不进本插件） |
+
+⇒ 正确说法是：**GIF 能到插件**；断点可能在**模型不为"图片"调用本工具**，也可能在**平台压缩**（逐条消息而异）。
+判据只看两处结构化日志：`使用工具：media_analyze`（core）与 `media_analysis: route=`（插件）。
+复核命令：
+
+```bash
+ls -la /root/AstrBot/data/temp/media_image_*.gif | tail -3
+head -c 6 /root/AstrBot/data/temp/media_image_20261026044400746_affe.gif | xxd -p   # 474946383761 = GIF87a
+ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames \
+        -of default=noprint_wrappers=1 <那个 .gif>
+grep -a -c '使用工具：media_analyze' /root/AstrBot/data/logs/astrbot.log     # 0 ⇒ 那一轮模型没调
+grep -a 'media_analysis: route=' /root/AstrBot/data/logs/astrbot.log | tail -3
+```
+
 
 ### 后台语义（v0.4）
 
@@ -186,7 +229,7 @@
 | ① | **视频主路径改原生直送** | `client.chat.completions.create(messages=[text, video_url(base64 data url)])`；核心 `text_chat` 放不进 video 块（`assemble_context` 硬抛 `ValueError`）⇒ 走 provider 底层 `client`，三条护栏见下 |
 | ② | **抽帧降级为回退** | 原生不可用 / 超门槛压不动 / 调用失败时才抽帧；`vision_provider_id` 语义收窄为"仅回退用的图片模型" |
 | ③ | **三模型位** | `video_provider_id`（原生视频，**新增**）+ `vision_provider_id`（仅抽帧）+ `audio_provider_id`（音轨） |
-| ④ | **超门槛先压缩** | 默认 8 MiB 直送门槛（按**延迟**定，不是 provider 上限）；ffmpeg 480p + ABR + AAC 64k mono，最多 2 趟，产物只落 `/tmp` |
+| ④ | **超门槛先压缩** | 默认 8 MiB 直送门槛（v0.5.1 起是 `video.max_direct_mb = 8`；按**延迟**定，不是 provider 上限）；ffmpeg 480p + ABR + AAC 64k mono，最多 2 趟，产物只落 `/tmp` |
 | ⑤ | **L1 可见性探测** | 4 s 合成小样片 + "数字=?,单词=?"（**双 token 都命中**才算过，200 ≠ 看见）；探测结论缓存 7 天，每窗口最多自动 1 次 |
 | ⑥ | **`include_frames` 变三态** | `auto`（默认）/`true`/`false` 字符串；`false` + 原生失败 ⇒ **绝不静默抽帧** |
 | ⑦ | **配置 11 → 21 键** | 新增 `video` 组 8 键 + `video_provider_id` + `prompts.video_native`；旧 11 键一个不动，`tools/migrate_config_v03.py` 补默认并审计 |
@@ -194,7 +237,9 @@
 **三条护栏（原生路径碰的是核心内部面 `provider.client`，不是公开 API）**：
 1. `max_tokens` 硬下限 **1024**（实测有模型在 64 时返回 200 但正文为空，全被推理吃掉）；
 2. **空 `content`/哨兵判失败并回退**（`[无可用内容]` / `[无语音]` 等同空文本）；
-3. 自建 `asyncio.wait_for`（`min(native_timeout_seconds, 剩余预算−35 s)`），底层调用**绕过**
+3. 自建 `asyncio.wait_for`（`min(NATIVE_TIMEOUT_S=60 s, 剩余预算 − 35 s)`；**v0.5.1 起超时是代码常量**，
+   `video.native_timeout_seconds` 键已删 —— 旧配置填 110 与填 61 等价，`ready` 行会打出
+   `native_timeout_s=60` 与收敛上限 `native_timeout_cap_s=65`），底层调用**绕过**
    核心的超时/重试。整块包在 `try/except Exception` 里：拿不到 `client`、适配器类型不符、调用
    抛错 ⇒ 只记 `video_native_unavailable`/`video_native_failed` **回退**，绝不让它变成新的
    "静默拒载"点。
@@ -330,7 +375,7 @@
 |---|---|---|---|---|
 | ① | **解析视频位** | 见上一节的五步阶梯 | 有原生通道 ⇒ ②；没有 ⇒ ⑤ | `video_provider:<id>` / `video_asserted` / `video_native_unavailable` |
 | ② | **L1 可见性探测**（仅首次） | 缓存 miss 或过期；`video.probe_enabled=true` 且 `probe_ttl_seconds>0` | 4 s 合成样片 + "数字=?单词=?"，**两条都命中才算过** | `video_probe_cached` / `video_probe_l1_ok` / `video_probe_l1_failed` / `video_probe_disabled` / `video_skip_budget` |
-| ③ | **直送闸 → 压缩** | `size > video.max_direct_bytes` 且 `compress_enabled=true` | ffmpeg 480p + ABR + AAC 64k mono，最多 **2 趟**；预算 = `min(compress_target_bytes, max_direct_bytes)` | `video_compressed:<from>-><to>`（命中）；`video_compress_skipped` / `video_compress_infeasible` / `video_compress_failed`，然后 ⑤ |
+| ③ | **直送闸 → 压缩** | `size > video.max_direct_mb × 1048576` 且 `compress_enabled=true` | ffmpeg 480p + ABR + AAC 64k mono，最多 **2 趟**；预算 = `min(compress_target_mb, max_direct_mb)` | `video_compressed:<from>-><to>`（命中）；`video_compress_skipped` / `video_compress_infeasible` / `video_compress_failed`，然后 ⑤ |
 | ④ | **原生调用** | 通道可用且（≤门槛 或 压缩命中） | `client.chat.completions.create(messages=[text, video_url(data:video/mp4;base64,…)])`，`max_tokens≥1024` | `video_native`；失败/超时 `video_native_failed`、200 但空文本 `video_native_empty` ⇒ ⑤ |
 | ⑤ | **回退（`include_frames` 三态）** | ①无通道 / ④失败 / ③压不动 | `false` ⇒ **绝不抽帧**；`auto` 且无视频模型 ⇒ 只转写；`auto` 且无视觉位 ⇒ 只转写；其余 ⇒ 抽帧 | `video_frames_forbidden` / `video_unavailable_no_provider` / `video_no_vision_provider` / `video_fallback_frames` + `vision_provider:<id>` / `video_skip_budget` |
 | ⑥ | **摘要** | 有转写或画面 | 复用视觉位；材料超 8000 字符从尾部截断；摘要失败不判死整次调用 | `material_trimmed` |
@@ -375,35 +420,71 @@
 `[无语音]` 是**提示词约定的哨兵**：模型认为整段无人声时只输出它。插件侧把"空文本"与
 `[无语音]` 都归一成 `transcript: []` + note `audio_empty`（**不是错误**）。
 
-## 配置（6 组 / 22 键）
+## 配置（6 组 / 21 叶）
 
-v0.3 新增 **`video` 组（8 键）** + `provider_settings.video_provider_id` +
-`prompts.video_native`；v0.2 的 11 个键**名字/类型/默认值一个都没动**；**v0.4.2 新增
-`background` 组（1 键）**，追加在 schema **最末尾**（既有 21 键的相对顺序一个字都没动）。
-新 schema 一直是超集 ⇒ 用户旧配置零迁移可用。键表（**22 个叶子键**，与
-`settings.KEY_MAP`、`main._settings()`、`_conf_schema.json`、迁移脚本
-**`tools/migrate_config_v042.py:KEY_ORDER`** **四处互钉**；v0.3 的迁移器冻结为 21 键前缀）：
+**v0.5.1 起 21 叶**（v0.3 的 21 键 + v0.4.2 的 `background.mode` − 本版删的 2 键 + 本版新增的
+`limits.audio_timeout_seconds`；三个字节键**改名成 MB**）。键表与
+`settings.KEY_MAP`、`main._settings()`（唯一读取点）、`_conf_schema.json`、
+**`tools/migrate_config_v05.py:KEY_ORDER`** **四处互钉**（集合与顺序都相等；`migrate_config_v042.py`
+的 22 键与 `migrate_config_v03.py` 的 21 键**冻结为历史快照**）。
 
-| 组 | 键 | 类型 | 默认 | 说明 |
-|---|---|---|---|---|
-| `provider_settings` | `audio_provider_id` | string | `""` | **v0.2 新增**。音频（多模态对话）provider，模型能力必须勾了「音频」；空＝回落核心当前对话 provider（不支持音频 ⇒ `AUDIO_UNAVAILABLE`） |
-| `provider_settings` | `vision_provider_id` | string | `""` | 读图的对话 provider；空＝核心当前对话 provider |
-| `provider_settings` | `video_provider_id` | string | `""` | **v0.3 新增**。原生视频模型（需要 `openai_chat_completion` 适配器且真的接受视频输入）；空＝不走原生，视频改走抽帧。显式配置 ⇒ note `video_asserted`，但仍由 L1 实测验证 |
-| `provider_settings` | `stt_provider_id` | string | `""` | **【已弃用】** v0.2 起不生效，只为保留历史设置而留在 schema 里（删了会被核心静默删除并落盘）；值非空时打一条弃用 `WARNING`（不打值） |
-| `prompts` | `audio` / `video` / `frame` / `summary` / `video_native` | text | 内置模板 | 4 份 v0.2 新增；`video_native` **v0.3 新增**（原生视频的“画面+声音”提示词），见「提示词」节 |
-| `limits` | `max_media_seconds` | int | `60` | 超过即 `MEDIA_TOO_LONG`；允许 5–300（越界钳位 + 告警） |
-| `limits` | `max_frames` | int | `6` | `include_frames=true` 时最多抽几帧；允许 1–12 |
-| `limits` | `max_media_bytes` | int | `67108864`（64 MiB） | **v0.2 新增**。群文件取件的硬闸，超限 `MEDIA_TOO_LARGE`；允许 1 MiB–512 MiB |
-| `video` | `probe_enabled` | bool | `true` | **v0.3 新增**。L1 自动探测开关（关＝信任显式声明，省一次调用） |
-| `video` | `probe_ttl_seconds` | int | `604800`（7 天） | **v0.3 新增**。探测结果有效期；`0`＝关闭探测（不读不写）；允许 0–2592000 |
-| `video` | `max_direct_bytes` | int | `8388608`（8 MiB） | **v0.3 新增**。**按延迟定的**直送门槛（不是 provider 上限）；超了先压缩。允许 1–32 MiB（32 MiB 同时是内存硬上限） |
-| `video` | `native_timeout_seconds` | int | `60` | **v0.3 新增**。单次原生调用上限，且 ≤ 剩余预算−**35 s**（保住抽帧最小预算 `FRAMES_MIN_BUDGET_S=25` + 余量）；允许 20–110 |
-| `video` | `native_max_tokens` | int | `2048` | **v0.3 新增**。**只能调大**（硬下限 1024，防止"200 但空正文"）；允许 1024–4096。**mimo 当视频模型时必须设 4096**（实测 8 MiB + 长提示词在 1024/2048 下都会 200 但正文为空） |
-| `video` | `compress_enabled` | bool | `true` | **v0.3 新增**。超门槛时是否先压缩（压缩远比抽帧便宜） |
-| `video` | `compress_target_bytes` | int | `8388608`（8 MiB） | **v0.3 新增**。压缩预算上界；实际取 `min(它, max_direct_bytes)`；允许 512 KiB–32 MiB |
-| `video` | `compress_timeout_seconds` | int | `30` | **v0.3 新增**。两趟转码共享这一个预算；允许 10–60 |
-| `cache` | `ttl_seconds` | int | `86400`（1 天） | **v0.2 新增**。缓存 TTL；`0`＝关闭缓存；允许 0–2592000（30 天） |
-| `background` | `mode` | string（枚举） | `"plugin"` | **v0.4.2 新增**。`plugin`＝插件自管后台（A2，投递确定）/ `core`＝核心原生后台（**实验**，需核心一行补丁 + 重启，且投递由模型决定）。**坏值一律回 `plugin`**（保守侧）+ 一条 WARNING |
+**组序（＝面板渲染序）**：`background` → `provider_settings` → `video` → `limits` → `cache` → `prompts`。
+`background`（引擎开关）**置顶**、`prompts`（五段长文本）**置末** ⇒ 面板上 `video` 组只剩 **3 行可见**。
+
+| 组 | 键 | 类型 | 默认 | 面板 | 说明 |
+|---|---|---|---|---|---|
+| `background` | `mode` | string（枚举） | `"plugin"` | 可见 | `plugin`＝插件自管后台（A2，投递确定）/ `core`＝核心原生后台（**实验**，需核心一行补丁 + 重启）。**坏值一律回 `plugin`**（保守侧）+ 一条 WARNING。**v0.5.1 只挪位置、默认不变** |
+| `provider_settings` | `audio_provider_id` | string | `""` | 可见 | 音频（多模态对话）provider，模型能力须勾「音频」；空＝回落核心当前对话 provider（不支持音频 ⇒ `AUDIO_UNAVAILABLE`） |
+| `provider_settings` | `video_provider_id` | string | `""` | 可见 | 原生视频模型（需 `openai_chat_completion` 适配器且真的接受视频输入）；空＝不走原生，改走抽帧。显式配置 ⇒ note `video_asserted`，仍由 L1 实测验证 |
+| `provider_settings` | `vision_provider_id` | string | `""` | 可见 | 读图的对话 provider（**仅抽帧回退** + 摘要）；空＝核心当前对话 provider |
+| `provider_settings` | `stt_provider_id` | string | `""` | **隐藏** | **【已弃用】** v0.2 起不生效，只为保留历史设置而留在 schema 里（删了会被核心静默删除并落盘 ⇒ 丢用户值）。值非空时打一条弃用 WARNING（不打值） |
+| `video` | **`max_direct_mb`** | int | **8** | 可见 | **（MB）** 原生直送的体积门槛，**按延迟定**（不是 provider 上限）；超了先压缩。**1–32 MB**，32 MB 同时是**内存硬上限** |
+| `video` | `compress_enabled` | bool | `true` | 可见 | 超门槛时是否先压缩（压缩远比抽帧便宜） |
+| `video` | **`compress_target_mb`** | int | **6** | 可见 | **（MB）** 压缩预算上界；实际取 `min(它, max_direct_mb)`。**1–32 MB** |
+| `video` | `compress_timeout_seconds` | int | `30` | **隐藏** | 两趟转码共享这一个预算；10–60 |
+| `video` | `probe_enabled` | bool | `true` | **隐藏** | L1 自动探测开关（关＝信任显式声明，省一次调用） |
+| `video` | `probe_ttl_seconds` | int | `604800`（7 天） | **隐藏** | 探测结果有效期；`0`＝关闭探测（不读不写）；0–2592000 |
+| `limits` | `max_media_seconds` | int | `60` | 可见 | 超过即 `MEDIA_TOO_LONG`；5–300 |
+| `limits` | `max_frames` | int | `6` | 可见 | `include_frames=true` 时最多抽几帧；1–12 |
+| `limits` | **`max_media_mb`** | int | **64** | 可见 | **（MB）** 取件硬闸（群文件下载 / 远程 GIF），超限 `MEDIA_TOO_LARGE`；**1–512 MB** |
+| `limits` | **`audio_timeout_seconds`** | int | **60** | 可见 | **v0.5.1 新增**。单次多模态音频调用超时；**10–95**（step 5）。超时后**只重试一次**，总耗时仍受 100 s 总预算约束 |
+| `cache` | `ttl_seconds` | int | `86400`（1 天） | 可见 | 缓存 TTL；`0`＝关闭；0–2592000（30 天） |
+| `prompts` | `audio` / `video` / `frame` / `summary` / `video_native` | text | 内置模板 | 可见 | 5 份提示词，见「提示词」节 |
+
+### 隐藏的 4 键（**键与值都保留**，只是面板不显示）
+
+| 键 | 为什么隐藏而不是删除 |
+|---|---|
+| `provider_settings.stt_provider_id` | 弃用键。删掉 ⇒ 核心 `check_config_integrity()` 会把用户旧值当 **stale 删除并落盘**，且面板上那个弃用下拉位反而诱导误配 |
+| `video.probe_enabled` | L1 探测的总闸，属"翻车后才会去动"的开关 |
+| `video.probe_ttl_seconds` | 同上（默认 7 天够用） |
+| `video.compress_timeout_seconds` | 两趟转码的共享预算，实测 4.5–6.9 s/趟，默认 30 s 余量充足。**生产填过 60 的实例在迁移后仍是 60**（隐藏≠删除） |
+
+### 本版删除的 2 键（值改为**代码常量**）
+
+| 删掉的键 | 为什么删 | 现在的生效值 |
+|---|---|---|
+| `video.native_max_tokens` | 只有"只能调大"一个语义（硬下限 1024），留着就是把一个**必然要调到 4096** 的旋钮交给运维；mimo 在 1024/2048 下会 200 但正文为空 | **4096**（`video_native.NATIVE_MAX_TOKENS`） |
+| `video.native_timeout_seconds` | 生效值是 `min(配置值, 剩余预算 − 35 s)` ⇒ **填 110 与填 61 完全等价**（"允许填一个永远不会生效的值"） | **60 s**（`analyze.NATIVE_TIMEOUT_S`），生效 `min(60, 剩余 − 35)`；`ready` 行把两个数都打出来（`native_timeout_s=60` / `native_timeout_cap_s=65`） |
+
+### 本版改名的 3 键（字节 → MB）
+
+| 旧键（v0.4.2） | 新键（v0.5.1） | 换算 |
+|---|---|---|
+| `video.max_direct_bytes` | `video.max_direct_mb` | `mb = (bytes + 524288) // 1048576`（四舍五入） |
+| `video.compress_target_bytes` | `video.compress_target_mb` | 同上 |
+| `limits.max_media_bytes` | `limits.max_media_mb` | 同上 |
+
+- **1 MB ≡ 1 MiB ≡ 1,048,576 字节**（二进制）。为什么不用 10^6：现网三个键的"整值"都是 2 的幂
+  （8 / 32 / 64 MB），换成十进制会让面板上的"8 MB"变成 8.39 MB，历史口径全部错位。
+- **钳位在 MB 域做**，字节只在派生的 `*_bytes` property 里出现（`analyze.py` / `media.py` 的读点不变）。
+- 迁移实测：`33554432 → 32`（delta 0）、`30000000 → 29`（`30,408,704`，delta **+408,704** ≤ 半个 MB）、
+  `67108864 → 64`（delta 0）。
+
+> **面板只认 `slider`，不认 `min`/`max`**：本版所有数值叶都带 `slider{min,max,step}`，
+> 且每个 `hint` 以「（允许范围：X–Y）」结尾并与 `slider` 逐字相等（有测试钉）。
+> 顶层写 `min`/`max` **零效果** —— 面板只在有 `slider` 时钳位（`ConfigItemRenderer.vue:155-172`；
+> 没有 `slider` 时 `validateNumericConfig()` 直接 `return rawValue`，`:351-356`）。
 
 插件内**没有** API key 字段：模型一律走 AstrBot 的 provider 引用。
 `modalities` 取**严格口径**（`None`/缺省 ⇒ 不支持）：核心在两处按"未配置＝全支持"兜底，
@@ -447,9 +528,10 @@ v0.3 新增 **`video` 组（8 键）** + `provider_settings.video_provider_id` +
 
 ## 压缩（v0.3；超直送门槛时）
 
-- **触发**：`size > video.max_direct_bytes` 且 `video.compress_enabled=true`（默认 true）。
-- **字节预算** = `min(video.compress_target_bytes, video.max_direct_bytes)`（默认 `min(8 MiB, 8 MiB)`
-  = 8,388,608 B）。源已在预算内 ⇒ **0 次转码**（8 MiB 档对 48.9 s / 5.64 MB 的样本就是 SKIP）。
+- **触发**：`size > video.max_direct_mb × 1048576` 且 `video.compress_enabled=true`（默认 true）。
+- **字节预算** = `min(video.compress_target_mb, video.max_direct_mb) × 1048576`（默认 `min(6, 8)` = **6 MB**
+  = 6,291,456 B；v0.4.2 及以前的默认是 8 MiB）。源已在预算内 ⇒ **0 次转码**
+  （6 MB 档对 48.9 s / 5.64 MB 的样本仍是 SKIP —— 那 4 行实测数据按档位引用，见下表）。
 - **目标码率**：`floor(预算×8 / 时长 / 1000) − 64`（64 = AAC 音频固定开销）。`< 64 kbps` ⇒
   `video_compress_infeasible`，不硬转（48.9 s 源在 512 KiB 预算下就会落这一支）。
 - **参数（冻结）**：`scale=-2:480`（720p→480p，竖屏 720x1280 → 270x480）+ libx264 `veryfast`
@@ -462,7 +544,7 @@ v0.3 新增 **`video` 组（8 键）** + `provider_settings.video_provider_id` +
 
 | 预算档（48.901 s / 5,640,723 B 生产样本，只读） | 转码 | 视频码率 | 产物 | 耗时 |
 |---|---|---|---|---|
-| 8 MiB（默认） | **0 趟**（源已达标） | — | 5,640,723（原样直送） | 0 ms |
+| 8 MiB（v0.4.2 及以前的默认；v0.5.1 默认 6 MB） | **0 趟**（源已达标） | — | 5,640,723（原样直送） | 0 ms |
 | **4 MiB** | **1 趟** | **622k**（实现公式按 48.901 s；t8 用 48 s 整数算得 635k） | **3,873,915 B**（t4 复测；t8 首测 3,939,056 B） | **4,207 ms**（t4；t8 4,810 ms） |
 | 2 MiB | 2 趟 | 285k → 269k | 2,098,819 → **2,008,617 B** | 4,455 + 4,870 ms |
 | 1 MiB（t4 三跳信封用的预算） | 2 趟 | — | **1,031,801 B** | 含在 24.4 s 端到端内 |
@@ -513,7 +595,8 @@ python3 tools/probe_video_capability.py --provider <id> --show           # 只�
 python3 tools/probe_video_capability.py --provider <id> --clear          # 清该 provider 的缓存
 ```
 
-- 输出 `suggested_max_direct_bytes` = **p50 ≤ 45 s 的最大档**（100 s 全局预算，留 ≥55 s 给后续步骤）。
+- 输出字段 **`suggested_max_direct_bytes`**（**工具侧字段名，单位字节**；100 s 全局预算，取 **p50 ≤ 45 s 的最大档**，
+  留 ≥55 s 给后续步骤）。填配置时换算成 MB：**除以 1,048,576** 填进 `video.max_direct_mb`。
 - **一次调用可能数分钟**（1 MiB≈10–32 s、8 MiB≈43–75 s）⇒ 别在生产高峰跑。
 - 只读 `data/cmd_config.json`；**不打印 key、不打印 base64**（只打字节数与耗时）；
   只写 `probe/v1/` 缓存，不碰插件配置、不 import 插件模块。
@@ -532,14 +615,14 @@ python3 tools/probe_video_capability.py --provider <id> --clear          # 清�
    **五档全 400，连 1 MiB 都 400**；4 分钟后同批重测 **全 200**（13.6 / 36.6 / 49.0 / 93.2 / 208.4 s）。
    ⇒ **不得把单次 400 当 SLA 或能力结论**；链路遇到 400 会记 `video_native_failed` 并按规定回退，
    行为正确，重试可能就好了。也**别**把"8 MiB 直送"写成 SLA。
-2. **mimo 建议 `native_max_tokens=4096`**：8 MiB + 长提示词在 **1024 / 2048** 下会 200 但
+2. **mimo 需要 `max_tokens=4096`（v0.5.1 起已是常量，不可配）**：8 MB + 长提示词在 **1024 / 2048** 下会 200 但
    正文为空（`video_native_empty`，推理把预算吃光）。护栏会判失败并回退（**不会假成功**），
    但等于白花一次调用钱。默认 2048 只够 Gemini 类通道；**mimo 请设 4096**，
-   或把 `video.max_direct_bytes` 留在 **4 MiB** 档。
+   或把 `video.max_direct_mb` 压到 **4 MB** 档。
 3. **原生视频没有体积上限，但有延迟上限**：Gemini 到 47.2 MiB、mimo 到 36.5 MiB 都 200
    （0 次拒绝）；但 8 MiB ≈ **45.6 / 49.0 / 50.4 s**（±10% 抖动）、16 MiB 93.2 s、32 MiB 208.4 s，
    而全局预算只有 **100 s** ⇒ **>8 MiB 直送不安全**（"能过"不等于"来得及"）。默认门槛
-   `video.max_direct_bytes = 8 MiB`（钳 **1–32 MiB**，32 MiB 同时是内存硬上限）是**按延迟定的**，
+   `video.max_direct_mb = 8 MB`（钳 **1–32 MB**，32 MB 同时是内存硬上限）是**按延迟定的**，
    不是 provider 上限。
 
 > 另有两条已登记的行为（不是缺陷）：① CLI 的标称档位与实际字节差 −7%~+16%（引用用实测字节）；
@@ -547,6 +630,41 @@ python3 tools/probe_video_capability.py --provider <id> --clear          # 清�
 > `[无用内容]`）会被当成"原生成功"，见 `CHANGELOG.md` 遗留 F6。
 
 ## 部署与迁移
+
+### v0.4.2 → v0.5.1（**多了「先迁移」这一步，顺序不可反**）
+
+```
+① 备份两份（插件目录 + 插件配置）
+  → ② 覆盖代码（新代码 + 新 schema）
+  → ③ python3 tools/migrate_config_v05.py --root /root/AstrBot --report   # 干跑：changed=1 keys=21
+  → ④ python3 tools/migrate_config_v05.py --root /root/AstrBot --apply    # 0600 备份 + 原子落盘
+  → ⑤ 重载插件一次（**且只一次**）
+  → ⑥ 五项复验
+```
+
+| 步 | 动作 | 校验 |
+|---|---|---|
+| 1 | `cp -a` 插件目录 + 插件配置；记 `sha256sum` 与 `git rev-parse HEAD` | 两份都在；配置 sha 记下 |
+| 2 | 覆盖代码到 `v0.5.1` | `grep -m1 '^version:' metadata.yaml` ⇒ `v0.5.1` |
+| 3 | **干跑迁移**（只读） | `summary: changed=1 keys=21`；`rename`3 / `drop`2 / `add`1 / **`keep`17**（其中 `hidden=1` 4 条） |
+| 4 | **落盘迁移** | 打印 `backup=<名>`；文件仍是 **0600 + BOM + 无尾随换行**；`max_direct_mb=32` / `compress_target_mb=29` / `max_media_mb=64` / `audio_timeout_seconds=60` / `compress_timeout_seconds=60`（**隐藏键保号**）/ `mode=core`（**不动**） |
+| 5 | **重载一次** | 新 `media_analysis ready:` 行（18 字段，含 `max_media_mb=` / `native_timeout_cap_s=65` / `audio_timeout_cap_s=95`）；`Added llm tool: media_analyze` 恰 1 次；引擎仍 `effective=core` |
+| 6 | **五项复验** | ① ready 行新字段齐；② `--report` 再跑一次 ⇒ 全 `keep`、`changed=0`；③ **连续两次加载 sha 相同**（再重载一次比对）；④ 一条真机媒体 ⇒ 日志出现 `media_analysis: route=…`；⑤ 冷启动窗口 `Provider .* was not found` 计数 **0** |
+
+- **③④ 必须在 ⑤ 之前**：新 schema 不认识旧字节键，一旦"先重载、后迁移"，核心会把
+  `video.max_direct_bytes` / `video.compress_target_bytes` / `limits.max_media_bytes` /
+  `video.native_max_tokens` / `video.native_timeout_seconds` 当 **stale 删掉**并按 MB 默认值补齐
+  ⇒ **32 MB 退回 8 MB、29 退回 6**，日志只留一条 `Config key removed: video.max_direct_bytes`，
+  人不会注意到（本机用真核心两支实测过，见 `SPEC-v0.5.1.md` §12.5）。
+- **③ 到 ⑤ 之间禁止在面板保存本插件配置**：旧实例内存里还是旧的 22 叶，一次保存就把迁移结果覆盖回旧形态。
+- **"命中旧 sha / 键序与旧文件一致"不可能成立**：三个键名已变，且核心按**参考配置序**重建 dict。
+  正确判据是「迁移器输出 == 新 schema 序」+「**连续两次加载 sha 相同**」。
+- **双冷启动**：`PLUGIN_VERSION` 变 ⇒ 结果缓存与 L1 探测**全部 miss**（每个视频位首用多一次 L1，3–20 s）。
+  急可 `rm -rf data/plugin_data/astrbot_plugin_media_analysis/{cache,probe}`（归 ops）。
+- **回滚四档**：**R1 配置回滚**（`--rollback <备份>`）—— **单独执行无效**，必须与 R2/R3 成对；
+  **R2 回 v0.4.2**（覆盖代码 → 还原配置 → 重载一次）；**R3 回 v0.3.0**（用 v0.3 的旧备份）；
+  **R4 撤核心一行补丁**（必须先 R2 或把 `background.mode` 改 `plugin` + 重载，再撤补丁 + **重启**）。
+  完整派单：`handoff/lanes/dev/20261026-order-fix-deploy-media-analysis-v0.5.1.md`。
 
 ### v0.4.1 → v0.4.2（**+1 键：仍然是"覆盖 + 重载一次"**）
 
@@ -626,8 +744,9 @@ python3 tools/migrate_config_v03.py --root /root/AstrBot --apply    # 备份(060
 - **回滚必须成对且反向**：回滚 v0.3 → v0.2 时新 schema 的 10 个新键会被 v0.2 当 stale 删掉，
   所以**同时**恢复①插件目录②配置备份，并再重载一次。只回滚代码 = 静默丢设置。
 - **验证（四件必验 + 三处位置）**：
-  ① ready 行含 `video_provider_id=` / `video.max_direct_bytes=… native_timeout_s=… native_max_tokens=…` /
-     `compress=on target=… probe=on ttl=…`；
+  ① ready 行（**v0.5.1 的 18 字段口径**）含 `video.max_direct_mb=` / `video.compress_target_mb=` /
+     `native_timeout_s=60` / `native_timeout_cap_s=65` / `native_max_tokens=4096` /
+     `compress=on` / `probe=on` / `probe_ttl=` / `audio_timeout_s=` / `audio_timeout_cap_s=95`；
   ② **原生被看见**：真群视频 ⇒ `ok:true` / `kind:"video"` / notes 含 `video_native`（首次另有
      `video_probe_l1_ok`，或 `video_probe_disabled`）/ `summary` 非空；`frames=0`、`transcript=[]` 是
      **设计如此**（原生一次调用同时拿画面与声音）；

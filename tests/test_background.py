@@ -901,3 +901,92 @@ async def test_accept_envelope_never_enters_the_result_cache(
         assert '"state"' not in text
         assert '"task_id"' not in text
         assert payload["cached"] is True
+
+
+# --------------------------------------------------------------------------- #
+# v0.5.1 C7：`engine=` 的传递 / `delivered=` 的归属（SPEC-v0.5.1 §6.3 / §6.4）
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_background_passes_engine_plugin_to_analyze(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """㉘ A2 任务体**显式**传 `engine="plugin"`（不从 `settings` 反查）。
+
+    反查是错的路子：C 模式下 `settings.background_mode` 可能是 `plugin` 回落态，
+    于是日志会把"谁在跑"写错。所以这里断言的是**调用参数**，不是日志措辞。
+    """
+    calls = _stub_analyze(monkeypatch)
+
+    payload = await _submit(context=FakeContext())
+    await background.wait(str(payload["task_id"]), timeout=5.0)
+
+    assert len(calls) == 1
+    assert calls[0]["engine"] == "plugin"
+
+
+@pytest.mark.asyncio
+async def test_delivered_appears_only_on_the_bg_finished_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`delivered=` **只**出现在 A2 的 `bg finished` 行（§6.4）。
+
+    `route=` 行永不带它（链路做决定时投递还没发生），`bg accepted` 也不带
+    （那时还没投）。三张断言合起来就是"归属唯一"。
+    """
+    log = RecordingLogger()
+    monkeypatch.setattr(background, "LOG", log, raising=False)
+    _stub_analyze(monkeypatch)
+
+    payload = await _submit(context=FakeContext())
+    await background.wait(str(payload["task_id"]), timeout=5.0)
+
+    lines = log.text().splitlines()
+    with_delivered = [line for line in lines if "delivered=" in line]
+    assert len(with_delivered) == 1, with_delivered
+    assert "bg finished" in with_delivered[0]
+    assert "delivered=yes" in with_delivered[0]
+    accepted = [line for line in lines if "bg accepted" in line]
+    assert accepted and all("delivered=" not in line for line in accepted)
+
+
+@pytest.mark.asyncio
+async def test_too_many_tasks_is_rejected_at_accept_with_one_route_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """㉗ 并发闸拒绝（`TOO_MANY_TASKS`）在**受理期**收口：一行 `stage=accept`，没有 `analyze` 行。
+
+    这是受理期第三种（也是最后一种）拒绝路径；`BAD_TARGET` / `MEDIA_NOT_FOUND` 在
+    `tests/test_analyze.py`，三者合起来覆盖 §6.2 的 `stage=accept` 枚举。
+    """
+    gate = Gate()
+    calls = _stub_analyze(monkeypatch, gate=gate)
+    log = RecordingLogger()
+    monkeypatch.setattr(analyze_mod, "LOG", log)
+
+    # 先把单会话并发闸填满（3 条都在挂起态）
+    accepted: list[str] = []
+    for index in range(background.BG_MAX_PER_SESSION):
+        payload = await _submit(event=make_event(message_id=f"m-{index}"), mode="auto")
+        accepted.append(str(payload["task_id"]))
+
+    with pytest.raises(envelope.ToolError) as exc_info:
+        await _submit(event=make_event(message_id="m-over"), mode="true")
+
+    assert exc_info.value.code == envelope.ERR_TOO_MANY_TASKS
+    assert background.stats()["tasks"] == background.BG_MAX_PER_SESSION, (
+        "被拒的那次不许登记，也不许起任务体"
+    )
+    assert len(calls) <= background.BG_MAX_PER_SESSION, "被拒的那次不许进 analyze"
+
+    route_lines = [
+        message
+        for level, message in log.records
+        if level == "INFO" and message.startswith("media_analysis: route=")
+    ]
+    gate.release()
+    for task_id in accepted:
+        await background.wait(task_id, timeout=5.0)
+
+    # 受理期拒绝**不**由 background 打行（门面才有 `stage=accept` 的职责），
+    # 所以这里断言的是"没有多余的 analyze 行"，而受理行在 test_analyze 的门面用例里。
+    assert route_lines == [], "受理期拒绝的 route 行归门面；background 不许重复打"

@@ -364,6 +364,35 @@ async def run(
     （§8.3）—— 所以这里**不**回读 `self`。
     """
     started = time.monotonic()
+
+    # D2 唤醒轮短路（SPEC-v0.5.1 §5.2 第 4 条）：与 A2 门面**同一判定、同一文案**，
+    # 位置在 `analyze` **之前** —— 这条路径天然"不提交后台任务"（C 根本没有任务表）。
+    # 判据失败一律 fail-open（`is_wake_round` 永不抛）⇒ 落到下面的正常路径。
+    wake = False
+    if analyze.is_wake_round(event):
+        try:
+            wake = not await analyze.chain_has_media(event, target)
+        except envelope.ToolError:
+            # 链里有更根本的错（如 `BAD_TARGET`）⇒ 不是"这轮没媒体"，交给 analyze 判
+            wake = False
+    if wake:
+        payload = envelope.fail_envelope_wake()
+        analyze.log_route(
+            route=analyze.ROUTE_NONE,
+            stage=analyze.STAGE_ACCEPT,
+            engine=analyze.ENGINE_CORE,
+            error=envelope.ERR_MEDIA_NOT_FOUND,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            wake_round=True,
+        )
+        text = render_core(payload)
+        LOG.info(
+            "media_analysis: core-mode done kind=- elapsed_ms=%d chars=%d wake_round=1",
+            int((time.monotonic() - started) * 1000),
+            len(text),
+        )
+        return text
+
     try:
         payload = await analyze.analyze(
             context=context,
@@ -373,6 +402,8 @@ async def run(
             include_frames=include_frames,
             settings=settings,
             cache=cache,
+            # v0.5.1（§6.3 J7）：C 分支**显式**传 core（不从 settings 反查，见 analyze 文档）
+            engine=analyze.ENGINE_CORE,
         )
     except asyncio.CancelledError:
         LOG.info("media_analysis: core-mode call cancelled")

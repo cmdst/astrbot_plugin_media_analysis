@@ -217,6 +217,8 @@ async def _run(
             include_frames=record.mode,
             settings=settings,
             cache=cache,
+            # v0.5.1（SPEC-v0.5.1 §6.3 J7）：引擎**显式**传，不靠 `settings` 反查
+            engine=analyze.ENGINE_PLUGIN,
         )
     except asyncio.CancelledError:
         # 取消：**不投递**、只记一行、继续上抛（取消语义不许被吞，评审 F5 同口径）

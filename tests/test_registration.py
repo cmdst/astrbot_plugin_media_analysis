@@ -342,6 +342,8 @@ def test_envelope_exports_the_frozen_key_orders() -> None:
 
 
 #: **23 条** `hint` 的逐字快照（v0.2 的 18 条 + v0.3 的 3 条 + v0.4 的 2 条）。
+#: v0.5.1 **码数不变**，只有 3 条里的**配置键名**跟着键表改名（`limits.max_media_mb` /
+#: `video.max_direct_mb`），`VIDEO_FAILED` 那句不再指向已删除的 `native_timeout_seconds`。
 #: 模型唯一读到的操作性文案，改一个字都要改这里。
 #: 抄自 `envelope.py` 的 `HINTS`；这不是"再抄一遍实现"，而是**契约文本**——
 #: 之前用 `envelope.HINTS[...]` 自证，改错文案全套仍绿，等于没人守。
@@ -351,7 +353,7 @@ HINTS_SNAPSHOT: dict[str, str] = {
     "MEDIA_UNRESOLVABLE": "媒体组件在，但取不到本地文件（可能已被清理，或平台没给可用地址）。",
     "PROBE_FAILED": "读不出媒体时长（ffprobe 失败），无法判定上限也无法抽帧。",
     "MEDIA_TOO_LONG": "媒体时长超过配置上限；请用户发更短的片段，或让管理员调高 limits.max_media_seconds。",
-    "MEDIA_TOO_LARGE": "文件体积超过上限；请用户发更短的片段，或让管理员调高 limits.max_media_bytes。",
+    "MEDIA_TOO_LARGE": "文件体积超过上限；请用户发更短的片段，或让管理员调高 limits.max_media_mb。",
     "UNSUPPORTED_MEDIA_TYPE": "这个文件不是可解析的音频或视频；请用户改发语音条，或发 mp4/mov/m4a/mp3/wav/amr 之类的媒体文件。",
     "NO_AUDIO_TRACK": "这条视频没有音轨；把 include_frames 设为 true 改走抽帧。",
     "NO_VIDEO_TRACK": "这条视频没有视频流；把 include_frames 设为 false 只做转写。",
@@ -365,8 +367,8 @@ HINTS_SNAPSHOT: dict[str, str] = {
     "VISION_FAILED": "视觉模型调用全部失败或超时；请稍后重试。",
     # —— v0.3 新增 3 条（SPEC-v0.3 §11.1，既有 18 条逐字不变）——
     "VIDEO_UNAVAILABLE": "没有可用的视频模型，也无法回退抽帧；请让管理员在插件配置里指定「视频模型」（走原生视频），或把 include_frames 设为 true 并配置「视觉模型」。",
-    "VIDEO_FAILED": "视频模型调用失败或超时；请稍后重试，或让管理员调大 video.native_timeout_seconds。",
-    "VIDEO_TOO_LARGE": "视频体积超过直送门槛且压不到门槛内；请让管理员调大 video.max_direct_bytes，或把 include_frames 设为 auto 或 true 改走抽帧。",
+    "VIDEO_FAILED": "视频模型调用失败或超时；请稍后重试，或让管理员换一个更快的视频模型。",
+    "VIDEO_TOO_LARGE": "视频体积超过直送门槛且压不到门槛内；请让管理员调大 video.max_direct_mb，或把 include_frames 设为 auto 或 true 改走抽帧。",
     # —— v0.4 新增 2 条（SPEC-v0.4 §7.1，既有 21 条逐字不变）——
     "GIF_CONVERT_FAILED": "这张动图（GIF）转换失败；请重试，或让用户改发视频。",
     "TOO_MANY_TASKS": "当前会话或实例正在分析的媒体太多；请等前面的结果发出来再试。",
@@ -486,3 +488,70 @@ def test_dumps_is_utf8_json_string() -> None:
     assert isinstance(dumped, str)
     assert "中文" in dumped, "ensure_ascii=False 才能让中文直接可读"
     assert json.loads(dumped) == payload
+
+
+# --------------------------------------------------------------------------- #
+# v0.5.1：唤醒轮 hint 的契约面 + 运行面文件里"旧配置键名"的静态守卫
+# （SPEC-v0.5.1 §5.3 / §9.4 的 ㉟ 与"范围"括注）
+# --------------------------------------------------------------------------- #
+def test_wake_hint_is_a_pure_constant_and_not_a_new_error_code() -> None:
+    """㉟ 唤醒轮 hint：**纯常量**、与普通 `MEDIA_NOT_FOUND` 不同、且**不是**第 24 个码。
+
+    §5.3 的两条硬要求：① 错误码仍是 23（`error` 仍是 `MEDIA_NOT_FOUND`）；
+    ② 两条 hint 都是纯常量（无路径、无异常文本、无 provider id、无数字串）。
+    """
+    wake = envelope.HINT_MEDIA_NOT_FOUND_WAKE
+    plain = envelope.HINTS[envelope.ERR_MEDIA_NOT_FOUND]
+
+    assert wake != plain, "唤醒轮与普通「没发媒体」必须是两句话"
+    assert wake and wake.strip() == wake
+    assert not re.search(r"\d", wake), f"wake hint 里出现数字：{wake!r}"
+    assert "/" not in wake and "\\" not in wake and "http" not in wake.lower()
+    assert envelope.ERR_MEDIA_NOT_FOUND in envelope.HINTS
+    assert len([name for name in vars(envelope) if name.startswith("ERR_")]) == 23
+
+    payload = envelope.fail_envelope_wake()
+    assert list(payload) == list(envelope.FAIL_KEYS), "失败信封仍 3 键、顺序不变"
+    assert payload == {
+        "ok": False,
+        "error": envelope.ERR_MEDIA_NOT_FOUND,
+        "hint": envelope.HINT_MEDIA_NOT_FOUND_WAKE,
+    }
+
+
+#: v0.5.1 **删掉/改名**的配置键（点号形式）。它们不许再出现在三个运行面文件里
+#: —— 因为核心 `check_config_integrity()` 会把 schema 里没有的键当 stale **删掉并落盘**，
+#: 代码里再引用一个已删的键就是"读不到就一直用默认值"的静默降级。
+_LEGACY_KEY_PATHS = (
+    "video.max_direct_bytes",
+    "video.compress_target_bytes",
+    "video.native_max_tokens",
+    "video.native_timeout_seconds",
+    "limits.max_media_bytes",
+)
+
+#: 运行面文件（本任务负责的那半边）；配置面三份文件由 `test_config_map.py` 守。
+_RUNTIME_FILES = ("analyze.py", "envelope.py")
+
+
+def test_runtime_files_no_longer_mention_the_removed_config_keys() -> None:
+    """§9.4「范围」：`analyze.py` / `envelope.py` 里不许再有旧**点号键**（含 docstring）。"""
+    root = Path(__file__).resolve().parent.parent
+    for name in _RUNTIME_FILES:
+        source = (root / name).read_text(encoding="utf-8")
+        leftover = [legacy for legacy in _LEGACY_KEY_PATHS if legacy in source]
+        assert leftover == [], f"{name} 里还留着已删/改名的配置键 {leftover}"
+
+
+def test_runtime_files_read_settings_through_the_mb_properties_only() -> None:
+    """§9.4 的"允许清单"对偶：运行面只读三个**派生字节 property**，不读已删字段。
+
+    `settings.video_max_direct_bytes`（property）与 `settings.video_max_direct_mb`（配置字段）
+    都在允许面内；被禁的是 `video_native_*` 这类**已删除的字段名**。
+    """
+    root = Path(__file__).resolve().parent.parent
+    for name in _RUNTIME_FILES:
+        source = (root / name).read_text(encoding="utf-8")
+        assert "settings.video_native_" not in source, f"{name} 仍在读已删字段"
+        assert ".video_native_timeout_seconds" not in source
+        assert ".video_native_max_tokens" not in source

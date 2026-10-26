@@ -29,6 +29,8 @@ import json
 
 import pytest
 
+from astrbot.core.provider import func_tool_manager as ftm
+
 from astrbot_plugin_media_analysis import analyze as analyze_mod
 from astrbot_plugin_media_analysis import background, core_mode, envelope, main, settings
 from astrbot_plugin_media_analysis import cache as cache_mod
@@ -58,6 +60,26 @@ _OK_PAYLOAD: dict[str, object] = {
     "elapsed_ms": 100,
     "cached": False,
 }
+
+
+class _UnpatchedGuardedTool(ftm._PermissionGuardedTool):  # type: ignore[misc,valid-type]
+    """核心 4.29.1 的**原装**包装器形态：镜像区**没有** `is_background_task`。
+
+    为什么自己造一个"未修真身"，而不是直接用宿主核心树里的那个类：本机核心树**可能**
+    （由部署单/运营方）已经打过那一行镜像补丁 —— 那时"未修世界"在真机上就不存在了，
+    这三格会随宿主状态假红/假绿。这里在真类之上把那个**实例属性**摘掉，读数自然回落到
+    `FunctionTool.is_background_task` 的类默认 `False`，与 4.29.1 原装行为逐字等价，
+    且与宿主树是否被打过补丁**无关**（判据仍是 `wrapper_flag() is False`）。
+    """
+
+    def __init__(self, tool, manager) -> None:  # noqa: D107 —— 与父类同签名
+        super().__init__(tool, manager)
+        self.__dict__.pop("is_background_task", None)
+
+
+def unpatched_core(monkeypatch) -> None:
+    """把"未修核心"这个世界**显式**装好（`monkeypatch` 结束时自动复原）。"""
+    monkeypatch.setattr(ftm, "_PermissionGuardedTool", _UnpatchedGuardedTool)
 
 
 def _log(monkeypatch, module) -> RecordingLogger:
@@ -98,15 +120,36 @@ def _levels(logger: RecordingLogger, level: str) -> list[str]:
     return [message for _level, message in logger.records if _level == level]
 
 
+def _stub_analyze_calls(monkeypatch) -> list[dict[str, object]]:
+    """把 `analyze.analyze` 换成"只记录参数"的假身（短路时它**一次都不该被调用**）。"""
+    calls: list[dict[str, object]] = []
+
+    async def _fake(**kwargs):
+        calls.append(dict(kwargs))
+        return dict(_OK_PAYLOAD)
+
+    monkeypatch.setattr(analyze_mod, "analyze", _fake)
+    return calls
+
+
+def _cron_event():
+    """核心 `CronMessageEvent` 的最小同形桩：`get_platform_name()=="cron"`、无消息链。"""
+    event = make_event(current=[])
+    event.get_platform_name = lambda: "cron"  # type: ignore[assignment]
+    return event
+
+
 # --------------------------------------------------------------------------- #
 # 1. 探测（6 格）
 # --------------------------------------------------------------------------- #
 def test_unpatched_core_is_rejected_loudly_and_rolled_back(monkeypatch) -> None:
-    """① 未修核心（**真 4.29.1 包装器**，不 patch）⇒ plugin + ERROR + **flag 已还原**。
+    """① 未修核心（**4.29.1 原装形态**，无镜像行）⇒ plugin + ERROR + **flag 已还原**。
 
     这条是本版的核心安全性质：配置写了 `core`，但核心没补那一行镜像时，插件必须
     **响亮地拒绝**（而不是"看起来正常、实际同步阻塞 30–100 s"）。
+    "原装形态"由 `unpatched_core()` **显式**构造（不依赖宿主核心树的补丁状态）。
     """
+    unpatched_core(monkeypatch)
     logger = _log(monkeypatch, core_mode)
     tool = make_tool()
     tmgr = FakeManager([tool])
@@ -214,10 +257,12 @@ def test_activate_is_idempotent(monkeypatch) -> None:
     assert second.effective == core_mode.MODE_CORE
     assert tool.is_background_task is True
 
-    # 手工逃生门同样可用（没有 `monkeypatch` 的脚本场景）：复原后包装器退回**未修**世界
+    # 手工逃生门同样可用（没有 `monkeypatch` 的脚本场景）：复原后回到宿主树的包装器
     assert core_shim_is_patched() is True
     core_shim_unpatch()
     assert core_shim_is_patched() is False
+    # "未修世界"要**显式**装（宿主核心树可能自己已经带那一行镜像；见 `unpatched_core`）
+    unpatched_core(monkeypatch)
     assert core_mode.activate(tmgr, requested="core").reason == core_mode.REASON_WRAPPER_NO_MIRROR
 
 
@@ -544,8 +589,9 @@ async def test_first_call_recheck_demotes_later_calls_to_a2(monkeypatch) -> None
     """
     _patch_analyze(monkeypatch, _OK_PAYLOAD)
     logger = _log(monkeypatch, core_mode)
+    unpatched_core(monkeypatch)  # 显式"未修核心"世界 ⇒ 复检会判 wrapper_no_mirror
     tool = make_tool()
-    tmgr = FakeManager([tool])  # 未 patch ⇒ 复检会判 wrapper_no_mirror
+    tmgr = FakeManager([tool])
     plugin = _c_plugin(manager=tmgr)
     plugin._bg_recheck_pending = True
 
@@ -611,3 +657,93 @@ async def test_initialize_never_throws_when_the_manager_is_missing(monkeypatch) 
 
     ready = [message for message in _levels(logger, "INFO") if "ready:" in message]
     assert len(ready) == 2, "每次 initialize() 恰好一行 ready:"
+
+
+# --------------------------------------------------------------------------- #
+# 8. v0.5.1：C7 `route=` 行 + `engine=` 传递 + D2 唤醒轮短路（SPEC-v0.5.1 §5 / §6）
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_c_passes_engine_core_to_analyze_and_emits_one_route_line(
+    monkeypatch, tmp_path
+) -> None:
+    """㉘ C 分支**显式**传 `engine="core"`；且 `route=` 行由 `analyze` 打、`stage=analyze`。
+
+    断言的是**真的链路**（不是桩）：`build_rig` 的真 `analyze` 会打自己那行
+    `route=… engine=core … stage=analyze`，这正是"引擎名不靠 `settings` 反查"的证据。
+    """
+    rig = build_rig(monkeypatch, tmp_path, kind="audio")
+    logger = RecordingLogger()
+    monkeypatch.setattr(analyze_mod, "LOG", logger)
+
+    text = await core_mode.run(
+        context=rig.context,
+        event=rig.event,
+        target="current",
+        focus="",
+        include_frames=False,
+        settings=rig.settings,
+        cache=rig.cache,
+    )
+
+    assert text.startswith(core_mode.CORE_TEXT_PREFIX)
+    route_lines = [
+        message
+        for level, message in logger.records
+        if level == "INFO" and message.startswith("media_analysis: route=")
+    ]
+    assert len(route_lines) == 1, route_lines
+    assert "stage=analyze engine=core" in route_lines[0], route_lines[0]
+    assert "route=audio" in route_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_c_wake_round_short_circuits_with_the_wake_hint(monkeypatch) -> None:
+    """D2 第 4 条：C 分支在 `analyze` **之前**短路，回同一条专用 hint 的**文本**。
+
+    C 模式下"不提交后台任务"是结构性成立的（C 根本没有任务表）⇒ 判据只能看
+    "没跑链路"（`analyze` 未被调用）+ 文本里带唤醒轮 hint + 一行 `stage=accept`。
+    """
+    logger = _log(monkeypatch, core_mode)
+    calls = _stub_analyze_calls(monkeypatch)
+    plugin = _c_plugin()
+
+    text = await plugin.media_analyze(_cron_event(), target="current")
+
+    assert calls == [], "短路必须发生在 analyze 之前"
+    assert core_mode.CORE_TEXT_PREFIX in text
+    assert envelope.HINT_MEDIA_NOT_FOUND_WAKE in text
+    assert envelope.HINTS[envelope.ERR_MEDIA_NOT_FOUND] not in text
+    done = [message for message in _levels(logger, "INFO") if "core-mode done" in message]
+    assert done and "wake_round=1" in done[0]
+
+
+@pytest.mark.asyncio
+async def test_c_mode_never_prints_delivered_or_a2_lines(monkeypatch, tmp_path) -> None:
+    """§6.4：C 模式下**任何行**都没有 `delivered=`，也没有 A2 专属的 `bg accepted/finished`。
+
+    这是 v0.4.2 冻结的互斥判据在**日志面**的对偶：谁投递决定谁打 `delivered=`，
+    而 C 的投递归唤醒轮的模型（`send_message_to_user`）。
+    """
+    rig = build_rig(monkeypatch, tmp_path, kind="audio")
+    core_log = RecordingLogger()
+    bg_log = RecordingLogger()
+    monkeypatch.setattr(core_mode, "LOG", core_log)
+    monkeypatch.setattr(background, "LOG", bg_log, raising=False)
+
+    await core_mode.run(
+        context=rig.context,
+        event=rig.event,
+        target="current",
+        focus="",
+        include_frames=False,
+        settings=rig.settings,
+        cache=rig.cache,
+    )
+
+    joined = "\n".join(
+        message for _lvl, message in core_log.records + bg_log.records
+    )
+    assert "delivered=" not in joined
+    assert "bg accepted" not in joined
+    assert "bg finished" not in joined
+    assert "core-mode done" in joined

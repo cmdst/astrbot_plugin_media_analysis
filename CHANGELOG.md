@@ -1,5 +1,82 @@
 # CHANGELOG
 
+## v0.5.1 — 2026-10-26（**配置面重做 + 六个运行面缺陷；待评审 / 待推送 / 待部署**）
+
+**配置从 22 叶瘦身到 21 叶，并把"字节"换成"MB"**；同时修掉 2026-10-26 上线暴露的六个运行面缺陷
+（音频超时、唤醒轮短路、`route=` 观测行、加载期一致性告警、`ready` 有效值、启动期 provider 噪声）。
+**0 新增错误码（23 条不变）、0 新增 notes 词（43 不变）、0 新增工具参数（仍是 3 个）。**
+
+### 配置面（22 叶 → 21 叶 / 6 组）
+
+| 动作 | 键 | 说明 |
+|---|---|---|
+| **改名（3）** | `video.max_direct_bytes` → **`video.max_direct_mb`**（默认 **8**，1–32）<br>`video.compress_target_bytes` → **`video.compress_target_mb`**（默认 **6**，1–32）<br>`limits.max_media_bytes` → **`limits.max_media_mb`**（默认 **64**，1–512） | **1 MB ≡ 1 MiB ≡ 1,048,576 字节**；换算 `mb = (bytes + 524288) // 1048576`（四舍五入），钳位在 **MB 域**做、字节只在派生 property 里出现 |
+| **删除（2）** | `video.native_max_tokens`、`video.native_timeout_seconds` | 值进**代码常量**：`NATIVE_MAX_TOKENS = 4096`、`NATIVE_TIMEOUT_S = 60.0`（生效值 `min(60, 剩余预算 − 35)`）。理由见下「声明式变更」D-1/D-2 |
+| **新增（1）** | **`limits.audio_timeout_seconds`** | int，默认 **60**，**10–95**（step 5）。滑块上界 == 兑现上界（`MAX_AUDIO_TIMEOUT_SECONDS = int(AUDIO_HONOR_MAX_S) = int(DEADLINE_S − 5)`）⇒ 面板**给不出**永不生效的区间 |
+| **隐藏（4，键与值都保留）** | `video.probe_enabled`、`video.probe_ttl_seconds`、`video.compress_timeout_seconds`、`provider_settings.stt_provider_id` | **item 级 `invisible`**，不是删除 ⇒ 核心不会把用户值当 stale 删掉（生产 `compress_timeout_seconds=60` **保号**）。`stt_provider_id` 隐藏后面板不再渲染那个弃用下拉位 |
+| **不动（13）** | `background.mode`、三个 provider id、`video.compress_enabled`、5 份 `prompts.*`、`limits.max_media_seconds`、`limits.max_frames`、`cache.ttl_seconds` | 路径 / 类型 / 默认值 / 值一字不动 |
+
+- **组序重排**：`background`（引擎开关）**置顶**、`prompts`（五段长文本）**置末**，中间保持
+  `provider_settings → video → limits → cache`。面板上 `video` 组只剩 **3 行可见**（隐藏 3 键后）。
+- **面板纪律**：数值叶**一律用 `slider`**，**不用**顶层 `min`/`max` —— 面板只认 `slider`
+  （`ConfigItemRenderer.vue:155-172`；没有 `slider` 时**不做任何钳位**，见 `:351-356`）。
+  每个数值叶的 `hint` 以「（允许范围：X–Y）」结尾，且 X/Y 与 `slider.min/max` 逐字相等（有测试钉）。
+- **四处互钉**：`_conf_schema.json` ⇄ `settings.KEY_MAP` ⇄ `main._settings()` ⇄
+  **`tools/migrate_config_v05.py:KEY_ORDER`**（21 条，顺序也相等）。`migrate_config_v042.py`（22 键）
+  与 `migrate_config_v03.py`（21 键）**冻结为历史快照**，不再跟随。
+
+### 运行面（六个缺陷）
+
+| # | 缺陷 | 本版做法 |
+|---|---|---|
+| **D1** | 音频超时硬编码 60 s、单发、无重试 | 超时可配（`limits.audio_timeout_seconds`）+ **硬超时恰好重试一次**（`AUDIO_RETRY_MAX=1`、第 2 次至少要有 `AUDIO_RETRY_MIN_S=10` 秒预算）。总耗时仍 ≤ `DEADLINE_S`（`t1+t2 ≤ remaining` 可证）。`log_detail` 冻结为 `text_chat timeout; first_timeout=…s retry_timeout=…s` / `… retry_skipped=budget`（仍以 `text_chat timeout` 起头，运维旧 grep 不破）。**`soft_timeout`（本轮要画面）语义一字不变**（记 `audio_timeout` 后继续抽帧，且不重试）；**provider 抛错不重试**。不新增回落 provider 键 |
+| **D2** | 唤醒轮消息链恒空，模型把超时说成"文件丢了"，还多提交一条必然失败的后台任务 | `is_wake_round()`（`platform_name=="cron"` **或** `background_task_result` 存在；**fail-open，永不抛**）+ `chain_has_media()` ⇒ 合成事件**直接返回** `MEDIA_NOT_FOUND` + 专用 hint（`HINT_MEDIA_NOT_FOUND_WAKE`），**不提交后台任务、不产生 task_id**。普通"用户确实没发媒体"仍用原 hint |
+| **C7** | 判"这次走了哪条链路"只能翻缓存信封 | 每次调用**恰一行** `media_analysis: route=<cache\|native\|frames\|audio\|none> stage=<analyze\|accept> engine=<plugin\|core> kind=<audio\|video\|-> fallback=<10 选 1> cached=<0\|1> duration_s=… frames=… transcript_chars=… elapsed_ms=… [error=CODE] [wake_round=1]`。A2 与 C **双引擎**都覆盖（`engine=` 显式传），**`delivered=` 仍只归 A2 的 `bg finished`**；`route=` 行**不写 notes**（缓存中立） |
+| **D3** | 预算链不自洽：填 110 与填 61 等价却无提示 | 加载期三条 `config-check warn=<id>`：`timeout_over_budget`（**raw** 值 > 95，只可能是手改 JSON —— 面板滑块上界已是 95）、`compress_target_ge_075_direct`（`4×target > 3×direct`）、`max_direct_over_suggested`（高于该模型的延迟参考值）。只 WARN、每 id 每进程至多一条、**不改配置** |
+| **ready 行** | 打的是配置原值，"以为调了其实没生效" | 改打**有效值**：**18 个 `key=value`**，逐字顺序 = `audio_provider_id` / `video_provider_id` / `vision_provider_id` / `max_media_seconds` / `max_frames` / **`max_media_mb`** / **`video.max_direct_mb`** / **`video.compress_target_mb`** / `native_timeout_s=60` / **`native_timeout_cap_s=65`**（= `DEADLINE_S − NATIVE_RESERVE_S`，由公式算） / `native_max_tokens=4096` / `compress=` / `probe=` / `probe_ttl=` / **`audio_timeout_s`** / **`audio_timeout_cap_s=95`**（= `int(AUDIO_HONOR_MAX_S)`） / `cache_ttl_seconds` / `cache_dir`。**旧字节字段 4 个全部删除**（`max_media_bytes=` / `video.max_direct_bytes=` / `target=` / `ttl=`） |
+| **噪声** | 冷启动刷 `Provider … was not found`（WARN） | 加载期**不再**调 `context.get_provider_by_id()`（它自己会 WARN），改**静默读** `provider_manager.inst_map`；取不到只 DEBUG skip，并在首次工具调用顺延补检 |
+
+### 声明式变更（**知情改变，不是"语义不变"**）
+
+| # | 项 | 旧 → 新 | 为什么 |
+|---|---|---|---|
+| **D-1** | `video.native_max_tokens` → 常量 `NATIVE_MAX_TOKENS` | **2048 → 4096** | mimo 在 1024/2048 下会 200 但正文为空（推理吃光预算）；该键只有"只能调大"一个语义，留着就是把一个必然要调到 4096 的旋钮交给运维 |
+| **D-2** | `video.native_timeout_seconds` → 常量 `NATIVE_TIMEOUT_S` | 生效 **61.4 → 60.0**（−1.4 s） | 填 110 与填 61 **完全等价**（`min(配置值, 剩余预算 − 35)`），属"允许填一个永远不会生效的值" |
+| **D-3** | `video.compress_target_mb` **默认值** | **8 → 6** | 默认对 (8,8) 恰好落在下面告警②的坏配区（`≥0.75×门槛`）⇒ 交付即告警；6/8 = 0.75 且判据取严格大于，默认不响。只影响全新安装 |
+| **D-4** | `video.compress_target_mb` **下限** | **0.5 MiB → 1 MiB** | 整数 MB + slider 表达不了 0.5 |
+| **D-5** | **压缩跳门槛**（D-2 的算术后果） | 生产串 **115 s → 90 s**；**默认串 60 s → 60 s（不变）** | 门槛 = `video_compress_timeout_seconds + video_native_timeout_seconds × 0.5`（**取配置值**）。生产是 `60 + 55 = 115`，而进入这一跳时起步剩余 ≈ **96.4 s** ⇒ **超门槛视频的压缩跳从来跑不到**（恒 `video_skip_budget`）；D-2 之后 `60 + 30 = 90 < 96.4` ⇒ **压缩跳重新可达**。默认配置（`compress_timeout=30` / native 60）是 `30+30=60`，**前后完全一样** ⇒ **D-5 只影响填过非默认 `native_timeout_seconds` 的配置** |
+
+> **不要把 D-1/D-2/D-5 写成"语义不变"**：它们改的是**生效值**。VERSION bump 让结果缓存与 L1 探测
+> **双冷启动**（`PLUGIN_VERSION` 是两者的键分量）⇒ 换版后每个视频位首用会多一次 L1 调用（3–20 s）。
+
+### 迁移（**必须先于重载**）
+
+```bash
+python3 tools/migrate_config_v05.py --root /root/AstrBot --report   # 干跑：changed=1 keys=21
+python3 tools/migrate_config_v05.py --root /root/AstrBot --apply    # 0600 备份 + 原子落盘
+# 然后再重载插件一次
+```
+
+- **顺序不可反**：新 schema 不认识旧字节键 ⇒ 一旦"先重载、后迁移"，核心会把
+  `max_direct_bytes` / `compress_target_bytes` / `max_media_bytes` / `native_*` 当 **stale 删掉**
+  并按 MB 默认值补齐 —— **运营方的 32 MB 退回 8 MB、29 退回 6**，而日志只留一条
+  `Config key removed: video.max_direct_bytes`，人不会注意到（本机用真核心两支实测过）。
+- **落盘格式**：BOM + `indent=2` + `ensure_ascii=False` + **无尾随换行**、保留权限位（生产 0600）、
+  `mkstemp`+`fsync`+`os.replace` 原子写；备份逐字节 0600。
+- **判据**：迁移器输出 == **新 schema 序**；**连续两次加载 sha 相同**（不预设第一次是否重写）。
+  "命中旧 sha / 键序保持"**物理不可能**（三个键名已变、核心按参考配置序重建 dict）——
+  别再把它写进验收单。
+
+### 门禁
+
+- **全量 `pytest tests/ -q -p no:cacheprovider`：1011 passed / 0 failed / 0 skipped / 0 xfail**
+  （相对 v0.4.2 的 894 = **+117**）。
+- **基线口径（如实登记）**：`3980e4a`（v0.4.2）在**本机**是 **890 passed / 4 failed** —— 那 4 格全是
+  "宿主核心已打镜像补丁 ⇒ 本机不存在未修核心世界"的**环境性红**，不是代码缺陷；本轮把它修成
+  与宿主补丁状态无关的 `unpatched_core` 世界（3 格）+ 1 格改名连带（`test_migrate_config.py`），
+  再加 5 格新测试 ⇒ **1011/0**。**别把它读成"一直是 894/0"**。
+- 归档树（`git write-tree` 60 文件）解到同名目录后**逐 cell 同数**；导入探针 83 项全 PASS。
+
 ## v0.4.2 — 2026-10-25（**实验模式；待评审 / 待推送 / 待部署**）
 
 **+1 配置键 / 0 参数变更 / 0 错误码与 notes 词表变更**。把 v0.4.1 评估过的"路线 C

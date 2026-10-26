@@ -5,7 +5,7 @@ v0.2 → v0.3 的结构性变化（一句话：**视频主路径改成"原生视
 1. **视频原生直送**：`provider.client.chat.completions.create(messages=[…video_url…])`
    （核心 `text_chat` 放不进 video 块，`openai_source.py:1424` 硬抛 `ValueError`）；
    形状与三条护栏在 `video_native`，这里只管编排。
-2. **压缩在直送之前**：超 `video.max_direct_bytes` 先用 ffmpeg 压到预算（最多 2 趟），
+2. **压缩在直送之前**：超 `video.max_direct_mb` 先用 ffmpeg 压到预算（最多 2 趟），
    压不动才轮到抽帧 —— 顺序**不许反**（§6.5：压缩 4.8 s / 0 token，抽帧是 6 次视觉调用）。
 3. **抽帧只是回退**：原生不可用 / 超门槛且压不动 / 调用失败时，才按 `include_frames`
    三态决定要不要抽帧（`vision_provider_id` 是**仅回退**用的图片模型位）。
@@ -17,6 +17,20 @@ v0.4 只加一段（SPEC-v0.4 §5.12）：`[3.5]` 魔数二次确认 + `[4-pre]`
 GIF（`Image` 或群文件）先用 `ffmpeg` 归一成 mp4，再走**完全不变**的视频七跳；
 `kind` 仍是 `"video"`，走 GIF 分支时**跳过 `classify`**（那一步会把 `Image` 判成
 `kind=audio`），缓存 digest 取**源 GIF 字节**。后台异步不在这层（`background.py`）。
+
+v0.5.1 改两件事（都在运行面，**不动链路形状**）：
+1. **D1 音频超时配置化 + 恰好一次重试**（SPEC-v0.5.1 §4）：`transcribe` 的上限取
+   `limits.audio_timeout_seconds`（slider 10–95），硬超时**只**在 `soft_timeout=False`
+   时重试一次，两次都超时 ⇒ `AUDIO_FAILED` 且 `log_detail` 能分辨
+   `first_timeout` / `retry_timeout`（仍以 `text_chat timeout` 起头，运维 grep 不变）。
+   重试标记**只进日志**：`notes` 与单次成功逐字相同（缓存中立）。
+2. **C7 `route=` 结构化行**（§6）：每次调用**至多一行**、字段/顺序/枚举冻死，
+   `stage=analyze` 在这里的 `finally` 里打（`shutil.rmtree` 之前），并给 `analyze()`
+   加 `engine` **关键字参数**（A2 传 `plugin`、C 传 `core`）。
+   `route=` 行**只读** `notes` 的子串做判定，**不写** `notes`。
+3. **D2 唤醒轮短路**的两个**纯函数**（`is_wake_round` / `chain_has_media`）落在本模块：
+   `main`（A2）与 `core_mode`（C）都要用它们，而两者都已经 import `analyze`
+   ⇒ 不引入新的依赖边，也不把"事件形态"知识复制两份。
 
 三个阶段的降级形状仍然固定：
 - 用户主诉求（转写 / 看画面）无法满足 ⇒ `ToolError`（错误码见 `envelope`，v0.4 起 23 条）；
@@ -34,6 +48,7 @@ import asyncio
 import shutil
 import tempfile
 import time
+from dataclasses import dataclass
 
 from astrbot.api import logger as LOG
 
@@ -45,7 +60,29 @@ from . import settings as settings_mod
 # ---- 预算（SPEC-v0.2 §2.2 / SPEC-v0.3 §5.2）----
 DEADLINE_S = 100.0  # 全局预算；框架 tool_call_timeout=120 s，留 20 s 余量
 PROBE_TIMEOUT_S = 10.0  # 单次 ffprobe（实测 0.019 s，只防病态文件）
-AUDIO_TIMEOUT_S = 60.0  # 单次多模态调用（含上传：60 s 音频 2.44 MiB base64）
+AUDIO_TIMEOUT_S = settings_mod.AUDIO_TIMEOUT_DEFAULT_S
+"""音轨单次调用的**默认上限**（秒）＝ `limits.audio_timeout_seconds` 的默认值（60.0）。
+
+v0.5.1 起生产值来自配置（`settings.audio_timeout_seconds`，slider 10–95），本常量只在
+"配置值不可用"时兜底（`audio_cap_s()`）。为什么仍保留这个名字：`tests/test_video_chain.py`
+的 R2 用例用它断言"cap 真的是音轨上限"，而且它是**唯一**的默认值来源（不手写 60.0）。
+"""
+
+NATIVE_TIMEOUT_S = float(settings_mod.NATIVE_TIMEOUT_S)
+"""原生视频单次调用的**上限**（秒）—— v0.5.1 起配置键已删，值是**代码常量**（§2.2-B）。
+
+生效值仍是 `min(NATIVE_TIMEOUT_S, remaining − NATIVE_RESERVE_S)`（不变式逐字未动，
+`SPEC-v0.5.1` §2.2-B：旧配置填 110 与填 61 完全等价，所以这个旋钮本来就不该给）。
+`settings.NATIVE_TIMEOUT_S` 是**配置面的镜像**，`tests/test_config_map.py` 钉相等。
+"""
+
+# ---- D1：音轨超时的**恰好一次**重试（SPEC-v0.5.1 §4.1）----
+AUDIO_RETRY_MAX = 1
+"""最多**再**试几次（⇒ 至多 2 次尝试）。常量，不做配置项（§4.5：不加第 3 次、不加退避）。"""
+
+AUDIO_RETRY_MIN_S = 10.0
+"""起第 2 次至少要剩下这么多秒：不够就别开一次必然超时的调用（§4.1）。"""
+
 FRAME_EXTRACT_TIMEOUT_S = 15.0  # 单帧 ffmpeg（实测 6 帧合计 0.206 s）
 FRAME_CALL_TIMEOUT_S = 15.0  # 单帧 text_chat
 SUMMARY_TIMEOUT_S = 15.0  # 摘要 text_chat；剩余预算少于它就不做摘要
@@ -114,6 +151,224 @@ _TERMINAL_CODE = {
 }
 
 _PROBE_STORE: probe.ProbeStore | None = None
+
+
+# --------------------------------------------------------------------------- #
+# C7 `route=` 结构化行（SPEC-v0.5.1 §6：字段名、顺序、枚举**全部冻死**）
+#
+# 为什么把这一层放在 `analyze`：
+# - `stage=analyze` 的行只能由这里打（链路状态在这里累积，`finally` 里一次成行）；
+# - `stage=accept` 的两个调用方（`main` 的 A2 门面、`core_mode.run` 的 C 分支）**都**已经
+#   import 了本模块 ⇒ 不用为一行日志引入新的依赖边，也不会出现两份格式；
+# - 枚举是**封闭集合**：多一个自创值就是契约变更（`tests/` 用正则 + 集合相等两边夹）。
+# --------------------------------------------------------------------------- #
+ROUTE_CACHE = "cache"
+ROUTE_NATIVE = "native"
+ROUTE_FRAMES = "frames"
+ROUTE_AUDIO = "audio"
+ROUTE_NONE = "none"
+ROUTES: tuple[str, ...] = (ROUTE_CACHE, ROUTE_NATIVE, ROUTE_FRAMES, ROUTE_AUDIO, ROUTE_NONE)
+
+STAGE_ANALYZE = "analyze"
+STAGE_ACCEPT = "accept"
+STAGES: tuple[str, ...] = (STAGE_ANALYZE, STAGE_ACCEPT)
+
+ENGINE_PLUGIN = "plugin"
+ENGINE_CORE = "core"
+ENGINES: tuple[str, ...] = (ENGINE_PLUGIN, ENGINE_CORE)
+
+KIND_AUDIO = "audio"
+KIND_VIDEO = "video"
+KIND_DASH = "-"  # `stage=accept` 时还没判型（§6.2 的 `kind` 枚举第三档）
+KINDS: tuple[str, ...] = (KIND_AUDIO, KIND_VIDEO, KIND_DASH)
+
+FALLBACK_DASH = "-"
+FALLBACK_NATIVE_UNAVAILABLE = "native_unavailable"
+FALLBACK_NATIVE_FAILED = "native_failed"
+FALLBACK_NATIVE_EMPTY = "native_empty"
+FALLBACK_NATIVE_TOO_LARGE = "native_too_large"
+FALLBACK_FRAMES_FORBIDDEN = "frames_forbidden"
+FALLBACK_NO_VIDEO_PROVIDER = "no_video_provider"
+FALLBACK_NO_VISION_PROVIDER = "no_vision_provider"
+FALLBACK_SKIP_BUDGET = "skip_budget"
+FALLBACK_NO_AUDIO_TRACK = "no_audio_track"
+
+#: 10 个 `fallback` 取值（**封闭集合**，§6.2）：`-` + 9 个"为什么没走成更贵的那一跳"。
+FALLBACKS: tuple[str, ...] = (
+    FALLBACK_DASH,
+    FALLBACK_NATIVE_UNAVAILABLE,
+    FALLBACK_NATIVE_FAILED,
+    FALLBACK_NATIVE_EMPTY,
+    FALLBACK_NATIVE_TOO_LARGE,
+    FALLBACK_FRAMES_FORBIDDEN,
+    FALLBACK_NO_VIDEO_PROVIDER,
+    FALLBACK_NO_VISION_PROVIDER,
+    FALLBACK_SKIP_BUDGET,
+    FALLBACK_NO_AUDIO_TRACK,
+)
+
+#: 单行模板（§6.1 逐字；`error=` 与 `wake_round=1` 是**可选尾段**，都在同一行里）。
+_ROUTE_TEMPLATE = (
+    "media_analysis: route=%s stage=%s engine=%s kind=%s fallback=%s "
+    "cached=%d duration_s=%.2f frames=%d transcript_chars=%d elapsed_ms=%d%s%s"
+)
+
+#: `notes` → `fallback` 的子串判据（R3–R6；顺序即表的顺序）
+_FALLBACK_BY_NOTE: tuple[tuple[str, str], ...] = (
+    ("video_unavailable_no_provider", FALLBACK_NO_VIDEO_PROVIDER),
+    ("video_no_vision_provider", FALLBACK_NO_VISION_PROVIDER),
+    ("video_skip_budget", FALLBACK_SKIP_BUDGET),
+    ("no_audio_track", FALLBACK_NO_AUDIO_TRACK),
+)
+
+#: `native_state` → `fallback`（R7–R10）
+_FALLBACK_BY_NATIVE: tuple[tuple[str, str], ...] = (
+    (NATIVE_UNAVAILABLE, FALLBACK_NATIVE_UNAVAILABLE),
+    (NATIVE_FAILED, FALLBACK_NATIVE_FAILED),
+    (NATIVE_EMPTY, FALLBACK_NATIVE_EMPTY),
+    (NATIVE_TOO_LARGE, FALLBACK_NATIVE_TOO_LARGE),
+)
+
+
+def route_of(*, cached: bool, error: str, native_state: str, frames: int = 0) -> str:
+    """本次调用的顶层走法（**总函数**，§6.2 末段冻结的优先级）。
+
+    `cache`（命中缓存）> `none`（有异常码）> `native`（`native_state=="ok"`）
+    > `frames`（帧非空）> `audio`（其余）。`frames` 传**帧数**（不是列表）：
+    `route=` 行只需要计数，传列表会让调用方为了填一个参数去造对象。
+    """
+    if cached:
+        return ROUTE_CACHE
+    if error:
+        return ROUTE_NONE
+    if native_state == NATIVE_OK:
+        return ROUTE_NATIVE
+    if frames > 0:
+        return ROUTE_FRAMES
+    return ROUTE_AUDIO
+
+
+def fallback_of(
+    route: str, *, mode: str, notes: list[str], native_state: str
+) -> str:
+    """`fallback=` 的判定表（§6.2 的 R1–R11，**按序首命中**；输入只有三个）。
+
+    R1 是唯一的"没有降级"出口：`native` / `cache` / `none` 三种走法下"更贵的那一跳"
+    根本不该存在（原生成功、缓存回放、本次以错误收口）。
+    R2 只看 `mode=false` **且**原生没成功：`false` 的用户诉求就是"别看画面"，
+    抽帧被禁止是**按设计**（note 名 `video_frames_forbidden` 是同一件事的信封面）。
+    """
+    if route in (ROUTE_NATIVE, ROUTE_CACHE, ROUTE_NONE):  # R1
+        return FALLBACK_DASH
+    if mode == MODE_FALSE and native_state != NATIVE_OK:  # R2
+        return FALLBACK_FRAMES_FORBIDDEN
+    for needle, value in _FALLBACK_BY_NOTE:  # R3–R6
+        if needle in notes:
+            return value
+    for state, value in _FALLBACK_BY_NATIVE:  # R7–R10
+        if native_state == state:
+            return value
+    return FALLBACK_DASH  # R11
+
+
+def log_route(
+    *,
+    route: str,
+    stage: str,
+    engine: str,
+    kind: str = KIND_DASH,
+    fallback: str = FALLBACK_DASH,
+    cached: bool = False,
+    duration_s: float = 0.0,
+    frames: int = 0,
+    transcript_chars: int = 0,
+    elapsed_ms: int = 0,
+    error: str = "",
+    wake_round: bool = False,
+) -> None:
+    """打**一行** `media_analysis: route=…`（§6.1；单行、无换行、字段顺序冻死）。
+
+    两条自我约束：
+    - 枚举外的值**归一**成 `none` / `plugin` / `-`（绝不把自创枚举写进日志 —— 那会让
+      运维的 grep 与 §6.2 的集合相等判据同时失效）；
+    - **不读不写 `notes`**（调用方只把 `notes` 的子串判定结果传进来，见 `fallback_of`）。
+    """
+    safe_route = route if route in ROUTES else ROUTE_NONE
+    safe_stage = stage if stage in STAGES else STAGE_ANALYZE
+    safe_engine = engine if engine in ENGINES else ENGINE_PLUGIN
+    safe_kind = kind if kind in KINDS else KIND_DASH
+    safe_fallback = fallback if fallback in FALLBACKS else FALLBACK_DASH
+    error_tail = f" error={error}" if error else ""
+    wake_tail = " wake_round=1" if wake_round else ""
+    LOG.info(
+        _ROUTE_TEMPLATE,
+        safe_route,
+        safe_stage,
+        safe_engine,
+        safe_kind,
+        safe_fallback,
+        1 if cached else 0,
+        float(duration_s),
+        int(frames),
+        int(transcript_chars),
+        int(elapsed_ms),
+        error_tail,
+        wake_tail,
+    )
+
+
+@dataclass
+class _RouteState:
+    """`route=` 行需要的、**只在 `analyze()` 内部**累积的状态（不跨调用、不进信封）。"""
+
+    kind: str = KIND_DASH
+    duration_s: float = 0.0
+    native_state: str = ""
+    frames: int = 0
+    transcript_chars: int = 0
+    cached: bool = False
+    error: str = ""
+    cancelled: bool = False
+
+
+# --------------------------------------------------------------------------- #
+# D2 唤醒轮短路（SPEC-v0.5.1 §5）：两个**纯判定**函数，两个引擎共用
+# --------------------------------------------------------------------------- #
+def is_wake_round(event) -> bool:
+    """这个事件是不是"没有消息链的合成事件"（核心的唤醒轮，§5.1）。
+
+    两个信号都是**结构性**的（不依赖文案）：
+    - `cron/events.py:24-27` 把 `platform_meta.name` 钉成 `"cron"` ⇒ `get_platform_name()=="cron"`；
+    - `astr_agent_tool_exec.py:568-576` 给后台任务唤醒轮写 `extras["background_task_result"]`。
+
+    **fail-open**：事件对象缺方法、字段是怪类型、甚至抛异常 ⇒ 一律 `False`
+    （宁可多提交一次后台任务，也不许把一条正常用户消息误判成唤醒轮）。
+    本函数**永不抛**。
+    """
+    try:
+        name = str(event.get_platform_name() or "")
+        if name == "cron":
+            return True
+        extra = event.get_extra("background_task_result")
+        return isinstance(extra, dict)
+    except BaseException:  # noqa: BLE001 —— fail-open 的定义就是"判定失败 = 不是唤醒轮"
+        return False
+
+
+async def chain_has_media(event, target: str = "current") -> bool:
+    """消息链里**真有**媒体候选吗（§5.2 第 1/3 条）：只做类型判定，0 下载/0 ffmpeg/0 provider。
+
+    复用 `media.find_media`（受理路径的同一道判据），所以"有没有媒体"只有一个事实源。
+    `MEDIA_NOT_FOUND` ⇒ `False`；其它 `ToolError`（如 `BAD_TARGET`）**原样抛给调用方**
+    —— 那是更根本的错，不该被"唤醒轮"这个更窄的结论盖掉（§5.2 第 3 条的 fail-open 退路）。
+    """
+    try:
+        await media.find_media(event, target)
+    except envelope.ToolError as exc:
+        if exc.code == envelope.ERR_MEDIA_NOT_FOUND:
+            return False
+        raise
+    return True
 
 
 def is_valid_mode_value(value: object) -> bool:
@@ -213,15 +468,22 @@ async def analyze(
     include_frames: object,
     settings: settings_mod.Settings,
     cache: cache_mod.DiskCache,
+    engine: str = ENGINE_PLUGIN,
 ) -> dict[str, object]:
     """跑完整条链路，返回**成功信封**（9 键）；受控失败抛 `envelope.ToolError`。
 
     步骤号与 SPEC-v0.3 §7.3 的七跳一致（[0]–[7]），便于对着规格评审。
+
+    `engine` 是 v0.5.1 加的**关键字参数**（SPEC-v0.5.1 §6.3 的 J7）：只用于 `route=` 行的
+    `engine=` 字段，两个引擎**显式**传（A2 `background._run` 传 `"plugin"`、C
+    `core_mode.run` 传 `"core"`）。**不从 `settings.background_mode` 反查**——C 模式下
+    `settings` 可能是 `plugin` 回落态，反查会写出错误的引擎名。
     """
     started = time.monotonic()  # [0]
     deadline = started + DEADLINE_S
     notes: list[str] = []
     mode = normalize_mode(include_frames)
+    route_state = _RouteState()
     workdir = tempfile.mkdtemp(prefix=WORKDIR_PREFIX)
     try:
         # 1 —— focus 去空白 + 截断；配置里的上限已钳位
@@ -321,10 +583,15 @@ async def analyze(
         async with cache.singleflight(key):
             hit = await cache.get(key)
             if hit is not None:
+                # 命中即回放：`route=cache`、`fallback=-`（§6.2 的 R1），链路没跑
+                route_state.cached = True
+                route_state.kind = kind
+                route_state.duration_s = float(hit.get("envelope", {}).get("duration_s") or 0.0) \
+                    if isinstance(hit.get("envelope"), dict) else 0.0
                 return _replay(hit, started)
 
             if kind == "video":
-                transcript, frames, summary, frames_degraded = await _video_stage(
+                transcript, frames, summary, frames_degraded, native_state = await _video_stage(
                     context=context,
                     event=event,
                     path=path,
@@ -340,7 +607,7 @@ async def analyze(
                     workdir=workdir,
                 )
             else:
-                transcript, frames, summary, frames_degraded = await _audio_stage(
+                transcript, frames, summary, frames_degraded, native_state = await _audio_stage(
                     context=context,
                     event=event,
                     path=path,
@@ -379,6 +646,11 @@ async def analyze(
                 elapsed_ms=_elapsed_ms(started),
                 cached=False,
             )
+            route_state.kind = kind
+            route_state.duration_s = duration_s
+            route_state.native_state = native_state
+            route_state.frames = len(frames)
+            route_state.transcript_chars = _transcript_chars(transcript)
             await cache.put(key, payload)
             LOG.info(
                 "media_analysis: ok kind=%s mode=%s duration_s=%.2f frames=%d "
@@ -392,8 +664,60 @@ async def analyze(
                 payload["elapsed_ms"],
             )
             return payload
+    except asyncio.CancelledError:
+        # 取消（卸载/进程停止）：**不产 `route=` 行** —— 这次调用没有"走法"可言，
+        # 硬填一个 `route=audio` 会让运维以为它真跑成过。取消有自己的日志
+        # （`bg cancelled` / `core-mode call cancelled`），D4 的"缺席判据"也靠
+        # 核心那行 tool 调用记录区分，不会和"根本没到插件"混淆。
+        route_state.cancelled = True
+        raise
+    except envelope.ToolError as exc:
+        # 受控失败：只记码（`log_detail` 走既有的 `rejected:` 行，不进 `route=`）
+        route_state.error = exc.code
+        raise
+    except BaseException as exc:  # noqa: BLE001 —— 只负责"日志说真话"，**再上抛**
+        # 非受控异常（`_video_stage` 里的 RuntimeError、ffmpeg 封装漏出的东西、核心热重载
+        # 期间的空 client…）：收口点在调用方（`background._run` / `core_mode.run`），本层
+        # **不吞**；但如果这里不记码，`finally` 会按累积态打出一条**假的** `route=audio`
+        # （看起来像"只交了转写"），把事故藏起来。⇒ 记 `INTERNAL_ERROR` 再上抛
+        # （SPEC-v0.5.1 §6.2 的 `route=none` 正是"以错误收口"的那一档）。
+        # `asyncio.CancelledError` 是 `BaseException` 的子类，但它在上一支已被拦下
+        # （`route_state.cancelled=True` ⇒ 不打行），所以不会走到这里。
+        code = getattr(exc, "code", None)
+        route_state.error = (
+            code if isinstance(code, str) and code in envelope.HINTS
+            else envelope.ERR_INTERNAL_ERROR
+        )
+        raise
     finally:
-        # 8 —— 中间产物（含压缩产物）只落 /tmp，用完即删
+        # 8 —— `route=` 观测行（SPEC-v0.5.1 §6.3）：**每次调用恰好一行**，在删工作目录之前
+        #     打；`notes` 只用于 `fallback_of` 的子串判定，**不写回**（缓存中立）。
+        if not route_state.cancelled:
+            route = route_of(
+                cached=route_state.cached,
+                error=route_state.error,
+                native_state=route_state.native_state,
+                frames=route_state.frames,
+            )
+            log_route(
+                route=route,
+                stage=STAGE_ANALYZE,
+                engine=engine,
+                kind=route_state.kind,
+                fallback=fallback_of(
+                    route,
+                    mode=mode,
+                    notes=notes,
+                    native_state=route_state.native_state,
+                ),
+                cached=route_state.cached,
+                duration_s=route_state.duration_s,
+                frames=route_state.frames,
+                transcript_chars=route_state.transcript_chars,
+                elapsed_ms=_elapsed_ms(started),
+                error=route_state.error,
+            )
+        # 9 —— 中间产物（含压缩产物）只落 /tmp，用完即删
         shutil.rmtree(workdir, ignore_errors=True)
 
 
@@ -411,8 +735,12 @@ async def _audio_stage(
     notes: list[str],
     settings: settings_mod.Settings,
     workdir: str,
-) -> tuple[list[dict[str, object]], list[dict[str, object]], str]:
-    """纯语音消息：只做音轨转写 + 摘要（v0.2 语义不变；`mode` 只多一条 note）。"""
+) -> tuple[list[dict[str, object]], list[dict[str, object]], str, bool, str]:
+    """纯语音消息：只做音轨转写 + 摘要（v0.2 语义不变；`mode` 只多一条 note）。
+
+    返回 `(transcript, frames, summary, frames_degraded, native_state)`：语音消息**没有**
+    原生视频这一跳 ⇒ `native_state=""`（`route=` 行按 §6.2 落到 `audio`）。
+    """
     if mode != MODE_FALSE:
         notes.append("frames_skipped_audio_only")
     transcript = await _transcribe_path(
@@ -437,7 +765,8 @@ async def _audio_stage(
         notes=notes,
         settings=settings,
     )
-    return transcript, [], summary, True  # 语音消息没有"画面诉求"⇒ 永远算按设计降级
+    # 语音消息没有"画面诉求"⇒ 永远算按设计降级（`frames_degraded=True`），也没有原生跳
+    return transcript, [], summary, True, ""
 
 
 # --------------------------------------------------------------------------- #
@@ -458,11 +787,13 @@ async def _video_stage(
     notes: list[str],
     settings: settings_mod.Settings,
     workdir: str,
-) -> tuple[list[dict[str, object]], list[dict[str, object]], str]:
+) -> tuple[list[dict[str, object]], list[dict[str, object]], str, bool, str]:
     """视频七跳：[1] 视频位 → [2] L1 → [3] 直送闸/压缩 → [4] 原生 → [5] 回退 → [6] 摘要。
 
-    返回 `(transcript, frames, summary)`：原生成功时前两项是 `[]`、`summary` 是模型整段回答
-    （`transcript=[]` 是**显式取舍**：不做"原生 + 音轨"双跑，§16.2-7）。
+    返回 `(transcript, frames, summary, frames_degraded, native_state)`：原生成功时前两项是
+    `[]`、`summary` 是模型整段回答（`transcript=[]` 是**显式取舍**：不做"原生 + 音轨"双跑，
+    §16.2-7）。`native_state` 是 v0.5.1 为 `route=` 行透出的第 5 个元素（§6.2 的 R7–R10
+    要它区分 unavailable/failed/empty/too_large）；它**不进信封**、不进 `notes`。
     """
     # [1]-[4] 原生通道 + 直送闸 + 原生调用
     native_state = NATIVE_UNAVAILABLE
@@ -483,7 +814,7 @@ async def _video_stage(
                 workdir=workdir,
             )
             if native_state == NATIVE_OK:
-                return [], [], text, False
+                return [], [], text, False, native_state
     elif mode == MODE_TRUE:
         # 没有视频流却点名要画面 ⇒ v0.2 的判据逐字沿用
         raise envelope.ToolError(
@@ -541,7 +872,7 @@ async def _video_stage(
         notes=notes,
         settings=settings,
     )
-    return transcript, frames, summary, frames_degraded
+    return transcript, frames, summary, frames_degraded, native_state
 
 
 async def _frames_fallback(
@@ -729,11 +1060,12 @@ async def _native_attempt(
     send_path = path
     if size > direct_limit:
         remaining = deadline - time.monotonic()
-        min_actionable = (
-            float(settings.video_compress_timeout_seconds)
-            + float(settings.video_native_timeout_seconds) * 0.5
-        )
-        if remaining < min_actionable:
+        # v0.5.1（SPEC-v0.5.1 §2.2-B 的 D-2）：`native_timeout_seconds` 键已删 ⇒ 上限进常量
+        # `NATIVE_TIMEOUT_S`（60.0）。**这不是"语义不变"**：本阈值里原生上限是**加性**用法
+        # （`compress_timeout + NATIVE_TIMEOUT_S/2`），于是老 `native_timeout=110` 的
+        # `60 + 55 = 115 s` 变成 `60 + 30 = 90 s`，而起步剩余 ≈96.4 s ⇒ 超门槛视频的压缩跳
+        # 由"必然 `video_skip_budget`"变为**可达**（推导与两个代表值见 `min_actionable_s`）。
+        if remaining < min_actionable_s(settings):
             notes.append("video_skip_budget")
             return "", NATIVE_FAILED
         if not settings.video_compress_enabled:
@@ -766,9 +1098,7 @@ async def _native_attempt(
         size = int(result.size or size)
 
     remaining = deadline - time.monotonic()
-    timeout = min(
-        float(settings.video_native_timeout_seconds), remaining - NATIVE_RESERVE_S
-    )
+    timeout = min(NATIVE_TIMEOUT_S, remaining - NATIVE_RESERVE_S)
     if timeout <= 0:
         notes.append("video_skip_budget")
         return "", NATIVE_FAILED
@@ -778,7 +1108,9 @@ async def _native_attempt(
         provider,
         prompt=prompt,
         video_path=send_path,
-        max_tokens=settings.video_native_max_tokens,
+        # v0.5.1：`native_max_tokens` 键已删 ⇒ 用 `video_native.NATIVE_MAX_TOKENS`(4096)。
+        # 显式传（而不是靠默认值）是让"运行面读的是哪个值"在调用点上可读、可 grep。
+        max_tokens=video_native.NATIVE_MAX_TOKENS,
         timeout=timeout,
     )
     if not outcome.ok:
@@ -852,6 +1184,8 @@ async def _transcribe_path(
         notes=notes,
         reserve_s=reserve_s,
         soft_timeout=soft_timeout,
+        # v0.5.1 D1：上限来自配置（slider 10–95），不再硬编码 60 s
+        cap=audio_cap_s(settings),
     )
     notes.append(f"audio_provider:{providers.provider_id_of(audio_provider)}")
     if not text:
@@ -906,6 +1240,44 @@ async def _summary_stage(
     )
 
 
+def audio_cap_s(settings: settings_mod.Settings) -> float:
+    """音轨单次调用的超时**上限**（秒）＝ `limits.audio_timeout_seconds`（§4.1）。
+
+    配置面已经把值钳到 `[10, 95]`（`settings.MIN/MAX_AUDIO_TIMEOUT_SECONDS`，
+    95 == `AUDIO_HONOR_MAX_S` 是可被兑现的上界）⇒ 这里**不再钳位**，只做两件事：
+    - 取不到 / 不是数 ⇒ 退回 `AUDIO_TIMEOUT_S`（默认 60.0，等于该键的 schema 默认值）；
+    - 非正数 ⇒ 同上（0 或负数会让 `budgeted_timeout` 直接判"预算已尽"，那是配置坏值的
+      症状，不该被当成"用户想要 0 秒"）。
+
+    单独成函数而不是内联：`tests/test_analyze.py` 的 D1 用例要把它缩到亚秒级来
+    **快跑**（真等 60 s 不现实），这是一个显式的、被文档化的测试缝。
+    """
+    value = getattr(settings, "audio_timeout_seconds", None)
+    try:
+        cap = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return float(AUDIO_TIMEOUT_S)
+    return cap if cap > 0 else float(AUDIO_TIMEOUT_S)
+
+
+def min_actionable_s(settings: settings_mod.Settings) -> float:
+    """压缩跳的"值得动手"门槛（秒）＝ `compress_timeout + NATIVE_TIMEOUT_S / 2`。
+
+    §7.3-[3] 的冻结判据：剩余预算连"压缩整块 + 原生半程"都不够时，压出来也来不及直送
+    ⇒ 直接 `video_skip_budget`，别白花 ffmpeg 的 4–14 s。
+
+    **v0.5.1 D-2 的派生后果（这是行为变更，不是"语义不变"）**：原生上限在本式里是**加性**
+    用法。生产串是老版 `compress_timeout_seconds=60`（隐藏键，**保号**）+ 老
+    `native_timeout_seconds=110` ⇒ 旧门槛 `60 + 55 = 115 s`；而进入这一跳时起步剩余
+    ≈ `96.4 s`（SPEC-v0.5.1 §9.2 第 6 行）⇒ **超门槛视频的压缩跳在旧配置下必然
+    `video_skip_budget`**（从来跑不到）。D-2 把原生上限降到 60 之后门槛是
+    `60 + 30 = 90 s < 96.4 s` ⇒ 压缩跳**重新可达**。
+    单独成函数是为了让这条算术可被一格测试钉住（`tests/test_config_map.py` 的两个代表值），
+    而不是散落在 `_native_attempt` 里当内联表达式。
+    """
+    return float(settings.video_compress_timeout_seconds) + NATIVE_TIMEOUT_S * 0.5
+
+
 async def transcribe(
     provider,
     wav_path: str,
@@ -915,8 +1287,9 @@ async def transcribe(
     notes: list[str],
     reserve_s: float = 0.0,
     soft_timeout: bool = False,
+    cap: float | None = None,
 ) -> str:
-    """一次多模态 `text_chat(audio_urls=[wav])`，返回**整段**文本（SPEC-v0.2 §2.1）。
+    """多模态 `text_chat(audio_urls=[wav])`，返回**整段**文本（SPEC-v0.2 §2.1 + §4）。
 
     形状冻结：`image_urls` 一律不传、`audio_urls` 只放 1 个元素、不传
     `contexts`/`system_prompt`/`func_tool`（一次调用＝一次独立转写请求）。
@@ -924,59 +1297,106 @@ async def transcribe(
     返回值可能为空串或哨兵 `[无语音]`：那是**成功但没内容**，写 `audio_empty` note、
     `transcript=[]`，不是错误。
 
-    **预算（评审 R1 的接线点）**：超时不再写 `min(AUDIO_TIMEOUT_S, remaining)`，而是
-    `budgeted_timeout(remaining, AUDIO_TIMEOUT_S, reserve_s)` —— 扣掉后面那一跳（抽帧）
-    要用的预留。不扣的话，慢音轨会把抽帧预算吃光，主打回退在最该生效时 `video_skip_budget`。
+    **预算**：超时仍是 `budgeted_timeout(remaining, cap, reserve_s)`（公式逐字未变）——
+    进 `_transcribe_path` 时 `cap` = `limits.audio_timeout_seconds`（slider 10–95，
+    v0.5.1 起可配；旧版是硬编码 60）。
 
-    **超时后的分流（评审 R1 的裁决）**：
+    **v0.5.1 D1：硬超时后恰好一次重试**（`AUDIO_RETRY_MAX=1` ⇒ 至多 2 次尝试）：
 
     | 情形 | 行为 |
     | --- | --- |
-    | 本轮**要画面**（`soft_timeout=True`） | 记 note `audio_timeout`，返回 `""`，**继续走画面阶段** |
-    | 不要画面（`soft_timeout=False`） | `AUDIO_FAILED`（主诉求就是转写，不能假成功） |
+    | 本轮**要画面**（`soft_timeout=True`） | 记 note `audio_timeout`、返回 `""`、继续画面，**不重试** |
+    | 不要画面 + 超时 + 还有预算 | **重试一次**；仍超时 ⇒ `AUDIO_FAILED` |
+    | 不要画面 + 超时 + 剩余不足 `AUDIO_RETRY_MIN_S` | `AUDIO_FAILED`，`log_detail` 带 `retry_skipped=budget` |
+    | provider 抛错（非超时） | `AUDIO_FAILED`，**不重试**（那是模型侧真出问题，不是预算不够） |
 
-    「要画面」的判据是 `frames_possible()`（`mode=true`，或 `auto` + 视频模型 + 视觉位都配了）。
-    **只有超时**走这条降级：provider 抛错（4xx/5xx/安全过滤…）仍一律 `AUDIO_FAILED` ——
-    那说明模型侧真出问题了，不是"预算不够"。
+    **预算不变式**：两次尝试的超时分别是 `t1 = min(cap, R0 − r)`、`t2 = min(cap, R0 − t1 − r')`，
+    第二个 `min` 的上界就是 `R0 − t1` ⇒ `t1 + t2 ≤ R0` ⇒ **总耗时 ≤ `DEADLINE_S`**（§4.2）。
+
+    **`log_detail` 文案冻死**（§4.3，必须仍以 `text_chat timeout` 起头，运维的
+    `grep 'detail=text_chat timeout'` 不受影响）：
+
+    - 两次都超时 ⇒ `text_chat timeout; first_timeout=<t1>s retry_timeout=<t2>s`
+    - 首超时但预算不足 ⇒ `text_chat timeout; first_timeout=<t1>s retry_skipped=budget`
+
+    重试相关的一切（第几次、耗时）**只进日志**：`notes` 必须与"单次就成功"逐字相同
+    （§6.5 缓存中立 —— 信封整体入缓存，一条"重试过"的标记会被复用给别的调用）。
     """
-    remaining = deadline - time.monotonic()
-    timeout = budgeted_timeout(remaining, AUDIO_TIMEOUT_S, reserve_s)
-    if timeout <= 0:
-        if soft_timeout:
-            notes.append("audio_timeout")
-            LOG.info("media_analysis: 音轨没有可用预算（要画面）⇒ 记 audio_timeout 继续")
-            return ""
-        raise envelope.ToolError(
-            envelope.ERR_AUDIO_FAILED, log_detail="budget exhausted"
-        )
-    try:
-        resp = await asyncio.wait_for(
-            provider.text_chat(prompt=prompt, audio_urls=[wav_path]),
-            timeout=timeout,
-        )
-    except (asyncio.TimeoutError, TimeoutError):
-        if soft_timeout:
-            # 要画面 ⇒ 别让慢音轨把整次调用拖死（评审 R1）
-            notes.append("audio_timeout")
-            LOG.info(
-                "media_analysis: 音轨超时（%.1f s，已扣 %.0f s 画面预留）⇒ 记 audio_timeout 继续",
-                timeout,
-                reserve_s,
+    limit = AUDIO_TIMEOUT_S if cap is None else float(cap)
+    attempts = 0
+    timeouts: list[float] = []  # 每次超时那一刻的 timeout 值（顺序入列，§4.2）
+    while True:
+        attempts += 1
+        remaining = deadline - time.monotonic()
+        timeout = budgeted_timeout(remaining, limit, reserve_s)
+        if timeout <= 0:  # 与今天完全一致
+            if soft_timeout:
+                notes.append("audio_timeout")
+                LOG.info("media_analysis: 音轨没有可用预算（要画面）⇒ 记 audio_timeout 继续")
+                return ""
+            raise envelope.ToolError(
+                envelope.ERR_AUDIO_FAILED, log_detail="budget exhausted"
             )
+        # 本趟的起点＝刚算 `remaining` 那一刻（**不额外调一次 `monotonic()`**：
+        # 预算类用例用脚本时钟数调用次数，多一次就会把别人的第 N 个数挪走）
+        attempt_started = deadline - remaining
+        try:
+            resp = await asyncio.wait_for(
+                provider.text_chat(prompt=prompt, audio_urls=[wav_path]),
+                timeout=timeout,
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            timeouts.append(timeout)
+            if soft_timeout:
+                # 要画面 ⇒ 别让慢音轨把整次调用拖死（评审 R1）。**不重试**（J4）：
+                # 重试会吃掉给抽帧的 25 s 预留，把 `video_skip_budget` 的概率抬上去。
+                notes.append("audio_timeout")
+                LOG.info(
+                    "media_analysis: 音轨超时（%.1f s，已扣 %.0f s 画面预留）"
+                    "⇒ 记 audio_timeout 继续（不重试）",
+                    timeout,
+                    reserve_s,
+                )
+                return ""
+            if attempts >= 1 + AUDIO_RETRY_MAX:
+                raise envelope.ToolError(
+                    envelope.ERR_AUDIO_FAILED,
+                    log_detail=(
+                        f"text_chat timeout; first_timeout={timeouts[0]:.1f}s "
+                        f"retry_timeout={timeouts[-1]:.1f}s"
+                    ),
+                ) from None
+            if (deadline - time.monotonic()) - max(0.0, reserve_s) < AUDIO_RETRY_MIN_S:
+                raise envelope.ToolError(
+                    envelope.ERR_AUDIO_FAILED,
+                    log_detail=(
+                        f"text_chat timeout; first_timeout={timeouts[0]:.1f}s "
+                        "retry_skipped=budget"
+                    ),
+                ) from None
+            LOG.info(
+                "media_analysis: audio retry attempt=2/2 first_timeout_s=%.1f remaining_s=%.1f",
+                timeouts[0],
+                deadline - time.monotonic(),
+            )
+            continue  # ← **只此一次**（`AUDIO_RETRY_MAX` 是常量 1）
+        except Exception as exc:  # noqa: BLE001 —— provider 侧什么都可能抛
+            # `asyncio.CancelledError` 是 BaseException，不在这里被吞（取消语义必须传播）。
+            # **不重试**：非超时异常意味着模型侧真出问题（4xx/5xx/内容过滤），重试只是白花钱。
+            raise envelope.ToolError(
+                envelope.ERR_AUDIO_FAILED, log_detail=_exception_detail(exc)
+            ) from None
+        if attempts > 1:
+            # 重试成功：只进日志（§4.3），不进 notes/信封（缓存中立）
+            LOG.info(
+                "media_analysis: audio retry ok attempt=2/2 elapsed_ms=%d",
+                _elapsed_ms(attempt_started),
+            )
+        text = _response_text(resp)
+        if not text or text == NO_SPEECH_SENTINEL:
+            notes.append("audio_empty")
             return ""
-        raise envelope.ToolError(
-            envelope.ERR_AUDIO_FAILED, log_detail=f"text_chat timeout {timeout:.1f}s"
-        ) from None
-    except Exception as exc:  # noqa: BLE001 —— provider 侧什么都可能抛
-        # `asyncio.CancelledError` 是 BaseException，不在这里被吞（取消语义必须传播）
-        raise envelope.ToolError(
-            envelope.ERR_AUDIO_FAILED, log_detail=_exception_detail(exc)
-        ) from None
-    text = _response_text(resp)
-    if not text or text == NO_SPEECH_SENTINEL:
-        notes.append("audio_empty")
-        return ""
-    return text
+        return text
 
 
 async def describe_frames(
@@ -1292,3 +1712,12 @@ def _umo(event) -> str:
 
 def _elapsed_ms(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
+
+
+def _transcript_chars(transcript: list[dict[str, object]]) -> int:
+    """第一个转写条目的字数（与 `ok` 行同一口径；`route=` 行只读这个计数）。"""
+    if not transcript:
+        return 0
+    first = transcript[0]
+    text = first.get("text") if isinstance(first, dict) else ""
+    return len(text) if isinstance(text, str) else 0

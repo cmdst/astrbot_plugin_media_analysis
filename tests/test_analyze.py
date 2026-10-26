@@ -51,6 +51,7 @@ from astrbot_plugin_media_analysis import envelope, main, media, providers, sett
 from _fakes import (
     FakeChatProvider,
     FakeContext,
+    FakeEvent,
     RecordingLogger,
     audio_chat,
     make_event,
@@ -440,9 +441,14 @@ async def test_audio_call_exception_is_audio_failed(
 async def test_audio_call_timeout_is_audio_failed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """§2.2：`min(AUDIO_TIMEOUT_S, 剩余预算)` 超时 ⇒ `AUDIO_FAILED`（不冒泡成框架超时）。"""
+    """§2.2：`min(cap, 剩余预算)` 超时 ⇒ `AUDIO_FAILED`（不冒泡成框架超时）。
+
+    v0.5.1 起 cap 来自配置（`limits.audio_timeout_seconds`，整数秒，10–95）⇒ 想跑
+    **亚秒级**超时只能从 `analyze.audio_cap_s()` 这个显式测试缝进（真等 10 s 不现实）。
+    D1 的重试语义不影响本条的结论：两次都超时仍是同一个码、同一个 3 键信封。
+    """
     rig = build_rig(monkeypatch, tmp_path, audio=audio_chat(delay=0.2))
-    monkeypatch.setattr(analyze_mod, "AUDIO_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(analyze_mod, "audio_cap_s", lambda _settings: 0.01)
     payload = await rig.tool()
     assert payload["error"] == envelope.ERR_AUDIO_FAILED
 
@@ -2060,3 +2066,829 @@ async def test_gif_static_note_tracks_the_source_frame_count(
     animated = await rig.run()
     assert animated["cached"] is False
     assert "gif_static" not in animated["notes"]
+
+
+# --------------------------------------------------------------------------- #
+# v0.5.1 D1：音轨超时**配置化 + 恰好一次重试**（SPEC-v0.5.1 §4 / §9.4 的 G4 六格）
+#
+# 六格的分工（每一格都能**单独**变红）：
+#   ⑮ 超时→重试→仍超时：`attempts==2`，`log_detail` 双字段；
+#   ⑯ 预算不足：`retry_skipped=budget` 且 `attempts==1`；
+#   ⑰ 重试成功：notes 与"一次就成"**逐字相同**（缓存中立）；
+#   ⑱ `soft_timeout`：不重试（重试会吃掉抽帧预留）；
+#   ⑲ provider 抛错：不重试；
+#   ⑳ 总耗时 ≤ `DEADLINE_S`（把 `DEADLINE_S` 缩到 1.2 s 跑）。
+#
+# 为什么直接测 `analyze.transcribe` 而不是整条链：重试是**这一跳**的性质，整条链会把
+# 音轨预算与抽帧预留、摘要预算混在一起（那样变红时说不清是谁的问题）。整条链的接线由
+# 下面 `test_audio_cap_comes_from_the_config_key` + 既有 `budgeted_timeout` 用例守。
+# --------------------------------------------------------------------------- #
+class _AudioSpy:
+    """只实现 `transcribe` 用到那两件事的 provider 桩（`text_chat` + `completion_text`）。
+
+    `delays` 是**逐次**延迟（第 N 次用第 N 个，用尽后重复最后一个）⇒ 能造
+    "第一次超时、第二次秒回"这种序列，而不用真等 60 s。
+    """
+
+    def __init__(
+        self,
+        *,
+        delays: tuple[float, ...] = (0.0,),
+        text: str = "合成转写",
+        fail_at: int | None = None,
+    ) -> None:
+        self.delays = tuple(delays) or (0.0,)
+        self.text = text
+        self.fail_at = fail_at
+        self.calls = 0
+
+    async def text_chat(self, *, prompt=None, audio_urls=None):  # noqa: ANN001
+        self.calls += 1
+        if self.fail_at is not None and self.calls == self.fail_at:
+            raise RuntimeError("quota exceeded")
+        delay = self.delays[min(self.calls - 1, len(self.delays) - 1)]
+        if delay:
+            await asyncio.sleep(delay)
+        return SimpleNamespace(completion_text=self.text)
+
+
+async def _run_transcribe(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: _AudioSpy,
+    *,
+    cap: float,
+    deadline_after: float = 100.0,
+    reserve_s: float = 0.0,
+    soft_timeout: bool = False,
+) -> tuple[str, list[str], RecordingLogger]:
+    """跑一次 `transcribe`，返回 `(文本, notes, 日志桩)`（日志桩用于断言"只进日志"）。"""
+    logger = RecordingLogger()
+    monkeypatch.setattr(analyze_mod, "LOG", logger)
+    notes: list[str] = []
+    text = await analyze_mod.transcribe(
+        provider,
+        "/tmp/never-read.wav",
+        "把这段语音转写出来",
+        deadline=time.monotonic() + deadline_after,
+        notes=notes,
+        reserve_s=reserve_s,
+        soft_timeout=soft_timeout,
+        cap=cap,
+    )
+    return text, notes, logger
+
+
+def _info_lines(logger: RecordingLogger) -> list[str]:
+    return [message for level, message in logger.records if level == "INFO"]
+
+
+@pytest.mark.asyncio
+async def test_audio_hard_timeout_retries_exactly_once_then_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⑮ 两次都超时 ⇒ `AUDIO_FAILED`；`attempts==2` 且 `log_detail` 能分辨两趟。
+
+    `log_detail` 必须仍以 `text_chat timeout` 起头（运维既有 grep 句式
+    `media_analyze rejected: code=AUDIO_FAILED detail=text_chat timeout …` 不许失效），
+    后面才带 `first_timeout=` / `retry_timeout=` 两个字段。
+    """
+    provider = _AudioSpy(delays=(5.0,))
+    logger = RecordingLogger()
+    monkeypatch.setattr(analyze_mod, "LOG", logger)
+    notes: list[str] = []
+
+    with pytest.raises(envelope.ToolError) as exc_info:
+        await analyze_mod.transcribe(
+            provider,
+            "/tmp/never-read.wav",
+            "转写",
+            deadline=time.monotonic() + 100.0,
+            notes=notes,
+            cap=0.05,
+        )
+
+    assert exc_info.value.code == envelope.ERR_AUDIO_FAILED
+    assert provider.calls == 2, "恰好一次重试 ⇒ 共 2 次尝试"
+    detail = exc_info.value.log_detail
+    assert detail.startswith("text_chat timeout"), detail
+    assert "first_timeout=" in detail and "retry_timeout=" in detail, detail
+    assert "retry_skipped" not in detail, "这是「重试了仍失败」，不是「预算不足」"
+    assert notes == [], "重试标记只准进日志（notes 缓存中立）"
+    assert any("audio retry attempt=2/2" in line for line in _info_lines(logger))
+
+
+@pytest.mark.asyncio
+async def test_audio_retry_skipped_when_budget_is_below_the_minimum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⑯ 首次超时但剩余 < `AUDIO_RETRY_MIN_S` ⇒ **不重试**，`retry_skipped=budget`。
+
+    为什么要有这条闸：起一次注定超时的调用只会白占预算、把 `DEADLINE_S` 吃满。
+    """
+    provider = _AudioSpy(delays=(5.0,))
+    notes: list[str] = []
+    monkeypatch.setattr(analyze_mod, "LOG", RecordingLogger())
+
+    with pytest.raises(envelope.ToolError) as exc_info:
+        await analyze_mod.transcribe(
+            provider,
+            "/tmp/never-read.wav",
+            "转写",
+            deadline=time.monotonic() + 0.5,  # 首趟就会把预算吃光
+            notes=notes,
+            cap=0.1,
+        )
+
+    assert exc_info.value.code == envelope.ERR_AUDIO_FAILED
+    assert provider.calls == 1, "预算不足 ⇒ 只有 1 次尝试"
+    detail = exc_info.value.log_detail
+    assert detail.startswith("text_chat timeout")
+    assert "first_timeout=" in detail and "retry_skipped=budget" in detail, detail
+    assert "retry_timeout=" not in detail
+
+
+@pytest.mark.asyncio
+async def test_audio_retry_success_keeps_notes_verbatim_identical(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⑰ 首次超时 → 重试成功：拿到正文，且 notes 与"一次就成"**逐字相同**。
+
+    §6.5 缓存中立的机械判据：信封（含 notes）会整体入缓存 ⇒ 任何"第几次/重试过"的标记
+    都会被复用给别的调用；重试信息**只准**进日志。
+    """
+    one_shot = _AudioSpy(delays=(0.0,), text="同一段转写")
+    one_text, one_notes, _ = await _run_transcribe(monkeypatch, one_shot, cap=0.5)
+
+    retried = _AudioSpy(delays=(5.0, 0.0), text="同一段转写")
+    text, notes, logger = await _run_transcribe(monkeypatch, retried, cap=0.05)
+
+    assert retried.calls == 2, "第一次超时后才重试"
+    assert text == one_text == "同一段转写"
+    assert notes == one_notes == [], "重试过的 notes 必须与一次就成逐字相同"
+    lines = _info_lines(logger)
+    assert any("audio retry attempt=2/2" in line for line in lines)
+    assert any("audio retry ok attempt=2/2" in line for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_audio_soft_timeout_never_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """⑱ `soft_timeout=True`（本轮要画面）⇒ 超时只记 `audio_timeout`，**不重试**。
+
+    J4 的理由：整条链只给抽帧留 25 s（`FRAMES_MIN_BUDGET_S`），重试会把它吃光，
+    于是"主打回退在最该生效时 `video_skip_budget`"（评审 F6 修过的坑）。
+    """
+    provider = _AudioSpy(delays=(5.0,))
+    text, notes, _logger = await _run_transcribe(
+        monkeypatch, provider, cap=0.05, soft_timeout=True
+    )
+
+    assert text == ""
+    assert notes == ["audio_timeout"]
+    assert provider.calls == 1, "软超时不许重试（会吃掉抽帧预留）"
+
+
+@pytest.mark.asyncio
+async def test_audio_provider_error_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⑲ provider 抛错（非超时）⇒ 立即 `AUDIO_FAILED`，**不重试**、不带 timeout 字段。
+
+    非超时异常意味着模型侧真出问题（4xx/5xx/内容过滤），重试只是再花一次钱。
+    """
+    provider = _AudioSpy(fail_at=1)
+    notes: list[str] = []
+    monkeypatch.setattr(analyze_mod, "LOG", RecordingLogger())
+
+    with pytest.raises(envelope.ToolError) as exc_info:
+        await analyze_mod.transcribe(
+            provider,
+            "/tmp/never-read.wav",
+            "转写",
+            deadline=time.monotonic() + 100.0,
+            notes=notes,
+            cap=1.0,
+        )
+
+    assert exc_info.value.code == envelope.ERR_AUDIO_FAILED
+    assert provider.calls == 1, "抛错不重试"
+    detail = exc_info.value.log_detail
+    assert "first_timeout" not in detail and "retry_timeout" not in detail, detail
+    assert detail.startswith("RuntimeError"), detail
+
+
+@pytest.mark.asyncio
+async def test_audio_total_duration_stays_within_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """⑳ 含重试的总耗时 ≤ `DEADLINE_S`（把 `DEADLINE_S` 缩到 **1.2 s** 实跑）。
+
+    预算不变式（§4.2）：`t1 = min(cap, R0 − r)`、`t2 = min(cap, R0 − t1 − r')`
+    ⇒ 第二个 `min` 的上界就是 `R0 − t1` ⇒ `t1 + t2 ≤ R0`。这里用真实时钟验它：
+    两次尝试都超时，总耗时不许越过 `DEADLINE_S`。
+    """
+    monkeypatch.setattr(analyze_mod, "DEADLINE_S", 1.2)
+    # 把"起第 2 次至少要剩 10 s"按同一比例缩小，否则 1.2 s 预算下永远不会重试
+    monkeypatch.setattr(analyze_mod, "AUDIO_RETRY_MIN_S", 0.2)
+    monkeypatch.setattr(analyze_mod, "LOG", RecordingLogger())
+
+    provider = _AudioSpy(delays=(30.0,))
+    started = time.monotonic()
+    notes: list[str] = []
+    with pytest.raises(envelope.ToolError) as exc_info:
+        await analyze_mod.transcribe(
+            provider,
+            "/tmp/never-read.wav",
+            "转写",
+            deadline=started + analyze_mod.DEADLINE_S,
+            notes=notes,
+            cap=0.6,
+        )
+    elapsed = time.monotonic() - started
+
+    assert provider.calls == 2, "两个 0.6 s 的尝试都在预算内"
+    assert elapsed <= analyze_mod.DEADLINE_S + 0.05, (
+        f"总耗时 {elapsed:.3f}s 不得突破 DEADLINE_S={analyze_mod.DEADLINE_S}"
+    )
+    assert "first_timeout=" in exc_info.value.log_detail
+    assert "retry_timeout=" in exc_info.value.log_detail
+
+
+def test_audio_cap_comes_from_the_config_key() -> None:
+    """⑳′ 上限**来自配置**（`limits.audio_timeout_seconds`），不是硬编码 60。
+
+    这条把 D1 的"配置化"那一半钉住：`audio_cap_s()` 读的是 `Settings` 的字段，
+    而默认值仍等于旧硬编码的 60 s（⇒ 存量行为不变，§9.2 的 E3 行）。
+    """
+    from astrbot_plugin_media_analysis import settings as settings_mod
+
+    assert settings_mod.DEFAULT_AUDIO_TIMEOUT_SECONDS == 60
+    assert analyze_mod.AUDIO_TIMEOUT_S == float(settings_mod.DEFAULT_AUDIO_TIMEOUT_SECONDS)
+    assert analyze_mod.AUDIO_RETRY_MAX == 1, "恰好一次（§4.5：不加第 3 次、不加退避）"
+
+    assert analyze_mod.audio_cap_s(settings_mod.Settings()) == 60.0
+    assert analyze_mod.audio_cap_s(
+        settings_mod.Settings(audio_timeout_seconds=95)
+    ) == 95.0
+    # 坏配置（0 / 取不到）不许把预算直接判死，退回默认值
+    assert analyze_mod.audio_cap_s(settings_mod.Settings(audio_timeout_seconds=0)) == 60.0
+    assert analyze_mod.audio_cap_s(SimpleNamespace()) == 60.0
+
+
+# --------------------------------------------------------------------------- #
+# v0.5.1 D2：唤醒轮短路（SPEC-v0.5.1 §5 / §9.4 的 G5 三格）
+#
+# 事故形状：核心的后台任务唤醒轮会**再给模型一轮**（带工具集），模型看不到"上一轮"的媒体
+# ⇒ 这轮必然 `MEDIA_NOT_FOUND`，但那条 hint 是写给"用户忘了发媒体"的，于是模型开始劝用户
+# 重发同一条消息。修法：识别合成事件 ⇒ **不进 `background.submit`**（不产生 task_id）、
+# 回一条**专用 hint**、日志里留 `wake_round=1`。
+# --------------------------------------------------------------------------- #
+class _CronEvent(FakeEvent):
+    """核心 `CronMessageEvent` 的形态（`cron/events.py:24-27`：`platform_meta.name="cron"`）。"""
+
+    def get_platform_name(self) -> str:  # noqa: D102 —— 覆盖父类即可
+        return "cron"
+
+
+class _BackgroundResultEvent(FakeEvent):
+    """后台任务结果唤醒轮（`extr["background_task_result"]`，`astr_agent_tool_exec.py:568-576`）。"""
+
+    def get_extra(self, key: str = "", default=None):  # noqa: ANN001
+        if key == "background_task_result":
+            return {"task_id": "x", "state": "failed"}
+        return default
+
+
+class _ExplodingPlatformEvent(FakeEvent):
+    """`get_platform_name()` 抛异常的事件（测 fail-open：判定失败 ≠ 唤醒轮）。"""
+
+    def get_platform_name(self) -> str:  # noqa: D102
+        raise RuntimeError("platform meta unavailable")
+
+
+def _route_lines(logger: RecordingLogger) -> list[str]:
+    """从日志桩里挑出 `route=` 行（它们以固定前缀起头，且必须单行）。"""
+    return [
+        message
+        for level, message in logger.records
+        if level == "INFO" and message.startswith("media_analysis: route=")
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_factory", [_CronEvent, _BackgroundResultEvent])
+async def test_wake_round_short_circuits_with_the_dedicated_hint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, event_factory
+) -> None:
+    """㉑ 合成事件 ⇒ **0 次** `background.submit`、专用 hint、`wake_round=1`、无 `task_id`。
+
+    两个信号各测一次（`platform_name=="cron"` 与 `background_task_result`）——
+    §5.3 的 J12 用**双信号**，少测一个就等于放过一类同形态事件。
+    """
+    rig = build_rig(monkeypatch, tmp_path, kind="audio")
+    event = event_factory(chain=[])
+    logger = RecordingLogger()
+    monkeypatch.setattr(analyze_mod, "LOG", logger)
+
+    submits: list[dict[str, object]] = []
+
+    async def _spy_submit(**kwargs):  # noqa: ANN003
+        submits.append(kwargs)
+        raise AssertionError("唤醒轮不许提交后台任务")
+
+    monkeypatch.setattr(background, "submit", _spy_submit)
+
+    raw = await rig.plugin.media_analyze(event, target="current")
+    payload = json.loads(raw)
+
+    assert submits == [], "唤醒轮短路必须发生在 `background.submit` 之前"
+    assert list(payload) == list(envelope.FAIL_KEYS), "失败信封仍是 3 键、顺序不变"
+    assert payload["error"] == envelope.ERR_MEDIA_NOT_FOUND, "错误码仍是 23 条里的那一条"
+    assert payload["hint"] == envelope.HINT_MEDIA_NOT_FOUND_WAKE
+    assert payload["hint"] != envelope.HINTS[envelope.ERR_MEDIA_NOT_FOUND]
+
+    lines = _route_lines(logger)
+    assert len(lines) == 1, f"恰好一行 route=，实际 {lines}"
+    assert "route=none stage=accept engine=plugin kind=- fallback=-" in lines[0]
+    assert "error=MEDIA_NOT_FOUND wake_round=1" in lines[0]
+    # §5.5 判据：日志含 `wake_round=1` 且**不含** `task_id=`
+    joined = "\n".join(message for _lvl, message in logger.records)
+    assert "task_id=" not in joined
+
+
+@pytest.mark.asyncio
+async def test_normal_empty_message_keeps_the_plain_media_not_found_hint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """㉒ 普通消息里确实没媒体 ⇒ **旧 hint 一个字都不改**、`route=` 行没有 `wake_round`。
+
+    这条是"别把正常用户消息误杀"的反向判据：D2 只该改唤醒轮那一种情形。
+    """
+    rig = build_rig(monkeypatch, tmp_path, kind="audio")
+    logger = RecordingLogger()
+    monkeypatch.setattr(analyze_mod, "LOG", logger)
+
+    raw = await rig.plugin.media_analyze(make_event(current=[]), target="current")
+    payload = json.loads(raw)
+
+    assert list(payload) == list(envelope.FAIL_KEYS)
+    assert payload["error"] == envelope.ERR_MEDIA_NOT_FOUND
+    assert payload["hint"] == envelope.HINTS[envelope.ERR_MEDIA_NOT_FOUND], "普通「没发媒体」用旧 hint"
+
+    lines = _route_lines(logger)
+    assert len(lines) == 1
+    assert "error=MEDIA_NOT_FOUND" in lines[0]
+    assert "wake_round=1" not in lines[0]
+
+
+@pytest.mark.asyncio
+async def test_wake_detection_failure_falls_open(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """㉓ 判定抛异常 ⇒ **回落到原逻辑**且不崩（fail-open 的机械判据）。
+
+    `get_platform_name()` 抛错 / 缺 `get_extra` 都算"判不出来" ⇒ 当普通消息处理。
+    宁可多提交一次后台任务，也不许把一条正常用户消息误判成唤醒轮。
+    """
+    rig = build_rig(monkeypatch, tmp_path, kind="audio")
+    logger = RecordingLogger()
+    monkeypatch.setattr(analyze_mod, "LOG", logger)
+
+    raw = await rig.plugin.media_analyze(_ExplodingPlatformEvent(chain=[]), target="current")
+    payload = json.loads(raw)
+
+    assert payload["error"] == envelope.ERR_MEDIA_NOT_FOUND
+    assert payload["hint"] == envelope.HINTS[envelope.ERR_MEDIA_NOT_FOUND]
+    assert "wake_round=1" not in _route_lines(logger)[0]
+
+
+def test_is_wake_round_is_totally_fail_open() -> None:
+    """`is_wake_round` **永不抛**：缺方法 / 怪返回值 / 属性抛错全按 `False` 处理。"""
+    assert analyze_mod.is_wake_round(SimpleNamespace()) is False
+    assert analyze_mod.is_wake_round(_ExplodingPlatformEvent()) is False
+    # 两个真信号各命中一次
+    assert analyze_mod.is_wake_round(_CronEvent()) is True
+    assert analyze_mod.is_wake_round(_BackgroundResultEvent()) is True
+    # `get_extra` 返回非 dict（比如平台塞了个字符串）⇒ 不算唤醒轮
+    weird = FakeEvent()
+    weird.get_extra = lambda key="", default=None: "not-a-dict"
+    assert analyze_mod.is_wake_round(weird) is False
+
+
+@pytest.mark.asyncio
+async def test_wake_round_with_real_media_still_runs_normally(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """§5.2 第 3 条（fail-open 的退路）：合成事件但链里**真有**媒体 ⇒ 正常受理并跑完。
+
+    "唤醒轮"只是"通常没有媒体"的推断，不是"禁止分析"的判决；真有媒体时它必须让路。
+    """
+    rig = build_rig(monkeypatch, tmp_path, kind="audio")
+    wake_event = _CronEvent(chain=[])
+    wake_event._chain.append(make_record(rig.media_path))  # noqa: SLF001 —— 造"合成了但有媒体"
+    rig.event = wake_event
+
+    payload = await rig.tool()
+
+    assert payload["ok"] is True
+    assert payload["transcript"], "正常跑完，不是短路"
+
+
+# --------------------------------------------------------------------------- #
+# v0.5.1 C7：`route=` 结构化观测行（SPEC-v0.5.1 §6 / §9.4 的 G6 六格）
+#
+# 六格：㉔字段名与顺序 ㉕枚举集合相等 ㉖判定表逐行（5 个既有场景）㉗每调用至多一行
+#      ㉘两引擎分别传 plugin/core（在 `test_background` / `test_core_mode` 里）
+#      ㉙`route` 行不写 notes + 缓存回放 notes 逐字相同
+#
+# 行格式本身就是契约：这里的正则**逐字**抄自 SPEC-v0.5.1 §6.7（含 6 正 1 负样本），
+# 所以"自创枚举"（如 `route=compressed`）不是靠人眼挡，而是靠正则挡。
+# --------------------------------------------------------------------------- #
+ROUTE_LINE = re.compile(
+    r"^media_analysis: route=(?P<route>cache|native|frames|audio|none) "
+    r"stage=(?P<stage>analyze|accept) engine=(?P<engine>plugin|core) kind=(?P<kind>audio|video|-) "
+    r"fallback=(?P<fb>-|native_unavailable|native_failed|native_empty|native_too_large"
+    r"|frames_forbidden|no_video_provider|no_vision_provider|skip_budget|no_audio_track) "
+    r"cached=(?P<cached>[01]) duration_s=(?P<dur>\d+\.\d\d) frames=(?P<frames>\d+) "
+    r"transcript_chars=(?P<tc>\d+) elapsed_ms=(?P<ms>\d+)"
+    r"(?: error=(?P<err>[A-Z_]+))?(?: wake_round=1)?$"
+)
+
+#: SPEC §6.7 自带的 6 条正例（逐字抄；改一个字都要先改规格）
+_SPEC_ROUTE_SAMPLES = (
+    "media_analysis: route=native stage=analyze engine=core kind=video fallback=- cached=0 duration_s=12.34 frames=0 transcript_chars=0 elapsed_ms=6400",
+    "media_analysis: route=audio stage=analyze engine=plugin kind=video fallback=frames_forbidden cached=0 duration_s=125.38 frames=0 transcript_chars=1010 elapsed_ms=73775",
+    "media_analysis: route=cache stage=analyze engine=core kind=video fallback=- cached=1 duration_s=5.00 frames=0 transcript_chars=0 elapsed_ms=1",
+    "media_analysis: route=none stage=analyze engine=core kind=- fallback=- cached=0 duration_s=0.00 frames=0 transcript_chars=0 elapsed_ms=61113 error=AUDIO_FAILED",
+    "media_analysis: route=none stage=accept engine=plugin kind=- fallback=- cached=0 duration_s=0.00 frames=0 transcript_chars=0 elapsed_ms=0 error=MEDIA_NOT_FOUND wake_round=1",
+    "media_analysis: route=frames stage=analyze engine=plugin kind=video fallback=native_too_large cached=0 duration_s=20.00 frames=6 transcript_chars=120 elapsed_ms=41000",
+)
+
+#: SPEC §6.7 的负例：自创枚举必须被挡掉
+_SPEC_ROUTE_NEGATIVE = (
+    "media_analysis: route=compressed stage=analyze engine=plugin kind=video fallback=- "
+    "cached=0 duration_s=1.00 frames=0 transcript_chars=0 elapsed_ms=1"
+)
+
+
+def test_route_line_regex_accepts_the_six_frozen_samples() -> None:
+    """㉔ 六条冻结正例逐字通过（字段名 + **顺序** + 分隔符一起钉）。"""
+    for line in _SPEC_ROUTE_SAMPLES:
+        assert ROUTE_LINE.match(line), line
+
+
+def test_route_line_regex_rejects_a_self_invented_enum() -> None:
+    """㉕ 负例：`route=compressed` 这类自创值被正则挡掉（枚举封闭性不靠人眼守）。"""
+    assert not ROUTE_LINE.match(_SPEC_ROUTE_NEGATIVE)
+
+
+def test_route_enums_are_exactly_the_frozen_sets() -> None:
+    """㉕ 枚举集合**相等**（不是包含）：route 5 / stage 2 / engine 2 / fallback 10 / kind 3。"""
+    assert set(analyze_mod.ROUTES) == {"cache", "native", "frames", "audio", "none"}
+    assert set(analyze_mod.STAGES) == {"analyze", "accept"}
+    assert set(analyze_mod.ENGINES) == {"plugin", "core"}
+    assert set(analyze_mod.KINDS) == {"audio", "video", "-"}
+    assert set(analyze_mod.FALLBACKS) == {
+        "-",
+        "native_unavailable",
+        "native_failed",
+        "native_empty",
+        "native_too_large",
+        "frames_forbidden",
+        "no_video_provider",
+        "no_vision_provider",
+        "skip_budget",
+        "no_audio_track",
+    }
+    assert len(analyze_mod.FALLBACKS) == 10 and len(set(analyze_mod.FALLBACKS)) == 10
+
+
+def test_log_route_emits_one_matching_line_for_every_enum_value(monkeypatch) -> None:
+    """㉔ `log_route` 对**每一个**枚举取值都产出能过正则的单行（且不换行）。"""
+    logger = RecordingLogger()
+    monkeypatch.setattr(analyze_mod, "LOG", logger)
+
+    for route in analyze_mod.ROUTES:
+        for stage in analyze_mod.STAGES:
+            for engine in analyze_mod.ENGINES:
+                for kind in analyze_mod.KINDS:
+                    for fallback in analyze_mod.FALLBACKS:
+                        analyze_mod.log_route(
+                            route=route,
+                            stage=stage,
+                            engine=engine,
+                            kind=kind,
+                            fallback=fallback,
+                        )
+
+    lines = _route_lines(logger)
+    assert len(lines) == 5 * 2 * 2 * 3 * 10
+    for line in lines:
+        assert ROUTE_LINE.match(line), line
+        assert "\n" not in line
+
+
+def test_log_route_normalizes_out_of_enum_values(monkeypatch) -> None:
+    """自创枚举**不许**写进日志（归一成 `none` / `plugin` / `-`），否则运维 grep 与集合判据同时失效。"""
+    logger = RecordingLogger()
+    monkeypatch.setattr(analyze_mod, "LOG", logger)
+
+    analyze_mod.log_route(
+        route="compressed", stage="middle", engine="native", kind="gif", fallback="faster"
+    )
+
+    line = _route_lines(logger)[0]
+    assert ROUTE_LINE.match(line), line
+    assert "route=none stage=analyze engine=plugin kind=- fallback=-" in line
+
+
+@pytest.mark.parametrize(
+    ("route", "mode", "notes", "native_state", "expected"),
+    [
+        # R1 —— 没有"更贵的那一跳"的三种走法
+        ("native", "auto", [], "ok", "-"),
+        ("cache", "false", ["video_skip_budget"], "failed", "-"),
+        ("none", "auto", [], "", "-"),
+        # R2 —— 显式不要画面
+        ("audio", "false", [], "", "frames_forbidden"),
+        # R2 优先于 R3–R6（按序首命中的机械判据）
+        ("frames", "false", ["video_skip_budget"], "failed", "frames_forbidden"),
+        # R3–R6 —— notes 子串
+        ("audio", "auto", ["video_unavailable_no_provider"], "", "no_video_provider"),
+        ("audio", "auto", ["video_no_vision_provider"], "", "no_vision_provider"),
+        ("audio", "auto", ["video_skip_budget"], "", "skip_budget"),
+        ("audio", "auto", ["no_audio_track"], "", "no_audio_track"),
+        # R7–R10 —— native_state
+        ("audio", "auto", [], "unavailable", "native_unavailable"),
+        ("audio", "auto", [], "failed", "native_failed"),
+        ("audio", "auto", [], "empty", "native_empty"),
+        ("audio", "auto", [], "too_large", "native_too_large"),
+        # R11 —— 其余
+        ("audio", "auto", [], "", "-"),
+    ],
+)
+def test_fallback_table_r1_to_r11_row_by_row(
+    route: str, mode: str, notes: list[str], native_state: str, expected: str
+) -> None:
+    """㉖ `fallback` 判定表 R1–R11 **逐行**可测（含"按序首命中"的优先级行）。"""
+    assert (
+        analyze_mod.fallback_of(route, mode=mode, notes=list(notes), native_state=native_state)
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("cached", "error", "native_state", "frames", "expected"),
+    [
+        (True, "AUDIO_FAILED", "ok", 3, "cache"),  # 命中缓存优先级最高
+        (False, "VIDEO_FAILED", "ok", 3, "none"),  # 有错码 ⇒ none
+        (False, "", "ok", 3, "native"),  # 原生成功
+        (False, "", "failed", 3, "frames"),  # 有帧
+        (False, "", "failed", 0, "audio"),  # 其它
+    ],
+)
+def test_route_priority_is_cache_none_native_frames_audio(
+    cached: bool, error: str, native_state: str, frames: int, expected: str
+) -> None:
+    """㉖ `route` 也是总函数：cache > none > native > frames > audio。"""
+    assert (
+        analyze_mod.route_of(
+            cached=cached, error=error, native_state=native_state, frames=frames
+        )
+        == expected
+    )
+
+
+@pytest.mark.asyncio
+async def test_analyze_emits_exactly_one_route_line_right_after_the_ok_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """㉗ 成功路径：`route=` 行**恰好一条**，且紧挨在既有 `ok` 行**之后**（§6.1 末段）。"""
+    from _fakes import native_video
+
+    logger = RecordingLogger()
+    monkeypatch.setattr(analyze_mod, "LOG", logger)
+    rig = build_rig(monkeypatch, tmp_path, kind="video", native=native_video())
+
+    payload = await rig.run(include_frames="auto")
+
+    assert payload["ok"] is True
+    lines = [message for level, message in logger.records if level == "INFO"]
+    route_lines = [line for line in lines if line.startswith("media_analysis: route=")]
+    assert len(route_lines) == 1, route_lines
+    assert ROUTE_LINE.match(route_lines[0]), route_lines[0]
+    assert "route=native stage=analyze engine=plugin kind=video fallback=-" in route_lines[0]
+    assert "cached=0" in route_lines[0]
+
+    index = lines.index(route_lines[0])
+    assert lines[index - 1].startswith("media_analysis: ok "), "`route=` 紧跟在 `ok` 行之后"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scenario", "expect"),
+    [
+        ("native_ok", "route=native stage=analyze engine=plugin kind=video fallback=-"),
+        ("native_too_large_then_frames", "route=frames stage=analyze engine=plugin kind=video fallback=native_too_large"),
+        ("mode_false", "route=audio stage=analyze engine=plugin kind=video fallback=frames_forbidden"),
+        ("auto_without_video_provider", "route=audio stage=analyze engine=plugin kind=video fallback=no_video_provider"),
+    ],
+)
+async def test_five_existing_scenarios_land_on_the_frozen_route_and_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scenario: str, expect: str
+) -> None:
+    """㉖ 五个既有场景中的四个（第五个"缓存命中"在下一条用例里）逐条落到冻结的走法上。"""
+    from _fakes import native_video
+
+    logger = RecordingLogger()
+    monkeypatch.setattr(analyze_mod, "LOG", logger)
+
+    if scenario == "native_ok":
+        rig = build_rig(monkeypatch, tmp_path, kind="video", native=native_video())
+        await rig.run(include_frames="auto")
+    elif scenario == "native_too_large_then_frames":
+        # 超门槛 + 压缩关 ⇒ `native_state=too_large` ⇒ 抽帧回退接管（route=frames）
+        rig = build_rig(
+            monkeypatch,
+            tmp_path,
+            kind="video",
+            cfg=settings.Settings(
+                vision_provider_id="fake-chat",
+                video_compress_enabled=False,
+                video_max_direct_mb=1,
+            ),
+            native=native_video(),
+            frames=[(2.5, "unused")],
+        )
+        rig.media_path.write_bytes(b"\x00" * (2 * 1024 * 1024))
+        await rig.run(include_frames="auto")
+    elif scenario == "mode_false":
+        rig = build_rig(monkeypatch, tmp_path, kind="video", native=native_video(text=""))
+        await rig.run(include_frames="false")
+    else:  # auto_without_video_provider
+        # 视觉位配了、视频位空着 ⇒ `auto` 不许拿 6 次视觉调用去补（评审 F7）
+        rig = build_rig(
+            monkeypatch,
+            tmp_path,
+            kind="video",
+            cfg=settings.Settings(vision_provider_id="fake-chat"),
+        )
+        await rig.run(include_frames="auto")
+
+    lines = _route_lines(logger)
+    assert len(lines) == 1, lines
+    assert expect in lines[0], lines[0]
+
+
+@pytest.mark.asyncio
+async def test_cache_hit_lands_on_route_cache_without_running_the_chain(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """㉖ 第五个场景：命中缓存 ⇒ `route=cache`、`fallback=-`、`cached=1`，链路不再跑。"""
+    logger = RecordingLogger()
+    rig = build_rig(monkeypatch, tmp_path, kind="audio")
+    first = await rig.run()
+
+    monkeypatch.setattr(analyze_mod, "LOG", logger)
+    second = await rig.run()
+
+    assert first["cached"] is False and second["cached"] is True
+    lines = _route_lines(logger)
+    assert len(lines) == 1, lines
+    assert "route=cache stage=analyze engine=plugin kind=audio fallback=-" in lines[0]
+    assert "cached=1" in lines[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("target", "code"),
+    [("bogus", envelope.ERR_BAD_TARGET), ("current", envelope.ERR_MEDIA_NOT_FOUND)],
+)
+async def test_accept_phase_rejection_emits_one_route_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, target: str, code: str
+) -> None:
+    """㉗ 受理期拒绝 ⇒ 一行 `stage=accept`、`kind=-`、`fallback=-`，且**没有** `stage=analyze` 行。
+
+    覆盖 `BAD_TARGET` 与 `MEDIA_NOT_FOUND` 两个受理面；`TOO_MANY_TASKS` 在
+    `tests/test_background.py`（那里才有并发闸的夹具）。
+    """
+    rig = build_rig(monkeypatch, tmp_path, kind="audio")
+    logger = RecordingLogger()
+    monkeypatch.setattr(analyze_mod, "LOG", logger)
+
+    raw = await rig.plugin.media_analyze(make_event(current=[]), target=target)
+    payload = json.loads(raw)
+
+    assert payload["error"] == code
+    lines = _route_lines(logger)
+    assert len(lines) == 1, lines
+    assert f"route=none stage=accept engine=plugin kind=- fallback=-" in lines[0]
+    assert f"error={code}" in lines[0]
+    assert "stage=analyze" not in "\n".join(lines)
+
+
+@pytest.mark.asyncio
+async def test_route_line_never_writes_into_notes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """㉙ `route=` 行**只读** notes 的子串，绝不回写（缓存中立的机械判据）。
+
+    断言面上就看两件事：① notes 里没有任何 `route`/`engine`/`wake` 形状的痕迹；
+    ② 同一个媒体跑两次（miss + hit）时，**回放前的 notes** 与首跑逐字相同。
+    """
+    rig = build_rig(monkeypatch, tmp_path, kind="video")
+    first = await rig.run(include_frames="auto")
+
+    assert not [note for note in first["notes"] if note.startswith(("route", "engine", "wake_round"))]
+    assert first["notes"], "这条用例要有一串真实 notes 才有说服力"
+
+    second = await rig.run(include_frames="auto")
+    replay_notes = [note for note in second["notes"] if note not in ("cache_hit",)]
+    replay_notes = [note for note in replay_notes if not note.startswith("cache_age_s:")]
+    assert replay_notes == first["notes"], "缓存回放前后 notes 必须逐字相同"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_analysis_emits_no_route_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """取消（卸载/进程停止）**不打** `route=` 行：这次调用没有"走法"可言。
+
+    硬填一个 `route=audio` 会让运维以为它真跑成过；而"根本没到插件"由核心那行
+    tool 调用记录区分（§6.6 的缺席判据），取消有自己的一行（`bg cancelled`）。
+    """
+    rig = build_rig(monkeypatch, tmp_path, kind="audio")
+    logger = RecordingLogger()
+    monkeypatch.setattr(analyze_mod, "LOG", logger)
+
+    gate = asyncio.Event()
+    stubbed = media.classify
+
+    async def _slow_classify(*args, **kwargs):  # noqa: ANN002, ANN003
+        await gate.wait()
+        return await stubbed(*args, **kwargs)
+
+    monkeypatch.setattr(media, "classify", _slow_classify)
+
+    task = asyncio.create_task(rig.run())
+    await asyncio.sleep(0.02)  # 让它挂在那道闸上（还没走到信封）
+    assert not task.done()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert _route_lines(logger) == [], "取消不许产 route= 行"
+
+
+@pytest.mark.asyncio
+async def test_uncontrolled_exception_still_lands_on_route_none_internal_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """t5-F7：非受控异常也必须在 `route=` 行里说真话（`route=none error=INTERNAL_ERROR`）。
+
+    修之前：`analyze` 只捕获 `ToolError` 与 `CancelledError`，`_video_stage` 抛
+    `RuntimeError` 会直接穿过 `finally` —— 于是那行按累积态打成**假的** `route=audio`
+    （看起来像"只交了转写"），事故被藏起来。修之后：记 `INTERNAL_ERROR` 再上抛
+    （收口仍在调用方，本层不吞异常）。
+    """
+    logger = RecordingLogger()
+    monkeypatch.setattr(analyze_mod, "LOG", logger)
+    rig = build_rig(monkeypatch, tmp_path, kind="video", frames=[(2.5, "unused")])
+
+    async def _boom(**_kwargs):  # noqa: ANN003 —— 模拟"链路里漏出的非受控异常"
+        raise RuntimeError("boom from the chain")
+
+    monkeypatch.setattr(analyze_mod, "_video_stage", _boom)
+
+    with pytest.raises(RuntimeError, match="boom from the chain"):
+        await rig.run(include_frames="auto")
+
+    lines = _route_lines(logger)
+    assert len(lines) == 1, lines
+    assert "route=none stage=analyze engine=plugin kind=- fallback=-" in lines[0]
+    assert "error=INTERNAL_ERROR" in lines[0]
+    assert ROUTE_LINE.match(lines[0]), lines[0]
+
+
+@pytest.mark.asyncio
+async def test_tool_error_lands_on_route_none_with_its_own_code(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """t5-F7 的第二条路径：受控失败 ⇒ `route=none error=<那个码>`（不是 INTERNAL_ERROR）。
+
+    与上一条、`test_cancelled_analysis_emits_no_route_line` 一起覆盖三条出口：
+    `ToolError` ⇒ 带码的 `none` / 取消 ⇒ **0 行** / 非受控异常 ⇒ `INTERNAL_ERROR`。
+    """
+    logger = RecordingLogger()
+    monkeypatch.setattr(analyze_mod, "LOG", logger)
+    # 时长 999 s > limits.max_media_seconds(300) ⇒ `ToolError(MEDIA_TOO_LONG)` 从链路里抛出
+    rig = build_rig(monkeypatch, tmp_path, kind="audio", duration=999.0)
+
+    with pytest.raises(envelope.ToolError) as exc_info:
+        await rig.run()
+    assert exc_info.value.code == envelope.ERR_MEDIA_TOO_LONG
+
+    lines = _route_lines(logger)
+    assert len(lines) == 1, lines
+    assert "route=none stage=analyze engine=plugin" in lines[0]
+    assert f"error={envelope.ERR_MEDIA_TOO_LONG}" in lines[0]
+    assert "INTERNAL_ERROR" not in lines[0]
