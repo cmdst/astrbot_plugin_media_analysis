@@ -4,6 +4,57 @@
 
 **做减法加一处补上下文**：删掉核心原生后台（路线 C，`background.mode=core`），`background.mode` 降级为**隐藏弃用键**（只认 `plugin`，坏值内存归一 + 每进程一条告警，键与磁盘值都保留，计划 v0.6.0 删除）；投递成功后把结果登记为**一次性**上下文，由唯一 `@filter.on_llm_request` 钩子注入**下一轮同会话**的 `system_prompt`（TTL 300 s / 每会话 2 条 / 2400 字；不写 `conversation.history`、不写 `req.contexts`）。**0 新增配置键、0 新增错误码（23 不变）、0 新增 notes 词（43 不变）、0 新增工具参数（仍是 3 个）。**
 
+- **两个提交**：`dd4a149`（`refactor: remove core route`，16 路径）+ `57678a9`（`feat: one-shot result context injection`，13 路径）+ 一笔 docs。
+  跟踪文件 **60 → 56 → 59**（删 `core_mode.py` / `tests/test_core_mode.py` / `tests/test_core_mode_wiring.py` / `tests/_core_shim.py`；加 `result_context.py` / `tests/test_result_context.py` / `tests/test_context_injection.py`）。
+
+### ① 删除路线 C（核心原生后台）
+
+| 项 | 内容 |
+|---|---|
+| **删了什么** | `core_mode.py`（**441 行**：能力探测三步 / 七个 `reason` / fail-closed 还原 / C handler / `render_core`）+ `tests/test_core_mode.py`（29 格）+ `tests/test_core_mode_wiring.py`（23 格）+ `tests/_core_shim.py`（只被上面两个测试文件引用） |
+| **`main.py`** | 去掉 `core_mode` import、引擎激活态（`_bg` / `_bg_recheck_pending`）、探测面（`_tool_manager`）、C 分支与 `_run_core()`；`media_analyze` 只剩 A2 三出口（唤醒轮短路 → `find_media` → `background.submit`）；`terminate()` 仍取消后台任务 |
+| **`settings.py`** | 删 `MODE_CORE`；`BACKGROUND_MODES = (MODE_PLUGIN,)`；`normalize_background_mode()` 把 `core`/`CORE`/` core `/其它坏值一律归一 `plugin`，**每进程至多一条 WARNING**（去重 token 固定 `("background.mode", "*")`）、**不打值**、**不落盘** |
+| **`_conf_schema.json`** | `background.mode` 仍在 21 叶内，改成**隐藏弃用键**：`invisible: true`、`options: ["plugin"]`、`labels` 1 条、`default: "plugin"`、新 `hint`（写明 v0.6.0 删除） |
+| **`tools/migrate_config_v05.py`** | `HIDDEN_KEYS` **4 → 5**（+`background.mode`）；**`KEY_ORDER` 21 条一字不动**、该键的动作仍是 `keep`、**不搬值** |
+| **`background.py` / `analyze.py`** | 只改 C 路线相关文案；**错误码 23 / notes 词表 / 信封三形状 / 引擎日志词表 `ENGINE_*` 全部不动** |
+| **为什么这是 no-op** | 那个模式要求宿主核心在 `_PermissionGuardedTool.__init__` 补一行镜像；线上核心（**4.29.3**）没打 ⇒ 它每次加载都打一条 `wrapper_no_mirror` **ERROR** 并内存级回落 `plugin`。删掉它 = **把那条 ERROR 与 441 行死代码一起拿掉**，行为不变 |
+
+### ② 一次性结果上下文注入（`result_context.py`）
+
+**问题**：工具是异步的，结果由后台消息发给**用户**，**模型自己看不见** ⇒ 用户追问"刚才那个视频说了什么"，模型只能让用户重发或现编。
+
+**做法**：`background._run` 在**投递成功**（`_deliver` 返回 `True`）后 `result_context.remember(umo, text)`；
+唯一的 `@filter.on_llm_request()` 钩子 `_inject_media_results` 在**该会话的下一次请求**把正文拼进 `req.system_prompt`（与核心自己的"后台结果轮"同形）。
+
+| 常量 | 值 | 含义 |
+|---|---|---|
+| `_TTL_S` | `300.0` | 待注入条目存活 5 分钟（**闭区间**：恰好 300.0 s 仍有效） |
+| `_MAX_PER_UMO` | `2` | 每会话最多挂 2 条（挤掉最旧的） |
+| `_MAX_CHARS` | `2400` | 注入**正文**上限（`len(str)` 计）；截断是**前缀** |
+| `_MAX_UMOS` | `512` | 键数护栏，超出按"最旧条目 ts 最小"逐出 |
+
+- **一次性**：`take()` **先整体出队** ⇒ 被 TTL 过滤、或用户已把原文贴回来的条目**也不会复活**。
+- **只碰 `system_prompt`**：`req.prompt` / `req.contexts` / `conversation.history` **逐字不变**（后者是**落库**字段）。
+- **绝不外抛**：钩子全身 `try/except BaseException`（连 `CancelledError` 也不上抛）⇒ 失败只打 **1 条 WARNING** 并跳过本轮。理由：核心 `call_event_hook` 会把 handler 异常记成 `[ERRO]` 栈，等于在别人的请求上留脏日志。
+- **判据边界**：`send_message` 成功 / `False` 但 `event.send` 兜底成功 ⇒ **记**；抛异常（不重试）/ 兜底也失败 / 被取消 ⇒ **不记**（用户没看到，模型也不该以为发过）。
+- **`terminate()`** 调 `result_context.clear()`（卸载不留跨生命周期记忆）。
+- **0 新配置键**：四个阈值是**代码常量**（不是配置项）。
+
+### 迁移与回滚
+
+- **没有迁移步骤**：**21 叶不变** ⇒ 覆盖代码 → **重载一次** 即可；`tools/migrate_config_v05.py --report` 只作审计（`background.mode` 仍 `keep`、`changed=0`；报告里 `hidden=1` 从 4 条变 **5 条**）。
+- 生产配置里的 `background.mode` **磁盘值不动**（多半还是 `core`）⇒ 部署后会看到**恰 1 条** WARNING（文案固定、**不含值**），`ready` 行打 `background_mode=plugin`。要消掉告警由 ops **手工**改成 `plugin`（隐藏键，面板改不到）。
+- **回滚两档**：**R1** 回 v0.5.1（覆盖代码 + 重载；旧版本会**恢复**那条 `wrapper_no_mirror` ERROR，功能不受影响）；**R2** 只把 `background.mode` 手工改 `plugin`（v0.5.2 内止血，秒级）。
+- **双冷启动**（预期，非缺陷）：`PLUGIN_VERSION` 是结果缓存键（12 分量之一）与 L1 探测键的分量 ⇒ 升级后旧条目全 miss、每个视频位首用多一次 L1 探测（3–20 s）。
+
+### 门禁
+
+- **全量 `pytest tests/ -q -p no:cacheprovider`：1018 passed / 0 failed / 0 skipped / 0 xfail**（18.85 s；复跑同数）。
+  **算术**：基线 v0.5.1 `7a32b8d` = **1011** → C1 = **969**（`1011 − 52` 删 C 测试 `+ 12` D1 新格 `− 2`：两处 `sorted(glob('*.py'))` 参数化池随模块数 **12→11** 各缩 1 格，**不是丢用例**）→ C2 = **1018**（`+49` = `test_result_context` 28 + `test_context_injection` 13 + `test_background` 5 + `test_registration` 2 + `test_core_imports` 1）。
+- 唯一 warning 是核心 `tencent_record_helper` 的 `audioop` DeprecationWarning（与本插件无关）。`git status --porcelain --ignored` 跑完仍为空。
+- **变异**：M1（删 `system_prompt` 赋值）⇒ **7 failed**；M2（去掉 `core`→`plugin` 归一）⇒ **8 failed**；复原后字节一致并复绿。M3–M7 全红、R1 全绿、R2 只红边界格。
+- 真机探针（核心 **4.29.3** 未打补丁 + `/tmp` 包形态）：`Added llm tool` **1** 次、`OnLLMRequestEvent` 钩子**恰 1 个**、`wrapper_no_mirror`/`core-mode`/`core_mode` 计数 **0**、`ready` 行 **19 字段**且 `background_mode=plugin`。
+
 ## v0.5.1 — 2026-10-26（**配置面重做 + 六个运行面缺陷；待评审 / 待推送 / 待部署**）
 
 **配置从 22 叶瘦身到 21 叶，并把"字节"换成"MB"**；同时修掉 2026-10-26 上线暴露的六个运行面缺陷
@@ -82,6 +133,8 @@ python3 tools/migrate_config_v05.py --root /root/AstrBot --apply    # 0600 备�
 - 归档树（`git write-tree` 60 文件）解到同名目录后**逐 cell 同数**；导入探针 83 项全 PASS。
 
 ## v0.4.2 — 2026-10-25（**实验模式；待评审 / 待推送 / 待部署**）
+
+> **历史提示**：本条目里的「路线 C / `background.mode=core`」已在 **v0.5.2 删除**（见顶部条目）；以下内容仅作版本档案。
 
 **+1 配置键 / 0 参数变更 / 0 错误码与 notes 词表变更**。把 v0.4.1 评估过的"路线 C
 （核心原生后台）"从"不采用"精确化为「**默认不采用、可显式选择**」，并补上报告 §3.2 要求的
