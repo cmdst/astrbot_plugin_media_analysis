@@ -1090,3 +1090,62 @@ async def test_never_remembers_on_cancel(monkeypatch: pytest.MonkeyPatch) -> Non
 
     assert result_context.take("aiocqhttp:GroupMessage:781", "") == []
     assert _sent_texts(context) == [], "取消不投递"
+
+
+@pytest.mark.asyncio
+async def test_render_failure_still_releases_tables_and_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F1 回归（v0.5.2）：`render` 自己抛异常时，三张表 / 并发槽 / 去重键必须照样释放。
+
+    为什么这条必须存在：`text = render(payload)` 一旦落在 `try` **外面**，渲染失败就会
+    跳过 `finally: _finish(record)` —— 三张表、会话并发槽与去重键**静默泄漏**，症状是
+    "同会话再问几次就 `TOO_MANY_TASKS`"，而且日志里一个字都没有（比报错更难查）。
+    判据全部走**状态**（表 / `stats()` / 投递记录 / 待注入表），不碰源码字符串。
+    """
+    log = RecordingLogger()
+    monkeypatch.setattr(background, "LOG", log, raising=False)
+    _stub_analyze(monkeypatch)
+    boom = RuntimeError("render 炸了")
+
+    def _explode(*_args: object, **_kwargs: object) -> str:
+        raise boom
+
+    monkeypatch.setattr(background, "render", _explode)
+
+    umo = "aiocqhttp:GroupMessage:790"
+    context = FakeContext(send_ok=True)
+    event = make_event(message_id="m-render-fail-1", umo=umo)
+
+    payload = await _submit(context=context, event=event)
+    task_id = str(payload["task_id"])
+    task = background._TASKS[task_id].task
+    assert task is not None
+
+    # 异常照旧上抛到任务层（既有口径：`_consume` 吞掉它，不新造日志）
+    with pytest.raises(RuntimeError):
+        await task
+
+    # ① 三张表摘干净（泄漏点就在这里）
+    assert background._TASKS == {}
+    assert background._BY_KEY == {}
+    assert background._BY_UMO == {}
+    # ② 并发计数归零（会话槽 + 全局槽 + 去重键）
+    assert background.stats() == {"tasks": 0, "sessions": 0, "dedupe": 0}
+    # ③ 一次投递都没有（render 在 `_deliver` 之前就炸了）⇒ 更不会有第二条
+    assert _sent_texts(context) == []
+    assert event.sent == []
+    # ④ 不登记待注入上下文（用户没收到 ⇒ 模型也不该以为发过）
+    assert result_context.take(umo, "") == []
+    # ⑤ 日志面不新增：无 ERROR，也没有 `bg finished`（那行只在投递之后打）
+    assert not any(level == "ERROR" for level, _m in log.records), log.records
+    assert not any("bg finished" in message for _l, message in log.records)
+
+    # ⑥ 槽位真的放行了：同会话换一条消息再提交，必须**受理**而不是 TOO_MANY_TASKS
+    #    （泄漏时 `per_session` 会一直挂着，第 4 次就会撞闸）
+    second = await _submit(
+        context=FakeContext(send_ok=True),
+        event=make_event(message_id="m-render-fail-2", umo=umo),
+    )
+    assert second["ok"] is True and second["state"] == "accepted"
+    await background.wait(str(second["task_id"]), timeout=5.0)

@@ -246,10 +246,14 @@ async def _run(
         record.state = STATE_OK
 
     record.payload = payload
-    # ① 渲染只算一次：投递给用户看的文本与"登记给下一轮上下文"的文本**同字节**
-    #    （§5.8① / §10「投递文本唯一来源」—— 两条路径共用同一个局部 `text`）。
-    text = render(payload)
     try:
+        # ① 渲染只算一次：投递给用户看的文本与"登记给下一轮上下文"的文本**同字节**
+        #    （§5.8① / §10「投递文本唯一来源」—— 两条路径共用同一个局部 `text`）。
+        #    **必须在 try 内**：`render` 自身也可能抛（信封形状意外/纯函数回归），
+        #    在 try 外抛就等于跳过下面的 `finally: _finish(record)` ⇒ 三张表、会话槽
+        #    与去重键会静默泄漏（评审 F1，v0.5.2 引入的回归）。放回 try 内之后，
+        #    渲染失败与投递失败走**同一条**收尾路径，不新增任何日志口径。
+        text = render(payload)
         delivered = await _deliver(context, event, record.umo, text)
     except asyncio.CancelledError:
         # 投递期间被取消（`terminate()` 恰好撞上）：记 cancelled，不发第二条
