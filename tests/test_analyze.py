@@ -2497,7 +2497,8 @@ async def test_wake_round_with_real_media_still_runs_normally(
 # v0.5.1 C7：`route=` 结构化观测行（SPEC-v0.5.1 §6 / §9.4 的 G6 六格）
 #
 # 六格：㉔字段名与顺序 ㉕枚举集合相等 ㉖判定表逐行（5 个既有场景）㉗每调用至多一行
-#      ㉘两引擎分别传 plugin/core（在 `test_background` / `test_core_mode` 里）
+#      ㉘`engine=` 由调用方显式传（A2 在 `test_background` 里；v0.5.2 删掉路线 C 之后
+#        `core` 只剩日志词表的意义，没有生产调用方）
 #      ㉙`route` 行不写 notes + 缓存回放 notes 逐字相同
 #
 # 行格式本身就是契约：这里的正则**逐字**抄自 SPEC-v0.5.1 §6.7（含 6 正 1 负样本），

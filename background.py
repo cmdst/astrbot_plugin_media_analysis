@@ -1,32 +1,32 @@
 """后台任务表 + 结果渲染 + 确定性单次投递（SPEC-v0.4 §2.6 / §3 / §4）。
 
 **为什么是 A2（插件自管）而不是核心的 `is_background_task`**（裁决见 SPEC-v0.4 §2）：
-核心 4.29.1 的 `FunctionTool.is_background_task` 在派发层读的是
-`_PermissionGuardedTool` **包装器**（`core/provider/func_tool_manager.py:214-245` 只镜像
+核心 4.29.3 的 `FunctionTool.is_background_task` 在派发层读的是
+`_PermissionGuardedTool` **包装器**（`core/provider/func_tool_manager.py` 只镜像
 `name/description/parameters/active/handler_module_path`，**没有** `__getattr__`），
-而 `get_full_tool_set()` 每次重建包装器（`:496-512`）⇒ 在 `llm_tools.get_func(...)` 上置
-flag **恒为 False**（`/tmp` 探针实测：仍同步执行）。即便把 flag 置到包装器实例上（A1b），
+而 `get_full_tool_set()` 每次重建包装器 ⇒ 在 `llm_tools.get_func(...)` 上置 flag
+**恒为 False**（`/tmp` 探针实测：仍同步执行）。即便把 flag 置到包装器实例上（A1b），
 回执文案被核心写死、多一次整段历史的 agent 回合、而且**投递由模型决定**
-（`core/astr_agent_tool_exec.py:677-684` 只记 WARNING）⇒ 拿不到"恰好一次"。
+（`core/astr_agent_tool_exec.py` 只记 WARNING）⇒ 拿不到"恰好一次"。
 
-**v0.4.1 复核**（路线 C 调研，`research/20261025-native-core-background-route.md`）：核心侧
-只要在 `_PermissionGuardedTool.__init__` 里补一行镜像就能让 flag 生效，但 v0.4.1 **仍不
-adopt**。**v0.4.2 把口径精确化为"默认不采用、可显式选择"**（`background.mode=core`，
-实验模式，实现在 `core_mode.py`；本模块**不导入**它，依赖方向是 `main → core_mode →
-{analyze, envelope, background.render}`）。默认 `plugin` 下本模块仍是唯一引擎。
+**历史（路线 C，已删除）**：v0.4.1 复核过「核心补一行镜像就能让 flag 生效」的办法并
+**不 adopt**；v0.4.2 曾把它做成可选实验模式（`background.mode=core`，实现是一个独立
+模块）；**v0.5.2 连那个模块一起删掉了** —— 核心 4.29.3 至今仍不镜像该字段，那条路线
+在生产上从未生效过（每次加载只会打一条 `wrapper_no_mirror` ERROR 再内存级回落）。
+⇒ 现在 `plugin` 是**唯一**引擎。
 
-默认不开 C 的三条理由（**v0.4.2 的事实更正**，见 SPEC-v0.4.2 §1.4 / §9.3）：
-① **投递不确定** —— C 的发声靠唤醒轮模型主动调 `send_message_to_user`，没调只有核心一条
-WARNING ⇒ 从"恰好一次"退化为"大概率一次"；② **多一轮主 Agent** —— 每条后台任务多一轮
-完整模型调用；③ **3600 s 硬编码 + 无闸** —— 核心那层超时改不了，且 C 模式下去重/并发闸/
-预算闸**全部不存在**。
+不迁核心原生后台的三条理由（v0.5.2 仍然成立，已从"默认不开"升级为"不再可选"）：
+① **投递不确定** —— 那条路的发声靠唤醒轮模型主动调 `send_message_to_user`，没调只有核心
+一条 WARNING ⇒ 从"恰好一次"退化为"大概率一次"；② **多一轮主 Agent** —— 每条后台任务
+多一轮完整模型调用；③ **3600 s 硬编码 + 无闸** —— 核心那层超时改不了，且那条路上去重/
+并发闸/预算闸**全部不存在**。
 
-**（作废的说法）"本插件的成果是带媒体 ⇒ C 模式下没有可靠媒体出口"**：本插件的交付面
+**（作废的说法）"本插件的成果是带媒体 ⇒ 核心原生后台没有可靠媒体出口"**：本插件的交付面
 **只有一条 `Plain` 文本**（`_deliver` ⇒ `MessageChain([Plain(text)])`，信封里的 `frames`
-是**帧数计数**不是图片）⇒ 报告 §5.2 / §6.8 的"媒体无可靠出口"对本插件**不成立**。
-未来的禁令见 SPEC-v0.4.2 §9.2：若 `_deliver` 哪天开始投媒体组件，C 模式必须先被移除。
+是**帧数计数**不是图片）⇒ 报告 `research/20261025-native-core-background-route.md`
+§5.2 / §6.8 的"媒体无可靠出口"对本插件**不成立**（那从来不是否决它的理由）。
 `tests/test_registration.py` 的 `test_tool_is_not_a_core_background_task` 继续把
-"**默认模式**下不置 flag"钉死，防止"顺手开原生"造成同一条任务两条消息。
+"不置核心 flag"钉死，防止"顺手开原生"造成同一条任务两条消息。
 
 本模块的三条纪律（每条都在评审清单上）：
 
@@ -326,11 +326,12 @@ def render(payload: dict[str, object], *, max_chars: int = DELIVERY_MAX_CHARS) -
     note 原文（note 只进日志与信封）。成功三形态：`summary` → `transcript` 拼接 →
     "（本次没有可用的文字内容）"。
 
-    `max_chars` 是 v0.4.2 为 C 模式（核心原生后台）加的**唯一**改动（SPEC-v0.4.2 §6.2）：
-    C 模式的正文要塞进唤醒轮的 system prompt，比一条群消息更紧（`CORE_BODY_MAX`）。
-    **默认值 == `DELIVERY_MAX_CHARS` ⇒ A2 的输出逐字节不变**；
-    两种模式的用户可见文本必须同源（同一份摘要/转写/页脚/`…` 规则），否则"同一个结果在
-    两种模式下长得不一样"会变成第二个事实源。
+    `max_chars` 是 v0.4.2 为**已删除**的路线 C（核心原生后台）加的关键字参数
+    （那条路要把正文塞进唤醒轮的 system prompt，比一条群消息更紧）。
+    **默认值 == `DELIVERY_MAX_CHARS` ⇒ A2 的输出逐字节不变**；v0.5.2 删 C 之后它成了
+    "留给将来投递层（v0.5.3）的收口点"，**签名与默认值都不动** —— 用户可见文本必须同源
+    （同一份摘要/转写/页脚/`…` 规则），否则"同一个结果在不同投递路径下长得不一样"会变成
+    第二个事实源。
     """
     if payload.get("ok") is False:
         code = str(payload.get("error") or envelope.ERR_INTERNAL_ERROR)

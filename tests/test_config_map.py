@@ -77,9 +77,16 @@ EXPECTED_LEAVES: frozenset[str] = frozenset(EXPECTED_ORDER)
 #: `prompts` 置末（五段长文本不再插在中间）。
 EXPECTED_GROUPS = ["background", "provider_settings", "video", "limits", "cache", "prompts"]
 
-#: 4 个**隐藏**叶（item 级 `invisible: true`）：键与值都保留，只是面板不渲染。
+#: v0.5.2 从 `settings` 删掉的常量名。**拼出来**而不是写成字面量：收口判据里有一条
+#: "`.py` 面 0 活引用"的 grep（部署/评审用），若本文件写着字面量，那条 grep 会永远红
+#: —— 而这里要守的恰恰是"常量**不存在**"这个执行级事实。
+RETIRED_SETTINGS_CONSTANTS: tuple[str, ...] = ("MODE_" + "CORE",)
+
+#: 5 个**隐藏**叶（item 级 `invisible: true`）：键与值都保留，只是面板不渲染。
+#: v0.5.2 追加 `background.mode`（路线 C 已删除 ⇒ 它退化成"隐藏弃用键"）。
 EXPECTED_HIDDEN = frozenset(
     {
+        "background.mode",
         "provider_settings.stt_provider_id",
         "video.compress_timeout_seconds",
         "video.probe_enabled",
@@ -120,8 +127,12 @@ LEGACY_KEY_PATHS: tuple[str, ...] = (
 @pytest.fixture(autouse=True)
 def _reset_config_check_dedup():
     main._CONFIG_CHECK_DONE.clear()
+    # `settings._WARNED` 同样是**进程级**去重集合（提示词坏值 + 弃用枚举值共用一个背包），
+    # v0.5.2 的"每进程一条 WARNING"用例要能独立观察 ⇒ 前后都清。
+    settings._WARNED.clear()
     yield
     main._CONFIG_CHECK_DONE.clear()
+    settings._WARNED.clear()
 
 
 # --------------------------------------------------------------------------- #
@@ -438,11 +449,12 @@ def test_range_hint_matches_slider_and_settings_clamps() -> None:
         assert float(match.group(2)) == float(slider["max"]), path
 
 
-def test_hidden_leaves_are_exactly_the_four_and_keep_their_full_specs() -> None:
+def test_hidden_leaves_are_exactly_the_five_and_keep_their_full_specs() -> None:
     """隐藏 = **item 级** `invisible: true`，且 `type`/`default`/`slider`/`hint` 全套保留。
 
     "隐藏 ≠ 删除"是这一版最容易做错的取舍：删键会让核心把用户旧值当 stale 删掉并落盘
     （§1.3-2），而隐藏只是不渲染（`AstrBotConfig.vue:218/236/270`）。
+    v0.5.2 的第五个隐藏叶是 `background.mode`（弃用键，见 `EXPECTED_HIDDEN`）。
     """
     leaves = _schema_leaves(_schema())
     hidden = {path for path, spec in leaves.items() if spec.get("invisible") is True}
@@ -473,19 +485,111 @@ def test_mb_leaves_are_documented_in_mb() -> None:
 
 
 def test_background_mode_enum_matches_settings() -> None:
-    """`background.mode` 的三处枚举互钉：schema `options`/`default` ⇄ `settings` 常量。
+    """`background.mode` 互钉（v0.5.2 口径）：schema 只剩一项 ⇄ `settings` 只剩一个常量。
 
-    WebUI 的下拉框、`Settings` 的默认值、以及"合法取值集合"必须是同一份：任一处漂了，
-    用户在下拉框里选出的值都可能被运行期归一成**另一个**（`plugin`），且没有报错。
+    v0.4.2 时这里钉的是"两值枚举"（`plugin` / `core`）。v0.5.2 删掉路线 C 之后，本键
+    退化成**隐藏弃用键**：`options` 只有 `plugin`、`labels` 同步 1 条、`invisible: true`，
+    `settings.BACKGROUND_MODES == (MODE_PLUGIN,)`，且**那个已删的常量必须不存在**。
+
+    为什么用 `hasattr` 而不是 grep 源码：删了常量但留一个同名别名（或在别处重新赋值）
+    都会被 grep 漏掉，而 `hasattr` 是**执行级**事实。同理 `_run_core` 方法必须真的不在类上。
     """
     leaf = _schema_leaves(_schema())["background.mode"]
     assert leaf["type"] == "string"
-    assert tuple(leaf["options"]) == settings.BACKGROUND_MODES
-    assert leaf["default"] == settings.DEFAULT_BACKGROUND_MODE
+    assert tuple(leaf["options"]) == settings.BACKGROUND_MODES == ("plugin",)
+    assert leaf["default"] == settings.DEFAULT_BACKGROUND_MODE == "plugin"
     assert settings.DEFAULT_BACKGROUND_MODE == settings.Settings().background_mode
-    assert settings.BACKGROUND_MODES == (settings.MODE_PLUGIN, settings.MODE_CORE)
-    assert len(leaf["labels"]) == len(leaf["options"]), "每个 option 都要有人读的 label"
-    assert "invisible" not in leaf, "引擎开关必须可见（派单 C4）"
+    assert settings.BACKGROUND_MODES == (settings.MODE_PLUGIN,) == ("plugin",)
+    assert len(leaf["labels"]) == len(leaf["options"]) == 1, "每个 option 都要有人读的 label"
+    assert leaf.get("invisible") is True, "弃用键必须隐藏（面板不再渲染）"
+    assert "已弃用" in leaf["description"] and "已弃用" in leaf["hint"], leaf
+    # 已删除的枚举常量与方法：**执行级**判据（不是 grep）
+    for retired in RETIRED_SETTINGS_CONSTANTS:
+        assert not hasattr(settings, retired), f"{retired} 必须随路线 C 一起删掉"
+    assert not hasattr(main.MediaAnalysisPlugin, "_run_core"), "C 分支的入口方法必须删掉"
+    assert not hasattr(main.MediaAnalysisPlugin, "_tool_manager"), "引擎探测面的工具方法必须删掉"
+
+
+# --------------------------------------------------------------------------- #
+# D1（v0.5.2）：`background.mode` 变**隐藏弃用键** —— 归一表 + 每进程一次告警
+# --------------------------------------------------------------------------- #
+#: §4.4 的 9 行归一表：`(输入, 归一值, 是否告警)`。只有"合法值的大小写/空白变体"与
+#: "缺键（`""` / `None`）"不告警 —— `core` 已从合法值变成**已删枚举**。
+NORMALIZATION_TABLE: tuple[tuple[object, str, bool], ...] = (
+    ("plugin", "plugin", False),
+    ("PLUGIN", "plugin", False),
+    (" plugin ", "plugin", False),
+    ("core", "plugin", True),
+    ("CORE", "plugin", True),
+    (" core ", "plugin", True),
+    ("", "plugin", False),
+    (None, "plugin", False),
+    ("on", "plugin", True),
+)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected", "warns"),
+    NORMALIZATION_TABLE,
+    ids=[repr(row[0]) for row in NORMALIZATION_TABLE],
+)
+def test_background_mode_normalization_table(
+    raw: object, expected: str, warns: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§4.4 的归一表逐行真跑：**返回值**与**是否告警**两件事一起钉。
+
+    `core`/`CORE`/` core ` 三行是本版唯一的行为变化点（v0.5.1 里它们是合法值）：
+    路线 C 已删 ⇒ 它们必须回 `plugin` 并各打一条 WARNING（同一进程内合并成一条，
+    由下一个用例守）。
+    """
+    from _fakes import RecordingLogger
+
+    log = RecordingLogger()
+    monkeypatch.setattr(settings, "LOG", log)
+
+    assert settings.normalize_background_mode(raw) == expected
+    warnings = [message for level, message in log.records if level == "WARNING"]
+    assert len(warnings) == (1 if warns else 0), log.records
+
+
+def test_background_mode_warns_at_most_once_per_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """三种**不同原因**的坏值（已删枚举 / 类型非法 / 又一种类型）⇒ 本键总共只 1 条 WARNING。
+
+    去重 token 必须与原因**无关**（固定 `("background.mode", "*")`）：否则运维把
+    `core` 改成 `on` 再改成 `{}`，日志里就变成三条不同的提示，等于没有去重。
+    """
+    from _fakes import RecordingLogger
+
+    log = RecordingLogger()
+    monkeypatch.setattr(settings, "LOG", log)
+
+    for raw in ("core", "on", 3):
+        assert settings.normalize_background_mode(raw) == "plugin"
+    warnings = [message for level, message in log.records if level == "WARNING"]
+    assert len(warnings) == 1, log.records
+
+
+def test_background_mode_warning_never_echoes_the_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """告警**不打值**（AGENTS §8：配置值不进日志）⇒ 生产里的 `core` 不会被回显。
+
+    判据是"告警文本里没有原值"，不是"告警里没有小写 c-o-r-e 这三个字母"：
+    所以这里对三种大小写形态都断言，防止有人为了好读写成 `...（core）`。
+    """
+    from _fakes import RecordingLogger
+
+    log = RecordingLogger()
+    monkeypatch.setattr(settings, "LOG", log)
+
+    settings.normalize_background_mode("CoRe")
+    warnings = [message for level, message in log.records if level == "WARNING"]
+    assert len(warnings) == 1, log.records
+    assert "core" not in warnings[0].lower(), f"告警回声了配置值：{warnings[0]!r}"
+    # 但**原因**要能读懂（"已删枚举"是运维唯一能据此行动的线索）
+    assert "已删枚举" in warnings[0], warnings[0]
 
 
 def test_schema_leaf_types_are_renderable_by_core() -> None:
@@ -982,12 +1086,20 @@ def test_configview_flag_accepts_only_real_booleans(monkeypatch: pytest.MonkeyPa
 # --------------------------------------------------------------------------- #
 # `main._settings()`：21 键逐条显式读（含 MB 域钳位与原值）
 # --------------------------------------------------------------------------- #
-def test_main_settings_assembles_all_twenty_one_keys() -> None:
+def test_main_settings_assembles_all_twenty_one_keys(monkeypatch: pytest.MonkeyPatch) -> None:
     """`main._settings()` 的 21 个字段都能从一份配置里取到（含钳位、去空白与枚举归一）。
 
     这份配置**故意把每个数值键喂到边界外**：钳位值必须落到边界上，而
     `raw_audio_timeout` 必须保留原值 9999（钳位后恒 ≤ 95，拿钳位值判越界是死代码）。
+
+    v0.5.2：`background.mode="core"` 从"合法值"变"非法值" ⇒ 快照里必须是 `plugin`，
+    并且**恰好一条** `background.mode` 的 WARNING（本条只看这一个键的告警：同一份配置
+    里越界钳位也会各打一条，那是钳位告警，不是枚举告警）。
     """
+    from _fakes import RecordingLogger
+
+    log = RecordingLogger()
+    monkeypatch.setattr(settings, "LOG", log)
     plugin = main.MediaAnalysisPlugin(
         context=None,
         config={
@@ -1022,7 +1134,7 @@ def test_main_settings_assembles_all_twenty_one_keys() -> None:
     )
     snapshot = plugin._settings()
     assert snapshot == settings.Settings(
-        background_mode=settings.MODE_CORE,
+        background_mode=settings.MODE_PLUGIN,
         audio_provider_id="a1",
         video_provider_id="vid1",
         vision_provider_id="v1",
@@ -1052,6 +1164,11 @@ def test_main_settings_assembles_all_twenty_one_keys() -> None:
     # 越界原值仍被保留给告警①（钳位值 95 ≠ 原值 9999）
     assert snapshot.raw_audio_timeout == 9999
     assert snapshot.audio_timeout_seconds == 95
+    # v0.5.2：`core` 只剩"已删枚举"这一条告警（每进程一次、不打值）
+    bg_warnings = [m for level, m in log.records if level == "WARNING" and "background.mode" in m]
+    assert len(bg_warnings) == 1, log.records
+    assert "已删枚举" in bg_warnings[0], bg_warnings[0]
+    assert "core" not in bg_warnings[0], f"告警不许回声配置值：{bg_warnings[0]!r}"
 
 
 def test_main_settings_on_empty_config_returns_defaults() -> None:
@@ -1196,6 +1313,11 @@ async def test_ready_line_reports_effective_values(monkeypatch: pytest.MonkeyPat
     assert "video_provider_id='vid-x'" in line
     assert "compress=on" in line and "probe=on" in line
 
+    # ④ v0.5.2：`background_mode=` 是**归一后的有效值**，且字段数固定 19（§4.6）
+    assert "background_mode=plugin" in line, f"ready 行缺 background_mode=plugin：{line}"
+    tokens = [token for token in line.split() if "=" in token]
+    assert len(tokens) == 19, f"ready 行字段数应为 19：{tokens}"
+
 
 @pytest.mark.asyncio
 async def test_ready_line_audio_timeout_is_the_clamped_value(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1214,6 +1336,39 @@ async def test_ready_line_audio_timeout_is_the_clamped_value(monkeypatch: pytest
     assert len(ready) == 1
     assert f"audio_timeout_s={settings.MAX_AUDIO_TIMEOUT_SECONDS}" in ready[0]
     assert "audio_timeout_s=120" not in ready[0]
+
+
+@pytest.mark.asyncio
+async def test_ready_line_background_mode_is_the_normalized_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """G1-7：配置喂 `core` ⇒ `ready` 行打 `background_mode=plugin`，**不出现 core 字样**。
+
+    判据是"真跑 `initialize()` 抓那一行"（不是自己拼字符串），而且两个 LOG 都要 patch：
+    `ready` 行走 `main.LOG`、归一告警走 `settings.LOG` —— 只 patch 一个会漏观测。
+    同时钉住字段数 **19**：新增字段不是"多打一个词"，它是可 grep 契约的一部分。
+    """
+    from _fakes import RecordingLogger
+
+    log = RecordingLogger()
+    monkeypatch.setattr(main, "LOG", log)
+    monkeypatch.setattr(settings, "LOG", log)
+    plugin = await _run_initialize(
+        log, {"background": {"mode": "core"}, "cache": {"ttl_seconds": 0}}
+    )
+    await plugin.terminate()
+
+    ready = [m for level, m in log.records if level == "INFO" and "ready:" in m]
+    assert len(ready) == 1, log.records
+    line = ready[0]
+    assert "background_mode=plugin" in line, line
+    assert "background_mode=core" not in line, line
+    assert "core" not in line, f"ready 行不许出现 core 字样：{line}"
+    tokens = [token for token in line.split() if "=" in token]
+    assert len(tokens) == 19, tokens
+    # 归一告警照打（一次），否则"配置里还留着 core"这件事在日志里彻底消失
+    bg_warnings = [m for level, m in log.records if level == "WARNING" and "background.mode" in m]
+    assert len(bg_warnings) == 1, log.records
 
 
 # --------------------------------------------------------------------------- #

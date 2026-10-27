@@ -30,9 +30,11 @@
 （`Settings.video_max_direct_bytes` 等），所以这次改名对运行期是**零改动** ——
 除了两个已删的键（`native_*`），它们的值搬进了代码常量。
 
-`background.mode`（v0.4.2 新增，本版**只挪位置不改默认**）取值只有 `plugin`（默认，
-插件自管后台 A2）/ `core`（核心原生后台，**实验**，需核心一行补丁 + 重启）。坏值一律
-**回 `plugin`**（保守侧：少花钱、少不确定性），见 `normalize_background_mode`。
+`background.mode`（v0.4.2 新增）自 v0.5.2 起是**隐藏弃用键**：路线 C（核心原生后台）
+已删除，合法取值只剩 `plugin`（插件自管后台 A2）；坏值（含历史上的 `core`）一律
+**回 `plugin`** 并打**一条** WARNING（每进程一次、不打值），见
+`normalize_background_mode`。键与磁盘值都保留 —— 删键会被核心当 stale 删掉并落盘，
+真正的删键留 v0.6.0。
 
 `provider_settings.stt_provider_id` 仍是**弃用键**（SPEC-v0.2 §5.3）：它必须继续留在
 schema 与 `KEY_MAP` 里 —— 从 schema 删掉的那一刻，核心 `check_config_integrity()` 会把
@@ -212,21 +214,22 @@ SPEC-v0.5.1 §2.2-B）。本常量是**配置面的镜像**（受守卫对偶：
 加载期不变式断言 —— 运行期判断一律读 `analyze` 侧那份。
 """
 
-# v0.4.2 `background.mode`（枚举，不是布尔：见 SPEC-v0.4.2 §3.1「键的取舍」——布尔表达不了
-# "默认 / 实验"的语义差别，将来出现第三种引擎还要再改类型＝破坏性变更）
+# `background.mode`（v0.4.2 加的枚举键；v0.5.2 起是**隐藏弃用键**，只认 `plugin`）
 MODE_PLUGIN = "plugin"
-"""插件自管后台（A2）：受理即返回 + 插件自己 `send_message` **恰好一次**。**默认值**。"""
+"""插件自管后台（A2）：受理即返回 + 插件自己 `send_message` **恰好一次**。**唯一合法值**。"""
 
-MODE_CORE = "core"
-"""核心原生后台（路线 C，**实验**）：需核心补 `_PermissionGuardedTool` 一行镜像并重启。"""
+BACKGROUND_MODES: tuple[str, ...] = (MODE_PLUGIN,)
+"""合法取值（== `_conf_schema.json` 的 `options`，测试钉相等）。
 
-BACKGROUND_MODES: tuple[str, str] = (MODE_PLUGIN, MODE_CORE)
-"""合法取值（== `_conf_schema.json` 的 `options`，测试钉相等）。"""
+v0.5.2 **删掉**了 `core`（核心原生后台，路线 C）：该值的常量已删除、schema 的
+`options` 只剩一项、`invisible: true`。键与磁盘值都保留（删键会被核心
+`check_config_integrity()` 当 stale 删掉并落盘），只是运行期一律归一成 `plugin`。
+"""
 
 DEFAULT_BACKGROUND_MODE = MODE_PLUGIN
 """默认值（== schema 的 `default` == `Settings.background_mode` 的默认值）。
 
-v0.5.1 **不改**这个默认（【用户裁决 U2】：生产 `background.mode=core` 由配置决定，不回退）。
+v0.5.2 的默认仍是 `plugin`（v0.5.1 的【用户裁决 U2】"生产由配置决定"随 C 一起作废）。
 """
 
 # v0.3 `video.*` 的非字节默认值（== `_conf_schema.json` 的 `default`，逐字相同）
@@ -384,18 +387,27 @@ def _warn_once(key: str, reason: str) -> None:
     )
 
 
+#: 已删除枚举值的**原因词**（v0.5.2：`core` 从"合法值"变"非法值"，告警文案要能分辨
+#: "你用了已删的枚举"与"你写错了类型"—— 两者对运维的动作不同）。
+_REASON_REMOVED_MODES: dict[str, str] = {"core": "已删枚举"}
+
+
 def normalize_background_mode(value: object) -> str:
-    """把配置里的 `background.mode` 归一成 `"plugin" | "core"`（SPEC-v0.4.2 §3.3）。
+    """把配置里的 `background.mode` 归一成 `"plugin"`（v0.5.2：合法取值只剩一个）。
 
     | 输入 | 输出 | 日志 |
     | --- | --- | --- |
-    | `"plugin"` / `"core"`（`strip().lower()` 后） | 原样 | 无 |
-    | `"CORE"` / `" core "` | `"core"` | 无（大小写与空白是可容忍的手滑） |
-    | `""` / `None` / 缺键 | `"plugin"` | 无（缺键由核心 `check_config_integrity` 补默认） |
-    | 其它（`"on"` / `"1"` / `True` / `{}` / `2.5`…） | `"plugin"` | **WARNING 一次**（不打值） |
+    | `"plugin"` / `"PLUGIN"` / `" plugin "`（`strip().lower()` 后） | `plugin` | 无 |
+    | `"core"` / `"CORE"` / `" core "` | `plugin` | **WARNING 一条**（原因 `已删枚举`） |
+    | `""` / `None` / 缺键 | `plugin` | 无（缺键由核心 `check_config_integrity` 补默认） |
+    | 其它（`"on"` / `1` / `True` / `{}` / `2.5` / `[]`…） | `plugin` | **WARNING 一条**（原因为类型名） |
 
-    方向与 `analyze.normalize_mode`（工具参数非法值回 `auto`＝多花一次调用）**相反**：
-    配置是运维写的，写错时应当站在**保守侧**（`plugin` 少花钱、少不确定性）。
+    v0.5.2 的唯一行为变化：`core` 从"合法值"变"非法值"（路线 C 已删）。保留旧口径里
+    "大小写与空白可容忍"（`"PLUGIN"` 不告警）—— 那是运维手滑，不是语义错误。
+
+    **每进程至多一条 WARNING**（去重 token 固定为 `("background.mode", "*")`），且
+    **不打值**：配置值不进日志（AGENTS §8），生产里的 `core` 也不回声。**不改配置、
+    不落盘** —— 插件只报告怀疑，不动用户资产（v0.5.1 §8 纪律）。
     """
     if value is None:
         return DEFAULT_BACKGROUND_MODE
@@ -405,19 +417,26 @@ def normalize_background_mode(value: object) -> str:
             return text
         if not text:
             return DEFAULT_BACKGROUND_MODE
+        _warn_bad_background_mode(_REASON_REMOVED_MODES.get(text, "str"))
+        return DEFAULT_BACKGROUND_MODE
     _warn_bad_background_mode(type(value).__name__)
     return DEFAULT_BACKGROUND_MODE
 
 
-def _warn_bad_background_mode(type_name: str) -> None:
-    """非法 `background.mode` **只告警一次**，且**不打值**（配置值不进日志，AGENTS §8）。"""
-    token = ("background.mode", type_name)
+def _warn_bad_background_mode(reason: str) -> None:
+    """非法 `background.mode` **每进程只告警一次**，且**不打值**（AGENTS §8）。
+
+    去重 token 里的第二项**固定** `"*"`，不随原因变化：一个进程里无论是 `core`、`on`
+    还是 `{}`，本键总共至多一条 WARNING（相同键的重复提示对运维是噪声）。
+    """
+    token = ("background.mode", "*")
     if token in _WARNED:
         return
     _WARNED.add(token)
     LOG.warning(
-        "media_analysis: 配置 background.mode 非法（类型 %s），按 plugin 处理",
-        type_name,
+        "media_analysis: 配置 background.mode 非法（%s），已按 plugin 处理"
+        "（本键自 v0.5.2 起已弃用）",
+        reason,
     )
 
 
@@ -477,7 +496,7 @@ class Settings:
 
     # —— 引擎（组序第 1）——
     background_mode: str = DEFAULT_BACKGROUND_MODE
-    """引擎选择（**已归一**）：`plugin`（默认，A2）/ `core`（实验，核心原生后台）。
+    """引擎（**已归一**）：v0.5.2 起只可能是 `plugin`（A2）；`core` 已随路线 C 删除。
 
     它**不进**缓存键（12 分量）：交付机制不影响分析结果，换引擎不该让老条目失效。
     """

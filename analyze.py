@@ -26,10 +26,11 @@ v0.5.1 改两件事（都在运行面，**不动链路形状**）：
    重试标记**只进日志**：`notes` 与单次成功逐字相同（缓存中立）。
 2. **C7 `route=` 结构化行**（§6）：每次调用**至多一行**、字段/顺序/枚举冻死，
    `stage=analyze` 在这里的 `finally` 里打（`shutil.rmtree` 之前），并给 `analyze()`
-   加 `engine` **关键字参数**（A2 传 `plugin`、C 传 `core`）。
+   加 `engine` **关键字参数**（A2 传 `plugin`；v0.5.2 删掉路线 C 之后，实际调用方
+   只剩 `background._run`，`core` 只作为**日志词表的保留值**存在）。
    `route=` 行**只读** `notes` 的子串做判定，**不写** `notes`。
 3. **D2 唤醒轮短路**的两个**纯函数**（`is_wake_round` / `chain_has_media`）落在本模块：
-   `main`（A2）与 `core_mode`（C）都要用它们，而两者都已经 import `analyze`
+   `main`（A2 门面）要用它们，而它已经 import `analyze`
    ⇒ 不引入新的依赖边，也不把"事件形态"知识复制两份。
 
 三个阶段的降级形状仍然固定：
@@ -158,8 +159,8 @@ _PROBE_STORE: probe.ProbeStore | None = None
 #
 # 为什么把这一层放在 `analyze`：
 # - `stage=analyze` 的行只能由这里打（链路状态在这里累积，`finally` 里一次成行）；
-# - `stage=accept` 的两个调用方（`main` 的 A2 门面、`core_mode.run` 的 C 分支）**都**已经
-#   import 了本模块 ⇒ 不用为一行日志引入新的依赖边，也不会出现两份格式；
+# - `stage=accept` 的调用方（`main` 的 A2 门面）**已经** import 了本模块
+#   ⇒ 不用为一行日志引入新的依赖边，也不会出现两份格式；
 # - 枚举是**封闭集合**：多一个自创值就是契约变更（`tests/` 用正则 + 集合相等两边夹）。
 # --------------------------------------------------------------------------- #
 ROUTE_CACHE = "cache"
@@ -475,9 +476,9 @@ async def analyze(
     步骤号与 SPEC-v0.3 §7.3 的七跳一致（[0]–[7]），便于对着规格评审。
 
     `engine` 是 v0.5.1 加的**关键字参数**（SPEC-v0.5.1 §6.3 的 J7）：只用于 `route=` 行的
-    `engine=` 字段，两个引擎**显式**传（A2 `background._run` 传 `"plugin"`、C
-    `core_mode.run` 传 `"core"`）。**不从 `settings.background_mode` 反查**——C 模式下
-    `settings` 可能是 `plugin` 回落态，反查会写出错误的引擎名。
+    `engine=` 字段，由调用方**显式**传（A2 `background._run` 传 `"plugin"`；`core` 这个
+    值自 v0.5.2 删掉路线 C 后只剩日志词表的意义，没有生产调用方）。**不从
+    `settings.background_mode` 反查**——那个键已弃用、值可能被归一，反查会写出错误的引擎名。
     """
     started = time.monotonic()  # [0]
     deadline = started + DEADLINE_S
@@ -667,7 +668,7 @@ async def analyze(
     except asyncio.CancelledError:
         # 取消（卸载/进程停止）：**不产 `route=` 行** —— 这次调用没有"走法"可言，
         # 硬填一个 `route=audio` 会让运维以为它真跑成过。取消有自己的日志
-        # （`bg cancelled` / `core-mode call cancelled`），D4 的"缺席判据"也靠
+        # （`bg cancelled`），D4 的"缺席判据"也靠
         # 核心那行 tool 调用记录区分，不会和"根本没到插件"混淆。
         route_state.cancelled = True
         raise
@@ -677,7 +678,7 @@ async def analyze(
         raise
     except BaseException as exc:  # noqa: BLE001 —— 只负责"日志说真话"，**再上抛**
         # 非受控异常（`_video_stage` 里的 RuntimeError、ffmpeg 封装漏出的东西、核心热重载
-        # 期间的空 client…）：收口点在调用方（`background._run` / `core_mode.run`），本层
+        # 期间的空 client…）：收口点在调用方（`background._run`），本层
         # **不吞**；但如果这里不记码，`finally` 会按累积态打出一条**假的** `route=audio`
         # （看起来像"只交了转写"），把事故藏起来。⇒ 记 `INTERNAL_ERROR` 再上抛
         # （SPEC-v0.5.1 §6.2 的 `route=none` 正是"以错误收口"的那一档）。

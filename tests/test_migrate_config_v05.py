@@ -10,7 +10,8 @@
 1. **换算**：`bytes_to_mb` / `mb_to_bytes` 的边界表，并与 `settings` 的同名函数**逐值相等**
    （脚本不 import 插件模块 ⇒ 这是一份**受守卫对偶**，不是第二事实源）；
 2. **动作**：生产 22 叶 → `rename 3 / drop 2 / add 1 / keep 17`（`skip 0`），
-   `hidden=1` 恰 4 条；受 NAME 表（`RENAMES` / `DROPS` / `NEW_KEY_DEFAULTS` / `HIDDEN_KEYS`）
+   `hidden=1` 恰 5 条（v0.5.2 追加 `background.mode`）；受 NAME 表（`RENAMES` / `DROPS` /
+   `NEW_KEY_DEFAULTS` / `HIDDEN_KEYS`）
    与 schema / settings 三方对齐；
 3. **换算值**：`33554432 → 32`（delta 0）、`30000000 → 29`（30408704，delta +408704）、
    `67108864 → 64`（delta 0）；隐藏键 `compress_timeout_seconds=60` **保号**；
@@ -239,12 +240,16 @@ def test_new_key_defaults_are_exactly_the_audio_timeout() -> None:
 
 
 def test_hidden_keys_match_the_schema_invisible_set() -> None:
-    """`hidden=1` 的 4 条 = schema 里 item 级 `invisible: true` 的那 4 叶。"""
+    """`hidden=1` 的 5 条 = schema 里 item 级 `invisible: true` 的那 5 叶。
+
+    v0.5.2 的第五叶是 `background.mode`（路线 C 已删除 ⇒ 它退化成隐藏弃用键）：
+    迁移器**不搬这个值**（动作仍是 `keep`），只是报告里会多一个 `hidden=1` 标记。
+    """
     invisible = {
         path for path, spec in _schema_leaves().items() if spec.get("invisible") is True
     }
     assert set(migrator.HIDDEN_KEYS) == invisible
-    assert len(migrator.HIDDEN_KEYS) == 4
+    assert len(migrator.HIDDEN_KEYS) == 5
     for key in migrator.HIDDEN_KEYS:
         assert key in settings.KEY_MAP, "隐藏键必须仍在键表里（隐藏 ≠ 删除）"
 
@@ -270,8 +275,8 @@ def test_plan_action_counts_on_the_production_shape() -> None:
     assert counts["keep"] == 17
     assert counts["skip"] == 0
     hidden = [item.key for item in actions if item.hidden]
-    assert len(hidden) == 4, hidden
-    assert set(hidden) == set(migrator.HIDDEN_KEYS), "hidden=1 只许出现在那 4 个隐藏键上"
+    assert len(hidden) == 5, hidden
+    assert set(hidden) == set(migrator.HIDDEN_KEYS), "hidden=1 只许出现在那 5 个隐藏键上"
 
 
 def test_plan_converts_the_production_bytes_with_the_frozen_rounding() -> None:
@@ -458,7 +463,7 @@ def test_report_is_read_only(tmp_path: Path, capsys) -> None:
     assert sum("action=drop" in line for line in action_lines) == 2
     assert sum("action=add" in line for line in action_lines) == 1
     assert sum("action=keep" in line for line in action_lines) == 17
-    assert sum("hidden=1" in line for line in action_lines) == 4
+    assert sum("hidden=1" in line for line in action_lines) == 5
 
 
 def test_default_mode_is_a_dry_run(tmp_path: Path, capsys) -> None:

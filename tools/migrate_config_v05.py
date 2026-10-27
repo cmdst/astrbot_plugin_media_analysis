@@ -92,13 +92,17 @@ KEY_ORDER: tuple[tuple[str, str], ...] = (
     ("prompts.video_native", "text"),
 )
 
-#: 4 个**隐藏**键（item 级 `invisible: true`）：**键与值都保留**，只是面板不再渲染。
+#: 5 个**隐藏**键（item 级 `invisible: true`）：**键与值都保留**，只是面板不再渲染。
 #:
 #: 为什么"隐藏"而不是"删除"：从 schema 删掉的那一刻，核心会把用户的旧值当 stale
 #: **删掉并落盘**（§1.3-2）—— 隐藏是零风险且**保号**（生产 `compress_timeout_seconds=60`
 #: 正是"隐藏≠删除"的现场证据）。
+#:
+#: v0.5.2 追加 `background.mode`（路线 C 已删除 ⇒ 该键退化成隐藏弃用键）。它只影响
+#: 报告里的 `hidden=1` 标记：动作仍是 `keep`、值一个字不动（迁移器**不搬这个值**）。
 HIDDEN_KEYS: frozenset[str] = frozenset(
     {
+        "background.mode",
         "provider_settings.stt_provider_id",
         "video.probe_enabled",
         "video.probe_ttl_seconds",

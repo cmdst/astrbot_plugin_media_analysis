@@ -912,8 +912,8 @@ async def test_background_passes_engine_plugin_to_analyze(
 ) -> None:
     """㉘ A2 任务体**显式**传 `engine="plugin"`（不从 `settings` 反查）。
 
-    反查是错的路子：C 模式下 `settings.background_mode` 可能是 `plugin` 回落态，
-    于是日志会把"谁在跑"写错。所以这里断言的是**调用参数**，不是日志措辞。
+    反查是错的路子：`settings.background_mode` 是**已弃用**的兼容键（值可能被归一成
+    `plugin`），拿它反推引擎会把"谁在跑"写错。所以这里断言的是**调用参数**，不是日志措辞。
     """
     calls = _stub_analyze(monkeypatch)
 
