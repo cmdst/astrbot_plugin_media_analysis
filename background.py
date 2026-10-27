@@ -55,7 +55,7 @@ from astrbot.api import logger as LOG
 from astrbot.api.event import MessageChain
 from astrbot.api.message_components import Plain
 
-from . import analyze, envelope
+from . import analyze, envelope, result_context
 
 # ---- 护栏（**代码常量，0 新配置键**，SPEC-v0.4 §6.1）----
 BG_MAX_PER_SESSION = 3  # 单会话同时进行的任务上限
@@ -246,8 +246,11 @@ async def _run(
         record.state = STATE_OK
 
     record.payload = payload
+    # ① 渲染只算一次：投递给用户看的文本与"登记给下一轮上下文"的文本**同字节**
+    #    （§5.8① / §10「投递文本唯一来源」—— 两条路径共用同一个局部 `text`）。
+    text = render(payload)
     try:
-        delivered = await _deliver(context, event, record.umo, render(payload))
+        delivered = await _deliver(context, event, record.umo, text)
     except asyncio.CancelledError:
         # 投递期间被取消（`terminate()` 恰好撞上）：记 cancelled，不发第二条
         record.state = STATE_CANCELLED
@@ -260,6 +263,13 @@ async def _run(
         # 无论成败/取消：三张表照样要摘干净、`done` 照样要放行
         _finish(record)
     record.state = STATE_DELIVERED if delivered else STATE_UNDELIVERED
+    # ③ **只在投递成功后**登记给下一轮上下文（§5.8③ / §6.4 的判据表）：
+    #    `delivered` 为 True ＝ 用户那边确实收到了一段文本 ⇒ 值得让模型下一轮知道；
+    #    False（没找到平台且兜底也失败）或投递抛异常 ⇒ **不记**（用户没看到，模型也
+    #    不该以为它发过）。④ 本行在 `try/finally` **之外**（`finally` 里只有 `_finish`），
+    #    ⑤ 取消路径在 `raise` 处就断了，天然走不到这里。
+    if delivered:
+        result_context.remember(record.umo, text)
     LOG.info(
         "media_analysis: bg finished task=%s state=%s elapsed_ms=%d delivered=%s",
         _short(record.task_id),

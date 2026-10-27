@@ -45,6 +45,8 @@ _PACKAGE_MODULES = {
     "video_native",
     # v0.4 新增后台任务表（SPEC-v0.4 §2.6）；漏登记 = 漏扫一片扁平导入
     "background",
+    # v0.5.2 新增一次性结果上下文（纯逻辑模块，不 import 任何包内模块）
+    "result_context",
 }
 
 #: docstring 能生成的类型词（`provider/func_tool_manager.py:128-145`）。
@@ -117,7 +119,13 @@ def test_tool_method_has_exactly_one_decorator() -> None:
 
 
 def test_no_permission_or_command_decorators_anywhere_in_main() -> None:
-    """整个模块只允许 `filter.llm_tool` 一种装饰器（注释里提到别的名字不算）。"""
+    """整个模块**只允许两种**装饰器：`filter.llm_tool` 与 `filter.on_llm_request`。
+
+    白名单从一项变两项是 v0.5.2 的（新增结果注入钩子），**纪律本身没变**：这里守的是
+    "不许出现 `permission_type` / `command` / `event_message_type` 这类**消息处理器**
+    装饰器" —— 它们会让工具方法被当成处理器，权限不符就丢用户消息（AGENTS §3）。
+    注释里提到别的装饰器名字不算（这里扫的是 AST，不是文本）。
+    """
     tree = _main_tree()
     found: set[str] = set()
     for node in ast.walk(tree):
@@ -126,7 +134,11 @@ def test_no_permission_or_command_decorators_anywhere_in_main() -> None:
         for decorator in node.decorator_list:
             target = decorator.func if isinstance(decorator, ast.Call) else decorator
             found.add(ast.unparse(target))
-    assert found == {"filter.llm_tool"}, f"main.py 出现了别的装饰器：{sorted(found)}"
+    assert found == {"filter.llm_tool", "filter.on_llm_request"}, (
+        f"main.py 出现了白名单外的装饰器：{sorted(found)}"
+    )
+    # 工具方法仍然**只有**一个装饰器（钩子不许挂到工具上，反之亦然）
+    assert len(_media_analyze_def().decorator_list) == 1
 
 
 def test_tool_method_is_coroutine_and_returns_str() -> None:
@@ -289,6 +301,21 @@ def test_registered_schema_descriptions_are_nonempty() -> None:
     assert tool is not None
     for name, spec in tool.parameters["properties"].items():
         assert spec.get("description"), f"{name} 缺 description"
+
+
+def test_on_llm_request_hook_signature() -> None:
+    """`_inject_media_results` 必须收 `(self, event, req)` 且是协程（4.29.3 的硬要求）。
+
+    核心那条 docstring 逐字写着「请务必接收两个参数：event, req」：只收 `req` 的写法
+    在运行期会以 `TypeError` 崩在**所有**请求上（而且是在 LLM 请求管道里，不在本插件里）。
+    返回值被核心忽略 ⇒ 标注 `-> None`。
+    """
+    hook = main.MediaAnalysisPlugin.__dict__.get("_inject_media_results")
+    assert hook is not None, "钩子必须是**本类自身**的方法（与 terminate 同一条纪律）"
+    params = list(inspect.signature(hook).parameters)
+    assert params == ["self", "event", "req"], params
+    assert inspect.iscoroutinefunction(hook), "钩子必须是 async（同步函数核心不会 await）"
+    assert inspect.signature(hook).return_annotation in (None, "None")
 
 
 def test_tool_is_not_a_core_background_task() -> None:

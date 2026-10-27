@@ -37,6 +37,7 @@ EXPECTED_SOURCE_MODULES = [
     "media.py",
     "probe.py",
     "providers.py",
+    "result_context.py",  # v0.5.2：一次性结果上下文（纯逻辑，0 个 astrbot import）
     "settings.py",
     "video_native.py",
 ]

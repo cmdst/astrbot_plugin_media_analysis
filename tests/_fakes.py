@@ -575,7 +575,8 @@ class FakeContext:
         has_provider_manager: False ⇒ `provider_manager` 为 `None`（测第 ③ 步落空）。
         send_ok: `send_message` 的返回值（`False` = "没找到平台，什么都没发"，v0.4 的兜底分支）。
         raise_on_send: `send_message` 抛出的异常（投递失败只 WARNING、不重试）。
-        manager: `get_llm_tool_manager()` 的返回（v0.4.2 的引擎探测读它）。
+        manager: `get_llm_tool_manager()` 的返回（v0.5.2 起插件不再调用它 ——
+            路线 C 的引擎探测已随 v0.5.2 删除；保留本假面只为"真核心有这个方法"的形状）。
             **缺省（`_UNSET`）⇒ 返回真核心的全局 `llm_tools` 单例**——那正是生产里
             `context.get_llm_tool_manager()` 的语义；传 `None` 则模拟"桩环境没有管理器"。
     """
@@ -642,9 +643,8 @@ class FakeContext:
     def get_llm_tool_manager(self) -> Any:
         """真核心语义：`context.get_llm_tool_manager()` ⇒ 全局 `llm_tools` 单例。
 
-        缺省返回**真单例**（`astrbot.core.provider.register.llm_tools`）：生产里
-        `initialize()` 就是靠它定位自己的 `FuncTool`，假身必须同形，否则"探测拿不到
-        管理器"这条路径会在所有用例里假红。
+        缺省返回**真单例**（`astrbot.core.provider.register.llm_tools`）：
+        与真核心同形（v0.5.2 起插件不再读它，但假身不该比真核心少面）。
         """
         self.calls.record("get_llm_tool_manager")
         if self._manager is _UNSET:

@@ -10,6 +10,10 @@
 2. `Star.__init__` **不保存** `config`（`star/base.py:26-29`）⇒ 自己存。
 3. 工具方法**只挂** `@filter.llm_tool`：叠加 `@filter.permission_type` 会让它被当成
    消息处理器，权限不符就丢用户消息（AGENTS §3 装饰器纪律）。
+   v0.5.2 全模块只有**两个**装饰器：`@filter.llm_tool`（工具注册）与
+   `@filter.on_llm_request()`（一次性结果注入，`_inject_media_results`）——白名单由
+   `tests/test_registration.py` 钉死，`permission_type` / `command` 这类消息处理器
+   装饰器**永远**不许出现。
 4. `_settings()` 是**唯一配置读取点**，21 个键逐条显式读（`settings.KEY_MAP` ↔
    `_conf_schema.json` ↔ 迁移器 `migrate_config_v05.py:KEY_ORDER` ↔ 这里四方一致）。
    漏一个键 ＝ 生产链路上**静默丢弃**设置（SPEC-v0.5.1 §10）。
@@ -29,7 +33,7 @@ from astrbot.api import AstrBotConfig, logger as LOG
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 
-from . import analyze, background, cache, envelope, media, settings, video_native
+from . import analyze, background, cache, envelope, media, result_context, settings, video_native
 
 # --------------------------------------------------------------------------- #
 # 核心**内部面**加固（`error_redaction` 不在 `astrbot.api.*` 的公开导出里）。
@@ -298,7 +302,7 @@ class MediaAnalysisPlugin(Star):
             _CONFIG_CHECK_DONE.add("max_direct_over_suggested")
 
     async def terminate(self) -> None:
-        """卸载：取消全部后台任务 → 丢掉配置快照 → 关闭缓存（条目按 TTL 自然过期）。
+        """卸载：取消全部后台任务 → 丢掉待注入结果 → 丢掉配置快照 → 关闭缓存。
 
         顺序有讲究：先取消任务再关缓存 —— 反过来的话后台任务会在已关闭的缓存上继续跑
         一段（`DiskCache` 的写盘是幂等的，但"先断粮再收工"更干净）。
@@ -309,9 +313,14 @@ class MediaAnalysisPlugin(Star):
         且必须是**本类自身** `__dict__` 里的方法（核心只在 `star_cls_type.__dict__` 里找）。
 
         v0.4.2 曾在这里多一步「还原核心 flag」（路线 C）；v0.5.2 删 C 之后**没有**任何
-        核心侧状态要还原 —— 本类的卸载面只剩"取消自己派发的任务 + 关缓存"。
+        核心侧状态要还原 —— 本类的卸载面只剩"取消自己派发的任务 + 清注入队列 + 关缓存"。
+
+        `result_context.clear()` 是 v0.5.2 加的（SPEC-v0.5.2 §5.5 A8）：待注入结果是
+        **进程内**记忆，卸载/重载之后既没有"上一轮请求"可言，也不该跨生命周期复活
+        —— 新实例的钩子若捞出旧实例登记的结果，模型会对着一段它没参与过的历史说话。
         """
         await background.cancel_all()
+        result_context.clear()
         self._settings_cache = None
         store, self._cache = self._cache, None
         if store is not None:
@@ -536,3 +545,47 @@ class MediaAnalysisPlugin(Star):
                 elapsed_ms=_elapsed_ms(accept_started),
             )
             return envelope.dumps(envelope.fail_envelope(envelope.ERR_INTERNAL_ERROR))
+
+    @filter.on_llm_request()  # v0.5.2：唯一允许的第二个装饰器（结果一次性注入）
+    async def _inject_media_results(self, event, req) -> None:
+        """把**上一次投递成功**的分析结果拼进本轮的 `req.system_prompt`（SPEC-v0.5.2 §5）。
+
+        为什么是"下一轮 + system_prompt"（而不是当场回给模型）：工具是异步的，
+        `media_analyze` 受理即返回，结果由后台发出的**用户可见消息**承载 —— 模型看不见
+        那条消息。核心自己的"后台结果轮"也是把后台结果拼进 `system_prompt`
+        （`astr_agent_tool_exec.py`）⇒ 这里与核心同形；写 `req.contexts` 会破坏
+        `user/assistant` 交替，写 `conversation.history` 会**落库**，两者都不做。
+
+        三条纪律：
+        1. **一次性**：`result_context.take()` 先整体出队 ⇒ 同一会话只注入一轮；
+        2. **只碰 `system_prompt`**：`req.prompt` / `req.contexts` / `conversation.history`
+           逐字不变（B1–B3 的执行级断言在 `tests/test_context_injection.py`）；
+        3. **绝不外抛**：钩子抛异常会中断整轮请求 —— 宁可这一轮少一段上下文，
+           也不能让用户的消息因为"注脚"而失败（吞掉后只打一条 WARNING，B4）。
+
+        核心契约（4.29.3 `register_on_llm_request` 的 docstring）：必须收
+        `(self, event, req)` 两个参数、必须是协程；返回值被忽略，唯一的终止开关是
+        `event.is_stopped()`（本钩子不碰它）。
+        """
+        try:
+            texts = result_context.take(
+                getattr(event, "unified_msg_origin", "") or "",
+                getattr(req, "prompt", "") or "",
+            )
+            if not texts:
+                return  # 无事可注入 ⇒ 一行日志都不打（§5.7）
+            block = result_context.format_block(texts)
+            # `system_prompt` 的默认值是 `""`，但核心多处按 `or ""` 防御 ⇒ 这里同样防御。
+            req.system_prompt = (
+                (req.system_prompt or "") + "\n\n" + result_context._HEADER + "\n" + block
+            )
+            LOG.info(
+                "media_analysis: result_context inject items=%d chars=%d",
+                len(texts),
+                len(block),
+            )
+        except BaseException as exc:  # noqa: BLE001 —— 钩子吞异常，绝不断掉这一轮请求
+            LOG.warning(
+                "media_analysis: result_context 注入失败（%s），已跳过本轮",
+                type(exc).__name__,
+            )

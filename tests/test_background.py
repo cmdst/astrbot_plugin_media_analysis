@@ -25,7 +25,7 @@ import pytest
 from astrbot.api.message_components import Plain
 
 from astrbot_plugin_media_analysis import analyze as analyze_mod
-from astrbot_plugin_media_analysis import background, envelope, media, settings
+from astrbot_plugin_media_analysis import background, envelope, media, result_context, settings
 from _fakes import FakeContext, RecordingLogger, make_event
 from _rig import build_rig
 
@@ -45,13 +45,15 @@ def _reset_tables() -> None:
 
 @pytest.fixture(autouse=True)
 def clean_background_tables():
-    """清三张表 + 诊断缓冲（不跨用例泄漏并发计数与去重键）。"""
+    """清三张表 + 诊断缓冲 + **待注入结果**（不跨用例泄漏并发计数、去重键与上下文）。"""
     _reset_tables()
+    result_context.clear()
     yield
     for record in list(background._TASKS.values()):
         if record.task is not None:
             record.task.cancel()
     _reset_tables()
+    result_context.clear()
 
 
 # --------------------------------------------------------------------------- #
@@ -990,3 +992,101 @@ async def test_too_many_tasks_is_rejected_at_accept_with_one_route_line(
     # 受理期拒绝**不**由 background 打行（门面才有 `stage=accept` 的职责），
     # 所以这里断言的是"没有多余的 analyze 行"，而受理行在 test_analyze 的门面用例里。
     assert route_lines == [], "受理期拒绝的 route 行归门面；background 不许重复打"
+
+
+# --------------------------------------------------------------------------- #
+# v0.5.2 D3：投递成功后把结果登记成"下一轮上下文"（SPEC-v0.5.2 §5.8 / §6.4）
+#
+# 判据是**执行级**的两面：① 待注入表里到底有没有；② 存进去的文本与投递给用户的
+# 那段**同字节**（同一个局部 `text`）。四条对应 §6.4 判据表的四行。
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_remembers_the_result_only_after_successful_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`send_message → True` ⇒ 交付后该会话有 1 条待注入结果。"""
+    _stub_analyze(monkeypatch)
+    context = FakeContext(send_ok=True)
+    event = make_event(message_id="m-remember-1", umo="aiocqhttp:GroupMessage:777")
+
+    payload = await _submit(context=context, event=event)
+    await background.wait(str(payload["task_id"]), timeout=5.0)
+
+    pending = result_context.take("aiocqhttp:GroupMessage:777", "")
+    assert len(pending) == 1, "投递成功必须登记一条（否则模型下一轮仍然不知道结果）"
+    assert pending[0] in _sent_texts(context)[0]
+
+
+@pytest.mark.asyncio
+async def test_does_not_remember_when_delivery_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """投递抛异常（只 WARNING、不重试）⇒ **不登记**：用户没看到，模型也不该以为发过。"""
+    _stub_analyze(monkeypatch)
+    context = FakeContext(raise_on_send=RuntimeError("平台炸了"))
+    event = make_event(message_id="m-remember-2", umo="aiocqhttp:GroupMessage:778")
+
+    payload = await _submit(context=context, event=event)
+    await background.wait(str(payload["task_id"]), timeout=5.0)
+
+    assert result_context.take("aiocqhttp:GroupMessage:778", "") == []
+    assert context.calls.named("send_message"), "前置：确实尝试过投递"
+
+
+@pytest.mark.asyncio
+async def test_does_not_remember_when_primary_and_fallback_both_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`send_message → False` + `event.send` 也失败 ⇒ `delivered=False` ⇒ 不登记。"""
+    _stub_analyze(monkeypatch)
+    context = FakeContext(send_ok=False)
+    event = make_event(message_id="m-remember-3", umo="aiocqhttp:GroupMessage:779")
+
+    async def _boom(_chain) -> None:
+        raise RuntimeError("兜底也炸了")
+
+    monkeypatch.setattr(event, "send", _boom)
+
+    payload = await _submit(context=context, event=event)
+    await background.wait(str(payload["task_id"]), timeout=5.0)
+
+    assert result_context.take("aiocqhttp:GroupMessage:779", "") == []
+    assert event.sent == [], "前置：兜底确实没发出去"
+
+
+@pytest.mark.asyncio
+async def test_remembers_the_byte_identical_delivered_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§5.8①：登记的文本 == `_deliver` 发出去的那段文本（同一个局部 `text`，不是重渲染）。"""
+    _stub_analyze(monkeypatch)
+    context = FakeContext(send_ok=True)
+    event = make_event(message_id="m-remember-4", umo="aiocqhttp:GroupMessage:780")
+
+    payload = await _submit(context=context, event=event)
+    await background.wait(str(payload["task_id"]), timeout=5.0)
+
+    delivered = _sent_texts(context)[0]
+    pending = result_context.take("aiocqhttp:GroupMessage:780", "")
+    assert pending == [delivered], "登记文本必须与投递文本同字节（含页脚与截断）"
+    assert "\n" in delivered or len(delivered) > 0
+
+
+@pytest.mark.asyncio
+async def test_never_remembers_on_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """取消（`terminate()` / 停止信号）⇒ 不投递、不登记（§5.8⑤：取消路径天然走不到）。"""
+    gate = Gate()
+    _stub_analyze(monkeypatch, gate=gate)
+    context = FakeContext(send_ok=True)
+    event = make_event(message_id="m-remember-5", umo="aiocqhttp:GroupMessage:781")
+
+    payload = await _submit(context=context, event=event)
+    task_id = str(payload["task_id"])
+    task = background._TASKS[task_id].task
+    assert task is not None
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert result_context.take("aiocqhttp:GroupMessage:781", "") == []
+    assert _sent_texts(context) == [], "取消不投递"
