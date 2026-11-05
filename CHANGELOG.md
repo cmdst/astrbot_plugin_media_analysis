@@ -1,10 +1,14 @@
 # CHANGELOG
 
-## v0.5.2 — 2026-10-28（**删路线 C + 一次性结果上下文注入；待评审 / 待推送 / 待部署**）
+> 各版本标题中的「待评审／待推送／待部署」及正文的线上状态是当时记录，不代表当前状态；代码版本、标签、Release 和部署实例分别核对。
+
+## v0.5.2 — 2026-10-28（代码版本：删路线 C + 一次性结果上下文注入）
+
+> 代码版本不等同于正式 Release 或实例部署状态。2026-11-05 远端 `main` 指向 `2ec9bf5`；未发现 v0.5.2 标签或 GitHub Release。实际部署状态应在目标实例单独核对。
 
 **做减法加一处补上下文**：删掉核心原生后台（路线 C，`background.mode=core`），`background.mode` 降级为**隐藏弃用键**（只认 `plugin`，坏值内存归一 + 每进程一条告警，键与磁盘值都保留，计划 v0.6.0 删除）；投递成功后把结果登记为**一次性**上下文，由唯一 `@filter.on_llm_request` 钩子注入**下一轮同会话**的 `system_prompt`（TTL 300 s / 每会话 2 条 / 2400 字；不写 `conversation.history`、不写 `req.contexts`）。**0 新增配置键、0 新增错误码（23 不变）、0 新增 notes 词（43 不变）、0 新增工具参数（仍是 3 个）。**
 
-- **两个提交**：`dd4a149`（`refactor: remove core route`，16 路径）+ `57678a9`（`feat: one-shot result context injection`，13 路径）+ 一笔 docs。
+- **提交边界**：`dd4a149` 删路线 C，`57678a9` 加一次性结果上下文；之后 `76d91be`、`11e8f5b` 整理文档，`2ec9bf5` 修复渲染异常时后台任务表、会话槽及去重键未释放的问题，并新增回归测试。`dd4a149` 本身仍标记为 v0.5.1，版本号在 `57678a9` 改为 v0.5.2。
   跟踪文件 **60 → 56 → 59**（删 `core_mode.py` / `tests/test_core_mode.py` / `tests/test_core_mode_wiring.py` / `tests/_core_shim.py`；加 `result_context.py` / `tests/test_result_context.py` / `tests/test_context_injection.py`）。
 
 ### ① 删除路线 C（核心原生后台）
@@ -17,7 +21,7 @@
 | **`_conf_schema.json`** | `background.mode` 仍在 21 叶内，改成**隐藏弃用键**：`invisible: true`、`options: ["plugin"]`、`labels` 1 条、`default: "plugin"`、新 `hint`（写明 v0.6.0 删除） |
 | **`tools/migrate_config_v05.py`** | `HIDDEN_KEYS` **4 → 5**（+`background.mode`）；**`KEY_ORDER` 21 条一字不动**、该键的动作仍是 `keep`、**不搬值** |
 | **`background.py` / `analyze.py`** | 只改 C 路线相关文案；**错误码 23 / notes 词表 / 信封三形状 / 引擎日志词表 `ENGINE_*` 全部不动** |
-| **为什么这是 no-op** | 那个模式要求宿主核心在 `_PermissionGuardedTool.__init__` 补一行镜像；线上核心（**4.29.3**）没打 ⇒ 它每次加载都打一条 `wrapper_no_mirror` **ERROR** 并内存级回落 `plugin`。删掉它 = **把那条 ERROR 与 441 行死代码一起拿掉**，行为不变 |
+| **兼容影响** | 在历史实测的未打补丁核心上，`core` 模式会告警并回落到 `plugin`；删除后不再触发该探测。其他已打补丁且实际使用 `core` 的实例会改为插件自管后台，不能概括成所有部署都行为不变 |
 
 ### ② 一次性结果上下文注入（`result_context.py`）
 
@@ -36,7 +40,7 @@
 - **一次性**：`take()` **先整体出队** ⇒ 被 TTL 过滤、或用户已把原文贴回来的条目**也不会复活**。
 - **只碰 `system_prompt`**：`req.prompt` / `req.contexts` / `conversation.history` **逐字不变**（后者是**落库**字段）。
 - **绝不外抛**：钩子全身 `try/except BaseException`（连 `CancelledError` 也不上抛）⇒ 失败只打 **1 条 WARNING** 并跳过本轮。理由：核心 `call_event_hook` 会把 handler 异常记成 `[ERRO]` 栈，等于在别人的请求上留脏日志。
-- **判据边界**：`send_message` 成功 / `False` 但 `event.send` 兜底成功 ⇒ **记**；抛异常（不重试）/ 兜底也失败 / 被取消 ⇒ **不记**（用户没看到，模型也不该以为发过）。
+- **判据边界**：`send_message` 返回成功或 `False` 后 `event.send` 兜底成功 ⇒ **登记**；抛异常、兜底失败或取消 ⇒ **不登记**。接口返回成功不等于用户已收到或读到。
 - **`terminate()`** 调 `result_context.clear()`（卸载不留跨生命周期记忆）。
 - **0 新配置键**：四个阈值是**代码常量**（不是配置项）。
 
@@ -49,9 +53,9 @@
 
 ### 门禁
 
-- **全量 `pytest tests/ -q -p no:cacheprovider`：1018 passed / 0 failed / 0 skipped / 0 xfail**（18.85 s；复跑同数）。
+- **历史 C2 基线 `57678a9`**：全量 `pytest tests/ -q -p no:cacheprovider` 为 **1018 passed / 0 failed / 0 skipped / 0 xfail**（18.85 s；复跑同数）。后续 `2ec9bf5` 新增一条渲染失败回归；2026-11-05 在该提交的隔离归档中复跑为 **1019 passed、1 条弃用警告**。
   **算术**：基线 v0.5.1 `7a32b8d` = **1011** → C1 = **969**（`1011 − 52` 删 C 测试 `+ 12` D1 新格 `− 2`：两处 `sorted(glob('*.py'))` 参数化池随模块数 **12→11** 各缩 1 格，**不是丢用例**）→ C2 = **1018**（`+49` = `test_result_context` 28 + `test_context_injection` 13 + `test_background` 5 + `test_registration` 2 + `test_core_imports` 1）。
-- 唯一 warning 是核心 `tencent_record_helper` 的 `audioop` DeprecationWarning（与本插件无关）。`git status --porcelain --ignored` 跑完仍为空。
+- 两次记录中的 warning 均为核心 `tencent_record_helper` 的 `audioop` DeprecationWarning；历史 C2 测试后工作树报告为空，本轮测试在隔离归档中运行。
 - **变异**：M1（删 `system_prompt` 赋值）⇒ **7 failed**；M2（去掉 `core`→`plugin` 归一）⇒ **8 failed**；复原后字节一致并复绿。M3–M7 全红、R1 全绿、R2 只红边界格。
 - 真机探针（核心 **4.29.3** 未打补丁 + `/tmp` 包形态）：`Added llm tool` **1** 次、`OnLLMRequestEvent` 钩子**恰 1 个**、`wrapper_no_mirror`/`core-mode`/`core_mode` 计数 **0**、`ready` 行 **19 字段**且 `background_mode=plugin`。
 
@@ -107,8 +111,9 @@
 ### 迁移（**必须先于重载**）
 
 ```bash
-python3 tools/migrate_config_v05.py --root /root/AstrBot --report   # 干跑：changed=1 keys=21
-python3 tools/migrate_config_v05.py --root /root/AstrBot --apply    # 0600 备份 + 原子落盘
+# 先设置 ASTRBOT_ROOT 并备份插件目录及配置。
+python3 tools/migrate_config_v05.py --root "$ASTRBOT_ROOT" --report   # 干跑：changed=1 keys=21
+python3 tools/migrate_config_v05.py --root "$ASTRBOT_ROOT" --apply    # 0600 备份 + 原子落盘
 # 然后再重载插件一次
 ```
 
@@ -310,7 +315,7 @@ v0.3 的 `File` + `.gif` 已经"进链"了，但是错的那种：`_classify_fil
 
 - `metadata.yaml:version` / `settings.PLUGIN_VERSION` / 本文件顶部条目三处互钉到 **`0.4.0`**。
 - **结果缓存与 L1 探测缓存都会"冷启动"一次**：`PLUGIN_VERSION` 是两者的键分量 ⇒ v0.3 写的
-  条目**永不命中**（无需动作，按 TTL/容量自然淘汰；急可 `rm -rf data/plugin_data/<插件>/cache/`）；
+  条目不会按新版本键命中；过期文件不保证定时删除，需要清理时应核对实例、缓存路径及备份；
   每个视频模型首用会**多做一次 L1 探测**（约 3–20 s，可先跑
   `tools/probe_video_capability.py` 预热）。
 - **部署比 v0.3 简单一档**：覆盖代码 + **一次重载**即可（schema 未变、21 键一个不动 ⇒ 核心不会
@@ -375,10 +380,7 @@ v0.3 的 `File` + `.gif` 已经"进链"了，但是错的那种：`_classify_fil
 - 预算 = `min(compress_target_bytes, max_direct_bytes)`；源已在预算内 ⇒ **0 次转码**。
 - 码率 = `floor(预算×8 / 时长 / 1000) − 64`；`< 64 kbps` ⇒ `video_compress_infeasible`（不硬转）。
 - 产物只落 `/tmp`（`media_analysis_*` 工作目录，`finally` 整目录删）；源文件**只读**。
-- **实测基线**（生产样本只读：5,640,723 B / 48.901 s / 720x1280）：
-  **4 MiB 档 3,873,915 B / 4,207 ms / 1 趟 / 270x480 / 音轨保留**（t4 复测；t8 首测
-  3,939,056 B / 4,810 ms，码率按 48 s 整数算得 635k，实现按 48.901 s 算得 622k）；
-  8 MiB 档源已在预算内 ⇒ **0 趟**；1 MiB 档 **2 趟 → 1,031,801 B**。
+- **历史测试**覆盖了源已在预算内、单趟和双趟转码；结果会随源媒体及环境变化，不作为性能保证。
 
 ### ④ L1 可见性探测（只做这一层）
 
@@ -388,7 +390,7 @@ v0.3 的 `File` + `.gif` 已经"进链"了，但是错的那种：`_classify_fil
   TTL 默认 **7 天**、`0` = 关闭；每个 TTL 窗口**最多自动跑 1 次**（失败也写占位，防打爆）；
   落盘失败静默降级为进程内记忆。
 - **通道类失败不缓存**（F1）：4xx/5xx/DNS/超时只做 60 s 进程内冷却，读到通道类条目视同 miss；
-  **`--clear` / `rm -rf probe/` 对运行中插件最多 5 分钟生效**（内存 memo 上限
+  **CLI `--clear` / 清理磁盘 probe 缓存 对运行中插件最多 5 分钟生效**（内存 memo 上限
   `MEMO_MAX_AGE_S=300`）。
 - **不做体积阶梯探测**：实测两条通道到 47.2 MiB / 36.5 MiB 都 200（0 次拒绝）⇒ "体积上限"
   不是事实，真正先撞的是延迟（9.4 MB≈43 s、18.6 MB≈91 s、38.3 MB≈193 s）。
@@ -429,7 +431,7 @@ video_provider_id | vision_provider_id | video_fp | PLUGIN_VERSION`；`mode` 与
   TTL（7 天）；**本地环境类**（`no_font`/`ffmpeg_missing`/`build_failed`）**1 小时**；
   **通道类**（4xx/5xx/timeout/dns）**不缓存**（与 F1 同一套口径，`cache_ttl_for()`）。
 - **F2（记忆穿透）**：`probe._MEMO` 命中改为**过两道时效**（条目 TTL + `MEMO_MAX_AGE_S`=5 min），
-  `ProbeStore.clear()` **连记忆一起清** —— 此前 `--clear` / `rm -rf probe/` 对运行中的插件无效。
+  `ProbeStore.clear()` **连记忆一起清** —— 此前 CLI `--clear` / 清理磁盘 probe 缓存 对运行中的插件无效。
 - **F10（不许抛给模型）**：`video_native` 的每一层属性访问改走兜底 `getattr`（`provider.client`
   是会抛异常的 property 也只算"没有原生通道"）⇒ `video_native_unavailable`，不再落 `INTERNAL_ERROR`。
 - 用例：`tests/` +17（F7 成本不变式、F4 两种静音形态、F6 注入时钟 + `budgeted_timeout` 参数化（**该纯函数表已被批次三换成 spy 接线用例**）、
@@ -491,7 +493,7 @@ video_provider_id | vision_provider_id | video_fp | PLUGIN_VERSION`；`mode` 与
 2. **mimo 建议 `native_max_tokens=4096`**：8 MiB + 长提示词在 **1024 / 2048** 下会 200 但
    正文为空（`video_native_empty`；护栏会回退，但等于白花一次调用钱）。默认 2048 只够
    Gemini 类通道；**mimo 请设 4096**，或把直送门槛留在 **4 MiB**。
-3. **原生没有体积上限，但有延迟上限**：47.2 MiB 也能过，但 8 MiB ≈ 45.6–50.4 s、16 MiB 93.2 s、
+3. **历史测试不能证明没有体积上限**：47.2 MiB 的样本通过，但 8 MiB ≈ 45.6–50.4 s、16 MiB 93.2 s、
    32 MiB 208.4 s，而全局预算 100 s ⇒ **>8 MiB 直送不安全**（能过 ≠ 来得及）。默认
    `video.max_direct_bytes = 8 MiB`（钳 **1–32 MiB**）是按延迟定的，不是 provider 上限。
 
@@ -643,7 +645,7 @@ video_provider_id | vision_provider_id | video_fp | PLUGIN_VERSION`；`mode` 与
 
 - **库内门禁（v0.2.0 交付面，历史）**：`e9ad82b` 起 **442 passed / 0 failed / 0 skipped / 0 xfail**；
   `tests/` 18 个文件已入库（含 `test_version.py` 的版本/仓库守卫、`MAPPING-v02.md` 的 113 条旧用例
-  逐条映射）。**当前最新**是 v0.3.0 的 **695 passed @ `44aa2c8`**（代码/测试基线，见上文 v0.3.0 条目）。
+  逐条映射）。后续 v0.3.0 的历史测试基线为 **695 passed @ `44aa2c8`**，不代表当前测试结果。
 - **上游仓库**：`https://github.com/cmdst/astrbot_plugin_media_analysis` 公开、默认 `main`；
   **`main` 已于 2026-10-23 09:39 推送到 `d9628a4`**（远端 sha == 本地，`git ls-remote` + 匿名
   `clone` 双向复核）。v0.3.0 的推送**不在本版**，归下一单（推送目标见 v0.3.0 派单 §10）。
@@ -705,13 +707,7 @@ video_provider_id | vision_provider_id | video_fp | PLUGIN_VERSION`；`mode` 与
 
 首个版本。单工具 `media_analyze`，音轨优先 + 抽帧按需。
 
-> 状态：库 `main` 的 **v0.1 代码/测试基线** = 提交 `16e0eea`（9 笔提交）；本文件与 `README.md` 的
-> 修订作为其后的**文档提交**落库（只动这两份文档，代码面逐字节不变）。**无远端、未 push**；生产
-> `/root/AstrBot/data/plugins/astrbot_plugin_media_analysis` **不存在**，`pin-check.sh` 无本插件条目
-> ⇒ 「未安装」是实测事实，不是"大概没装"。安装归 fix + 人，派单见
-> `/root/workspace/astrbot/handoff/lanes/dev/20261022-order-fix-deploy-media-analysis-v0.1.0.md`。
-> （**后话**：2026-10-23 00:58 该派单被执行，生产装上了 v0.1.0；2026-10-23 23:10:20 换到 v0.2.0。
-> 上面这句只对 2026-10-22 成立；当前生产状态见本文件顶部 v0.3.0 条目与 `AGENTS.md` §4。）
+> 历史基线：v0.1 代码与测试对应 `16e0eea`，后续 README 与 CHANGELOG 的文档修订没有改变该代码面。最初记录的未安装状态仅适用于当时；部署实例的当前状态应另行核对。
 
 ### 能力
 

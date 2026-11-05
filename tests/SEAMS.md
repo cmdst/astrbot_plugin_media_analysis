@@ -1,5 +1,7 @@
 # SEAMS — 让测试不碰网络、不碰真实 provider 的注入点清单
 
+> **历史快照（v0.1）**：下文接口、测试数字和实现要求记录早期设计，不是当前接口契约；例如 STT、布尔参数及缓存实现已变化。当前行为以源码、当前测试和版本文档为准。运行探针时必须使用隔离的 `ASTRBOT_ROOT`。
+
 面向 `builder`。每一行都能指到 `SPEC.md` 的**冻结签名**：只要那一条按 SPEC 写，测试就能
 零网络、零真实 provider、零真实群媒体地覆盖它；反过来，写成"import 期绑死 / 全局单例 /
 默认参数捕获常量"的形态，测试就只能靠真机跑，回归价值为零。
@@ -15,11 +17,16 @@
 | `test_fixtures.py` | 地基自检（29 条；**不 import 插件模块**，含「套件里不许挂 xfail」守卫） |
 | `SEAMS.md` | 本文件 |
 
-跑法（与 `AGENTS.md` §3 一致）：
+跑法（先设置 `PROJECT_ROOT` 为插件库目录、`PYTHON` 为包含测试依赖与 AstrBot 的解释器；这些命令及数字为历史示例）。每次先创建独立临时根，避免继承实际实例路径：
 
 ```bash
-cd /root/workspace/projects/astrbot_plugin_media_analysis && \
-  PYTHONDONTWRITEBYTECODE=1 /root/AstrBot/.venv/bin/python -m pytest tests/ -q -p no:cacheprovider
+ISOLATED_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/media-test-root.XXXXXXXX")
+export ASTRBOT_ROOT="$ISOLATED_ROOT"
+```
+
+```bash
+cd "$PROJECT_ROOT" && \
+  ASTRBOT_ROOT="${ISOLATED_ROOT:?先创建隔离根}" PYTHONDONTWRITEBYTECODE=1 "$PYTHON" -m pytest tests/ -q -p no:cacheprovider
 ```
 
 ---
@@ -167,21 +174,14 @@ python3 tests/make_fixtures.py --force      # 全量重造
 
 ## 3. 安全与"不写生产树"的两条实测
 
-1. **只 import 核心不写生产**（2026-10-22 实测）：把 `/root/AstrBot/data/cmd_config.json`
-   复制到 `ASTRBOT_ROOT=/tmp/x2` 后 import `astrbot.api.star` / `astrbot.core.provider.*`，
-   前后 `sha256` **完全一致**（`24cd843e…`）⇒ 纯 import 无副作用。
-2. **但构造 `AstrBotConfig` 会回写**：核心 `AstrBotConfig.__init__` 会跑
-   `migrate_config_on_load()`（`astrbot/core/config/astrbot_config.py:18` →
-   `astrbot/core/utils/migra_helper.py:317`），迁移完**保存** `<root>/data/cmd_config.json`。
-   所以 `conftest.py` 在任何 `import astrbot` 之前把 `ASTRBOT_ROOT` 钉到
-   `/tmp/media_analysis_testroot`（除非外部已显式设置）。**测试里任何"加载插件配置"的
-   用例都必须走这条路**，否则等于改生产配置（本 lane 红线）。
+1. 历史隔离实验中，仅导入部分核心模块没有改写测试配置；这不是对所有版本或导入路径的保证。
+2. **构造 `AstrBotConfig` 可能触发配置迁移和回写**。运行测试或探针时应在导入核心前指定隔离的 `ASTRBOT_ROOT` 和工作目录，不要指向真实实例。`conftest.py` 在未显式设置时使用临时测试根目录。
 
 ---
 
 ## 4. 桩（`_astrbot_stub.py`）的边界
 
-- **正常门禁走真核心**：`/root/AstrBot/.venv/bin/python` 里 `astrbot` 就是部署树，
+- **正常门禁走真核心**：`${PYTHON}` 里 `astrbot` 就是部署树，
   `Record.fromFileSystem` / `Video.fromFileSystem` / `isinstance(x, STTProvider)` 都是真类型面
   （`SPEC.md:977` 的实测）。`conftest.py` 的 `pytest_report_header` 首行会打印
   `backend=real-core`，跑门禁时一眼可查。
@@ -215,20 +215,21 @@ python3 tests/make_fixtures.py --force      # 全量重造
 **① 空测试也能跑**（t3 的完成条件之一：conftest 不依赖任何插件源码）
 
 ```bash
-R=/root/workspace/projects/astrbot_plugin_media_analysis/tests
-rm -rf /tmp/ground-empty && mkdir -p /tmp/ground-empty/tests
-cp "$R"/{conftest.py,_fakes.py,_astrbot_stub.py,make_fixtures.py} /tmp/ground-empty/tests/
-printf 'def test_noop():\n    assert True\n' > /tmp/ground-empty/tests/test_empty.py
-cd /tmp/ground-empty && PYTHONDONTWRITEBYTECODE=1 \
-  /root/AstrBot/.venv/bin/python -m pytest tests/ -q -p no:cacheprovider
+R="${PROJECT_ROOT:?请设置项目根目录}/tests"
+T=$(mktemp -d "${TMPDIR:-/tmp}/ground-empty.XXXXXXXX")
+mkdir -p "$T/tests"
+cp "$R"/{conftest.py,_fakes.py,_astrbot_stub.py,make_fixtures.py} "$T/tests/"
+printf 'def test_noop():\n    assert True\n' > "$T/tests/test_empty.py"
+cd "$T" && ASTRBOT_ROOT="${ISOLATED_ROOT:?先创建隔离根}" PYTHONDONTWRITEBYTECODE=1 \
+  "${PYTHON:?请设置测试 Python}" -m pytest tests/ -q -p no:cacheprovider
 # → 1 passed；报告头第一行是 backend=real-core
 ```
 
 **② 地基自检 + 夹具形状**（本任务交付的那套 28 条，**不 import 插件模块**）
 
 ```bash
-cd /root/workspace/projects/astrbot_plugin_media_analysis && \
-  PYTHONDONTWRITEBYTECODE=1 /root/AstrBot/.venv/bin/python -m pytest tests/test_fixtures.py -q -p no:cacheprovider
+cd "$PROJECT_ROOT" && \
+  ASTRBOT_ROOT="${ISOLATED_ROOT:?先创建隔离根}" PYTHONDONTWRITEBYTECODE=1 "$PYTHON" -m pytest tests/test_fixtures.py -q -p no:cacheprovider
 # → 28 passed in 1.41s（实测；从 /tmp 用绝对路径跑同样 28 passed ⇒ 不依赖 cwd）
 ```
 
@@ -242,9 +243,9 @@ python3 tests/make_fixtures.py --force    # 全量重造（实测 1.45 s）
 **④ 这套 `sys.path` 形态确实能按包导入插件**（builder 的测试会依赖它）
 
 ```bash
-cd /tmp && ASTRBOT_ROOT=/tmp/media_analysis_testroot PYTHONDONTWRITEBYTECODE=1 \
-  PYTHONPATH=/root/workspace/projects:/root/workspace/projects/astrbot_plugin_media_analysis/tests \
-  /root/AstrBot/.venv/bin/python -c "
+cd /tmp && ASTRBOT_ROOT="${ISOLATED_ROOT:?先创建隔离根}" PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONPATH="$(dirname "$PROJECT_ROOT"):$PROJECT_ROOT/tests" \
+  "$PYTHON" -c "
 import astrbot_plugin_media_analysis.main as m
 from astrbot.core.provider.register import llm_tools
 t = llm_tools.get_func('media_analyze')
@@ -254,15 +255,4 @@ print(m.__package__, bool(t), sorted(t.parameters['properties']), sorted(t.param
 
 **⑤ 一条给全队的提醒（不是本任务的产物，但踩的是同一条红线）**
 
-实测：`2026-10-22 04:55:24` 与 `04:55:42`，生产 `/root/AstrBot/data/cmd_config.json`
-被**回写**过两次（文件与目录 mtime 同时变）；结果是核心的 v5 迁移落地
-（`config_version = 5`、`provider_settings.computer_use_local_permissions.*` 被补进来、
-`image_compress_*` 两个叶子被核心迁移摘掉，26 个 provider 未变）。
-
-- 触发条件：**在 `cwd = /root/AstrBot` 或未设 `ASTRBOT_ROOT` 的情形下构造 `AstrBotConfig`**
-  （`get_astrbot_root()` 默认取 `os.getcwd()`，`astrbot/core/utils/astrbot_path.py:30-36`）。
-- 已排除"纯 import"：把同一份配置复制到 `ASTRBOT_ROOT=/tmp/x2` 后 import
-  `astrbot.api.star` / `astrbot.core.provider.*`，前后 `sha256` 一致（`24cd843e…`）。
-- 服务没有重启（`ActiveEnterTimestamp=2026-10-22 02:34:10`，SubState=running）⇒ 不是服务自己写的。
-- 本任务全程 `ASTRBOT_ROOT=/tmp/media_analysis_testroot`（`conftest.py` 强制），未碰生产。
-- 结论：**做任何探测都先钉 `ASTRBOT_ROOT`**；`conftest.py` 已经这么做了，临时脚本请照抄。
+历史排查曾发现构造核心配置对象会触发迁移并写回目标根目录配置。**结论：探针和测试先设置独立的 `ASTRBOT_ROOT` 与工作目录**；检查当前核心版本的路径行为，不以一次历史导入实验推断所有导入都无副作用。
