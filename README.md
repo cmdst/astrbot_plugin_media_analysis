@@ -1,34 +1,36 @@
 # astrbot_plugin_media_analysis
 
-上游仓库：<https://github.com/cmdst/astrbot_plugin_media_analysis>（**v0.5.2**）
+仓库：<https://github.com/cmdst/astrbot_plugin_media_analysis>（本代码快照版本 **v0.5.2**）
 
-给 LLM 一个工具 `media_analyze`：把**当前消息或引用消息**里的语音/视频/GIF
-（**含以「群文件」形式投递的 mp4/m4a/silk/gif…**）交给多模态模型。**工具调用是异步的**：
-受理即返回，分析在后台跑完再**唯一投递**一条结果消息（v0.4）；**v0.5.2 起，这条结果还会在
-"下一轮同一会话"的请求里以一次性上下文被模型自己看见**（见下面的 v0.5.2 小节）。**视频的主路径是「原生视频直送」**——
-整段 mp4 以内联 base64 一次调用同时拿画面与声音；只有**视频模型**不可用（没配 / 非
-`openai_chat_completion` 适配器 / L1 未通过）、超过直送门槛且压不下去、原生调用失败时，
-才**回退**到「抽帧 + 独立的图片模型」。返回固定形状的 JSON 信封；
-解析结果**本地缓存带 TTL**，同一媒体二次引用不再花 token。
+给 LLM 提供 `media_analyze` 工具，分析当前消息或引用消息里的语音、视频和 GIF，也支持以群文件形式投递的媒体。工具先返回受理回执，后台完成后尝试发送一条结果消息；**最多发送一次，不保证送达**。投递接口报告成功时，结果可在同一会话下一次符合条件的模型请求中作为一次性上下文使用。
 
-存在的理由很朴素：AstrBot 里**没有任何 provider 支持 `video` 模态**（`modalities` 含
-`video` 的 0 个），而 `Record` 到手已是本地 wav、`Video` 一行 `convert_to_file_path()`
-就是本地文件、群文件一行 `file_`/`url` 就能拿到 —— 硬件条件齐了，缺的只是
-"把视频降维成模型能吃的东西"这一段编排。
+视频优先尝试原生直送；原生不可用时，是否抽帧取决于 `include_frames`、视频和视觉模型配置及剩余预算。默认 `auto` 且未配置视频模型时不会抽帧：有音轨可尝试转写，无音轨则可能失败。结果缓存仅在相同缓存键命中且未过期时节省后续模型调用，并非每次引用都命中。
 
-## v0.5.2 改了什么（**删掉原生后台引擎 + 结果会在下一轮被模型看见**）
+## 安装与快速开始
+
+1. 在 AstrBot 插件管理中用上面的仓库地址安装。以 **2026-11-05** 的远端检查为准，默认分支 `main` 指向 `2ec9bf5`，其版本字段为 `v0.5.2`；默认分支将来可能变化。普通 GitHub 仓库地址由安装器下载仓库归档；其他 Git 地址可能使用浅克隆，具体取决于宿主版本和输入地址。
+2. 如需固定历史版本，可浏览标签 [`v0.5.1`](https://github.com/cmdst/astrbot_plugin_media_analysis/tree/v0.5.1) 对应源码；该链接用于浏览，不保证安装器把它当作 tag。固定版本可从该标签下载源码归档或检出后手动安装，并阅读标签内的文档；它不是本 README 描述的 v0.5.2。版本字段不足以唯一标识提交；从源码取件时同时记录提交 SHA。
+3. 确认安装目录名为 `astrbot_plugin_media_analysis`，兼容版本要求为 AstrBot `>=4.29,<5`，并确保 `ffmpeg`、`ffprobe` 在 PATH。核对安装目录中的 `metadata.yaml`，不要把版本号当成代码 SHA 的证明。
+4. 在插件配置里选择支持音频的对话模型；需要原生视频时另选支持视频输入的兼容模型。若要强制尝试抽帧，配置视觉模型并请求画面。人格使用工具白名单时需包含 `media_analyze`。
+5. 发送语音、视频或 GIF，向助手提问例如「请概括这段视频」；也可引用消息后提问。工具受理后等待后台结果，失败、取消或平台投递异常时可能收不到消息。
+
+升级或降级前备份插件目录和配置；跨版本的配置迁移顺序见下文「部署与迁移」，尤其 v0.4.2 → v0.5.1 的配置改名必须在重载前迁移。不同宿主和模型的可用能力应自行验证。
+
+> **历史说明**：下文各版本变更、实测数字和旧迁移步骤记录当时的代码与环境，不代表当前部署状态。查看旧版时以相应标签中的文件为准；跨多个版本升级不要直接照搬单一版本之间的步骤。
+
+## v0.5.2 改了什么（删除原生后台引擎 + 一次性结果上下文）
 
 **0 新增配置键 / 0 新增错误码（23 条不变）/ 0 新增 notes 词（43 不变）/ 0 新增工具参数（3 个不变）。**
 本版只做两件事，一件是减法、一件是补上下文：
 
 | # | 变更 | 一句话 |
 |---|---|---|
-| ① | **原生后台引擎（路线 C）已删除** | 之前那个「交给我跑、由核心自己的后台机制交付」的可选模式**没有了**。现在**只有一种后台实现**：插件自管 —— 受理即返回、跑完自己发**恰好一条**结果消息（含失败终态、去重、并发上限）。**行为上没有变化**：那个模式一直要求宿主核心打一行补丁，而线上核心没打 ⇒ 它每次都自动回落到插件自管。删掉它等于**把一条每次加载都刷的 ERROR 和 441 行死代码一起拿掉** |
-| ② | **结果会在下一轮对话里被模型看见** | 之前工具的异步结果只发给**用户**，**模型自己看不见** ⇒ 用户紧接着追问「刚才那个视频说了什么」，模型只能让用户重发、或者更糟地现编。现在：投递成功后插件把结果登记为**一次性上下文**，由唯一的 `on_llm_request` 钩子注入**下一轮同一会话**的 system prompt。**TTL 5 分钟 / 每会话最多 2 条 / 总长 2400 字**；**同一批结果只注入一次**（第二、第三轮不再重复）；**不写会话历史、不写 `contexts`**（只影响"这一轮模型看到什么"，不污染落库记录） |
+| ① | **原生后台引擎（路线 C）已删除** | 之前那个「交给我跑、由核心自己的后台机制交付」的可选模式**没有了**。现在**只有一种后台实现**：插件自管 —— 受理即返回，跑完尝试发送一条结果消息（含失败终态、去重、并发上限；不保证送达）。对于未打镜像补丁而回落到插件模式的宿主，删除后不再出现原先的探测 ERROR；曾经实际使用核心模式的宿主则会有行为变化 |
+| ② | **一次性结果上下文** | 投递接口报告成功后，插件登记结果，在同一会话下一次符合条件的 `on_llm_request` 请求中注入 system prompt。**TTL 5 分钟 / 每会话最多 2 条 / 正文总长 2400 字**；取出后不重复注入，也不直接写入会话历史或 `contexts`。过期、重复过滤或钩子失败时不保证注入 |
 | ③ | **`background.mode` 变成隐藏的弃用键** | 键**还在**（21 叶不变）、**磁盘上的值也保留**，只是面板不再显示，且**只认 `plugin`**。配置文件里若仍是 `core`：插件**只在内存里按 `plugin` 处理**并打**一条** WARNING（不改配置文件、不落盘、不在日志里回显值）。**计划 v0.6.0 删除这个键** |
 
 **升级很轻**：**21 叶没变 ⇒ 没有迁移脚本、没有迁移步骤**。备份 → 覆盖代码 → **重载一次** → 五项复验（见「部署与迁移 → v0.5.1 → v0.5.2」）。
-**行为面唯一的变化**是 `background.mode` 的坏值处理（`core` 从"合法枚举"变成"非法值"），其余全部是"删掉没人用的分支"。
+**行为变化**包括删除 `core` 路线、将 `core` 作为弃用值回落为 `plugin`，以及新增一次性结果上下文注入；不能把它们概括成对所有部署均无变化。
 **版本号 bump 的连带**照旧：结果缓存与视频能力探测缓存都会失效一次（每个视频位首用多一次探测，3–20 s，属预期）。
 
 ## v0.5.1 改了什么（**配置面重做 + 六个运行面缺陷**）
@@ -36,7 +38,7 @@
 | # | 变更 | 一句话 |
 |---|---|---|
 | ① | **配置 22 叶 → 21 叶 / 6 组** | 三个字节键**改名成 MB**（`video.max_direct_mb` / `video.compress_target_mb` / `limits.max_media_mb`，**1 MB = 1,048,576 字节**）；删 `native_max_tokens` / `native_timeout_seconds`（值进代码常量 4096 / 60 s）；新增 **`limits.audio_timeout_seconds`**（默认 60，**10–95**）；**隐藏** 4 键（`stt_provider_id` / `probe_enabled` / `probe_ttl_seconds` / `compress_timeout_seconds`，键与值都保留）；`background` 组**置顶**、`prompts` 组**置末** ⇒ `video` 只剩 3 行可见 |
-| ② | **D1 音频超时可配 + 恰好重试一次** | 硬编码 60 s → 配置项；超时只重试**一次**，总耗时仍 ≤ 100 s；`log_detail` 能分辨 `first_timeout` / `retry_timeout` / `retry_skipped=budget`；**要画面时（`soft_timeout`）语义一字不变**；provider 抛错不重试 |
+| ② | **D1 音频超时可配 + 符合条件时最多重试一次** | 硬编码 60 s → 配置项；超时只重试**一次**，总耗时仍 ≤ 100 s；`log_detail` 能分辨 `first_timeout` / `retry_timeout` / `retry_skipped=budget`；**要画面时（`soft_timeout`）语义一字不变**；provider 抛错不重试 |
 | ③ | **D2 唤醒轮短路** | 后台任务失败后的「唤醒轮」消息链恒空 ⇒ 模型重试必然 `MEDIA_NOT_FOUND` 并把超时说成"文件丢了"。现在合成事件**直接返回专用 hint**（`HINT_MEDIA_NOT_FOUND_WAKE`），**不提交后台任务、不产生 task_id**；检测 **fail-open** |
 | ④ | **C7 `route=` 观测行** | 每次调用（含失败与缓存命中）**恰一行** `media_analysis: route=… stage=… engine=… kind=… fallback=… cached=… …`，A2 / C 双引擎都覆盖 ⇒ **一条 grep 取代翻缓存信封**；`delivered=` 仍只归 A2 的 `bg finished`；该行**不写 notes**（缓存中立） |
 | ⑤ | **加载期三条一致性告警** | `config-check warn=timeout_over_budget`（**raw** 值 > 95，只可能是手改 JSON）/ `compress_target_ge_075_direct` / `max_direct_over_suggested`。只 WARN、每 id 每进程至多一条、**不改配置** |
@@ -70,7 +72,7 @@ native 生效超时 **61.4 → 60.0 s**（常量）／`compress_target_mb` 默�
 判断对本插件**不成立**，已按事实更正）：
 
 1. **投递不确定**：C 的发声靠唤醒轮模型主动调 `send_message_to_user`；没调时核心只打一条
-   WARNING ⇒ 从"恰好一次"退化为"大概率一次"（**这是第一理由**，且不可消除）。
+   WARNING；即使插件自管路径也只能尽力、至多投递一次，不能保证用户收到。
 2. **多一轮主 Agent**：每条后台任务多一轮完整模型调用（历史重放 + 信封进 system prompt）。
 3. **3600 s 硬编码 + 无闸**：核心那层超时改不了；且 C 模式下去重 / 并发闸 / 预算闸
    **全部不存在**（插件不能再持表，否则就是被否决的"混合模式"）。
@@ -158,8 +160,8 @@ native 生效超时 **61.4 → 60.0 s**（常量）／`compress_target_mb` 默�
   两条 argv：上面的冻结版给**多帧**源；**单帧**源用静止变体（`gif_static_argv`，滤镜里多一个
   `tpad` 前置），见下两条。
 - **四道闸**：源字节（`limits.max_media_mb`）/ 源时长（`limits.max_media_seconds`，
-  复用源时长探测 `probe_gif_duration_s`）/ 整次 ffmpeg **≤ 10 s** / 产物非空、不超上限、
-  **时长可度量**。失败码：体积 `MEDIA_TOO_LARGE`、时长 `MEDIA_TOO_LONG`、转换 `GIF_CONVERT_FAILED`。
+  复用源时长探测 `probe_gif_duration_s`）/ 整次 ffmpeg **≤ 10 s** / 产物非空、不超上限且有视频流。
+  有流但时长不可度量的产物按下文所述放行；失败码包括 `MEDIA_TOO_LARGE`、`MEDIA_TOO_LONG` 和 `GIF_CONVERT_FAILED`。
 - **单帧 GIF 走「1 s + 12 fps 克隆帧」静止变体**（真机 F2/F2-R/F2-S 的最终修法，`gif_static_argv`）：
   冻结 argv 的 `fps=12` 按输出帧间隔的**中点**取帧，源帧只保持 **0.04 s**（`ffmpeg -frames:v 1`
   的默认值，也就是绝大多数静态 GIF）时**整帧被跳过** ⇒ 产物是 262 字节、**0 个流**的空 mp4；
@@ -196,21 +198,22 @@ native 生效超时 **61.4 → 60.0 s**（常量）／`compress_target_mb` 默�
 
 | 事实 | 判据 |
 |---|---|
-| **平台会把真动图原样落盘** | `/root/AstrBot/data/temp/media_image_20261026044400746_affe.gif` = **1,331,920 B**，前 6 字节 `474946383761`（= `GIF87a`），`ffprobe -count_frames` ⇒ **15 帧 / 402x570 / 0.900 s** ⇒ `Image(GIF)` 的**魔数候选结构可达** |
-| **"这次没分析"不是插件拒收** | 同一轮的 core 日志里**没有** `使用工具：media_analyze` ⇒ **模型没调用工具**（插件只记录被调用的轮次，没被调用时日志里连 `media_analysis: route=` 都没有） |
-| **也有"被平台压成静态图"的情形** | 2026-10-26 02:46 那两条是 `media_image_*.jpg`（5,695 / 5,938 B）⇒ 那时按普通图片 `MEDIA_NOT_FOUND`，**属设计**（图片不进本插件） |
+| **平台可能保留真动图** | 历史样本落盘后具有 `GIF87a` 魔数且包含多帧，说明 `Image(GIF)` 候选结构在该次测试中可达；不代表所有平台或消息都相同 |
+| **"这次没分析"不一定是插件拒收** | 若目标消息对应的核心日志中没有工具调用记录，应先检查模型是否调用了 `media_analyze` |
+| **平台也可能转成静态图** | 若实际收到的是普通 JPEG 等图片，插件不会按 GIF 分析；应核对实际收到的文件内容，而非只看扩展名 |
 
 ⇒ 正确说法是：**GIF 能到插件**；断点可能在**模型不为"图片"调用本工具**，也可能在**平台压缩**（逐条消息而异）。
 判据只看两处结构化日志：`使用工具：media_analyze`（core）与 `media_analysis: route=`（插件）。
 复核命令：
 
 ```bash
-ls -la /root/AstrBot/data/temp/media_image_*.gif | tail -3
-head -c 6 /root/AstrBot/data/temp/media_image_20261026044400746_affe.gif | xxd -p   # 474946383761 = GIF87a
+# 设置 SAMPLE_GIF 为获准检查的样本，ASTRBOT_ROOT 为实例根目录。
+head -c 6 "$SAMPLE_GIF" | xxd -p   # GIF87a 或 GIF89a 的魔数
 ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames \
-        -of default=noprint_wrappers=1 <那个 .gif>
-grep -a -c '使用工具：media_analyze' /root/AstrBot/data/logs/astrbot.log     # 0 ⇒ 那一轮模型没调
-grep -a 'media_analysis: route=' /root/AstrBot/data/logs/astrbot.log | tail -3
+        -of default=noprint_wrappers=1 "$SAMPLE_GIF"
+grep -a '使用工具：media_analyze' "$ASTRBOT_ROOT/data/logs/astrbot.log"
+grep -a 'media_analysis: route=' "$ASTRBOT_ROOT/data/logs/astrbot.log" | tail -3
+# 将日志限定到目标消息对应的时间窗口，不能用全文件计数代替逐轮判断。
 ```
 
 
@@ -221,8 +224,8 @@ grep -a 'media_analysis: route=' /root/AstrBot/data/logs/astrbot.log | tail -3
 | 形状 | 何时 | 键 | 模型能看到吗 |
 |---|---|---|---|
 | **受理** | 任务已登记 | `ok` / `state` / `task_id` / `hint`（**恰好 4**，`state ∈ {accepted, running}`） | 是 |
-| 成功 | 分析完成 | 9 键（`kind`/`duration_s`/`transcript`/`frames`/`summary`/`notes`/`elapsed_ms`/`cached`/`ok`） | **否**——渲染成一条中文消息发给**用户** |
-| 失败 | 受理前 / 任务内 | `ok` / `error` / `hint`（恰好 3） | 受理前的直接看到；任务内的**变成**一条失败消息 |
+| 成功 | 分析完成 | 内部结果为 9 键（`kind`/`duration_s`/`transcript`/`frames`/`summary`/`notes`/`elapsed_ms`/`cached`/`ok`） | 不作为工具的同步返回值；渲染文本投递接口报告成功后，可能一次性注入同会话下一次请求 |
+| 失败 | 受理前 / 任务内 | `ok` / `error` / `hint`（恰好 3） | 受理前同步返回；后台失败时尝试投递失败文本，投递成功后也可能注入后续请求 |
 
 - **去重**：同一条消息、同一组参数、同一个会话再调一次 ⇒ 返回**同一个 `task_id`**
   （`state="running"`），不新建任务；拿不到 `message_id` 时去重关闭。
@@ -233,18 +236,17 @@ grep -a 'media_analysis: route=' /root/AstrBot/data/logs/astrbot.log | tail -3
 - **取消**：`terminate()` 取消全部任务并等它们收尾（不留持有 `event` 的孤儿 task）；
   取消**不投递**任何消息。
 - **不持久化**：进程重启/插件重载丢掉进行中的任务（用户侧＝"没有结果消息"），重发媒体即可。
-- **`/reset` 或用户打断不取消**后台任务（工作已付费，静默丢弃更糟），结果照常投递。
+- **`/reset` 或用户打断不取消**后台任务；任务完成后仍会尝试投递，但不保证送达。
 
 > **v0.5.2 起**：上面这套是**唯一**的后台实现（另一条「核心原生后台」路线已删除）。
-> **结果同时会被模型看见**：投递成功（用户那边确实收到了一段文本）后登记一次性上下文，
-> 由 `on_llm_request` 钩子在**下一轮同一会话**注入 system prompt。判据边界写死在代码里 ——
-> 投递失败 / 兜底也失败 / 被取消 ⇒ **不登记**（用户没看到，模型也不该以为发过）。
+> **结果可能被模型看见**：投递接口报告成功后登记一次性上下文，
+> 由 `on_llm_request` 钩子在同一会话的下一次符合条件的请求中注入 system prompt。
+> 接口返回成功不等于终端用户确认收到；投递失败或取消时不登记。
 > 详细语义见本文件「结果上下文（v0.5.2）」一节。
 
 ### 结果上下文（v0.5.2 新增）
 
-工具是异步的：模型拿到的是**受理回执**，结果由后台消息发给**用户** ⇒ 模型自己**看不到**那条消息。
-本版补上这一步：**投递成功后**把结果登记为「待注入」，在下一次请求时挂进 system prompt。
+工具异步执行：模型先拿到**受理回执**，后台尝试发送结果消息。本版在投递接口报告成功后登记「待注入」文本；后续同会话请求符合条件时才可能注入 system prompt。过期、重复过滤或钩子不适用等情形不会注入。
 
 | 项 | 值 | 说明 |
 |---|---|---|
@@ -257,7 +259,7 @@ grep -a 'media_analysis: route=' /root/AstrBot/data/logs/astrbot.log | tail -3
 | 写哪里 | **只写 `req.system_prompt`** | **绝不写** `req.prompt`（那是用户这句话）、`req.contexts`、会话历史（`history` 是**落库**字段） |
 | 失败时 | 只打一条 WARNING、**放弃这一轮注入** | 注入永不抛异常、绝不因为"注脚"影响正常回复 |
 | 日志 | `media_analysis: result_context inject items=<n> chars=<n>` | 不含正文、不含会话 id；**无事可注入时一行都不打** |
-| 判据 | 投递**成功**才登记 | `send_message` 失败且兜底也失败 / 抛异常 / 被取消 ⇒ **不登记**（用户没看到，模型也不该以为发过） |
+| 判据 | 投递接口报告成功才登记 | 找不到平台且兜底失败、抛异常或取消时不登记；接口成功不等于用户已收到或读到 |
 
 **已知边界**（设计如此，不是缺陷）：① 同一轮里模型可能连续请求多次，注入落在"续轮"也算生效
 （契约是"该会话的下一次请求"）；② 定时/主动唤醒轮**不**触发该钩子 ⇒ 待注入条目会留给用户下一句话；
@@ -271,7 +273,7 @@ grep -a 'media_analysis: route=' /root/AstrBot/data/logs/astrbot.log | tail -3
 | ② | **抽帧降级为回退** | 原生不可用 / 超门槛压不动 / 调用失败时才抽帧；`vision_provider_id` 语义收窄为"仅回退用的图片模型" |
 | ③ | **三模型位** | `video_provider_id`（原生视频，**新增**）+ `vision_provider_id`（仅抽帧）+ `audio_provider_id`（音轨） |
 | ④ | **超门槛先压缩** | 默认 8 MiB 直送门槛（v0.5.1 起是 `video.max_direct_mb = 8`；按**延迟**定，不是 provider 上限）；ffmpeg 480p + ABR + AAC 64k mono，最多 2 趟，产物只落 `/tmp` |
-| ⑤ | **L1 可见性探测** | 4 s 合成小样片 + "数字=?,单词=?"（**双 token 都命中**才算过，200 ≠ 看见）；探测结论缓存 7 天，每窗口最多自动 1 次 |
+| ⑤ | **L1 可见性探测** | 4 s 合成小样片 + "数字=?,单词=?"（**双 token 都命中**才算过，200 ≠ 看见）；可缓存结论默认有效 7 天，通道类失败只做短暂冷却 |
 | ⑥ | **`include_frames` 变三态** | `auto`（默认）/`true`/`false` 字符串；`false` + 原生失败 ⇒ **绝不静默抽帧** |
 | ⑦ | **配置 11 → 21 键** | 新增 `video` 组 8 键 + `video_provider_id` + `prompts.video_native`；旧 11 键一个不动，`tools/migrate_config_v03.py` 补默认并审计 |
 
@@ -285,8 +287,7 @@ grep -a 'media_analysis: route=' /root/AstrBot/data/logs/astrbot.log | tail -3
    抛错 ⇒ 只记 `video_native_unavailable`/`video_native_failed` **回退**，绝不让它变成新的
    "静默拒载"点。
 
-**不做**：体积上限阶梯探测（实测两条通道到 47.2 MiB / 36.5 MiB 都 200 ⇒ "体积上限"不是事实，
-先撞的是延迟）、视频 URL 引用、非 mp4 容器、用 `modalities` 判视频能力（核心没有 `video` 选项）。
+**不做**：运行时体积上限阶梯探测（历史实测两条通道到 47.2 MiB / 36.5 MiB 返回 200，不能据此断定上限不存在；延迟同样是限制）、视频 URL 引用、非 mp4 容器的可靠原生直送、用 `modalities` 判视频能力。
 
 ### 三模型位（v0.3）
 
@@ -295,7 +296,7 @@ grep -a 'media_analysis: route=' /root/AstrBot/data/logs/astrbot.log | tail -3
 | 位 | 键 | 用在哪 | 空串语义 |
 |---|---|---|---|
 | **视频（原生）** | `video_provider_id`（**v0.3 新增**） | 原生视频直送：一次调用同时要"画面 + 声音" | **不回落**核心当前对话 provider —— 视频是"声明式"能力，没声明就走回退（`video_native_unavailable`），不对未知模型盲发 8 MiB |
-| **视觉（仅回退）** | `vision_provider_id` | 抽帧回退：每帧一张图；摘要也可复用它 | 回落核心当前对话 provider（v0.2 语义不变） |
+| **视觉（仅回退）** | `vision_provider_id` | 抽帧回退：每帧一张图；摘要也可复用它 | 抽帧须显式配置；摘要可回落核心当前对话 provider |
 | **音频** | `audio_provider_id` | 音轨转写：原生不可用/失败后的保底，也是纯语音消息的主路径 | 回落核心当前对话 provider（不支持音频 ⇒ `AUDIO_UNAVAILABLE`） |
 
 **视频位的解析阶梯**（任一步失败都只"回退"，不判死整次调用）：
@@ -329,16 +330,14 @@ grep -a 'media_analysis: route=' /root/AstrBot/data/logs/astrbot.log | tail -3
 |---|---|---|---|
 | `target` | string | `"current"` | 只认 `current`（当前消息）/ `quoted`（被引用的那条消息） |
 | `focus` | string | `""` | 想了解的重点问题；空＝通篇摘要 |
-| `include_frames` | **string** | **`"auto"`** | 三态：`auto`＝要画面、插件自己选路（**未配视频模型时不抽帧**，只转写）；`true`＝明确要画面（原生失败必须抽帧回退）；`false`＝明确不要画面（原生失败**绝不抽帧**）。旧布尔值仍接受 |
+| `include_frames` | **string** | **`"auto"`** | 三态：`auto`＝优先原生；抽帧回退需视频位、视觉位、视频流和足够预算。`true`＝明确请求画面，原生不可用时尝试抽帧但可能失败。`false`＝原生失败后不抽帧，有音轨时尝试转写。旧布尔值仍接受 |
 
 > **`target` 不接受文件路径**（v0.2 明确裁决）：模型读的是"用户可控文本 + 框架注入的
 > 路径文本"，接受路径就等于给模型一个"读任意本地文件并送进远端模型"的原语。
 > 群里以**文件**形式发来的视频/语音，同样用 `current` / `quoted` 取 —— docstring 与
 > `BAD_TARGET` 的 hint 都写了这一句。
 
-**默认走 `auto`**：视频优先**原生直送**（一次调用同时拿画面与声音）；原生不可用、且配了
-视觉位时**才回退抽帧**（`true` 点名要画面，回退必须发生；`false` 明确不要画面，绝不抽帧）。
-不做"检测到无音轨就自动改道"这类隐式分支：隐式分支＝不可预测的成本。
+**默认走 `auto`**：视频优先尝试原生直送；原生不可用时，只有视频位和视觉位均已配置、有视频流且预算足够才可能抽帧。`true` 会尝试取得画面，但也可能因缺模型、视频流、预算或其他错误失败；`false` 禁止抽帧，**不禁止原生视频调用**。不能抽帧时有音轨可尝试转写，无音轨可能失败。
 
 `include_frames` 在 v0.3 是**字符串三态**（旧布尔值仍接受）。门面按白名单归一
 （`main._as_bool` / `_as_mode`；字符串先 `strip`、再按**大小写不敏感**比对）：
@@ -367,11 +366,11 @@ grep -a 'media_analysis: route=' /root/AstrBot/data/logs/astrbot.log | tail -3
 ```
 
 `state ∈ {"accepted","running"}`（`running` ＝同一条消息同一组参数已在跑，`task_id` 与首次
-相同）；`hint` 是**常量**（不夹带 `task_id`/路径/时长）。模型只会看到"受理"或"失败"两种，
-**分析结果不会回到模型手里**——它被渲染成一条中文消息发给用户（`—— 媒体分析：视频｜时长
-58.32s｜画面帧 0 张｜转写 0 字｜耗时 42.1s`，正文上限 1200 字，超出截断加 `…`）。
+相同）；`hint` 是**常量**（不夹带 `task_id`/路径/时长）。同步工具返回的是受理或受理前失败信封；
+后台结果被渲染为中文文本并尝试发送给用户（正文上限 1200 字，超出截断加 `…`）。v0.5.2 起，
+投递接口报告成功后，这段文本还可能在同一会话的下一次符合条件的请求中一次性注入模型上下文。
 
-成功信封（9 键，顺序固定）——**v0.4 起它出现在那条用户消息里，不再回给模型**：
+内部成功信封（9 键，顺序固定；不是发送给用户的 JSON 消息）：
 
 ```json
 {
@@ -422,8 +421,8 @@ grep -a 'media_analysis: route=' /root/AstrBot/data/logs/astrbot.log | tail -3
 | ⑥ | **摘要** | 有转写或画面 | 复用视觉位；材料超 8000 字符从尾部截断；摘要失败不判死整次调用 | `material_trimmed` |
 | ⑦ | **信封** | — | 成功 9 键 / 失败**恰好 3 键** | — |
 
-- **有音轨时的默认结局永远是 `ok:true` + 转写**：⑤ 的所有"不抽帧"分支都只降级，不把整次调用判死。
-  只有"**无音轨**且不得抽帧"才落到 `VIDEO_UNAVAILABLE` / `VIDEO_FAILED` / `VIDEO_TOO_LARGE`。
+- **不抽帧时**：有音轨可继续尝试转写，空转写也可能是成功结果；音频 provider 出错或硬超时仍可能 `AUDIO_FAILED`。
+  无音轨且不得抽帧时，按原生路径状态返回 `VIDEO_UNAVAILABLE` / `VIDEO_FAILED` / `VIDEO_TOO_LARGE` 等终态。
 - **`false` 是最硬的一条**：`auto` 的"允许回退"只对 `auto` 生效，`false` 是用户的显式成本约束
   ⇒ 原生失败也**不抽帧**（note `video_frames_forbidden`）。
 - **`auto` 且未配视频模型**（评审 F7）⇒ 不抽帧、退化为"只转写"（note
@@ -477,8 +476,8 @@ grep -a 'media_analysis: route=' /root/AstrBot/data/logs/astrbot.log | tail -3
 |---|---|---|---|---|---|
 | `background` | `mode` | string（枚举） | `"plugin"` | **隐藏（v0.5.2）** | **【已弃用】** 只认 `plugin`。v0.5.2 删掉了「核心原生后台」路线 ⇒ 配置里若仍是 `core`，插件**只在内存里按 `plugin` 处理**并打**一条** WARNING（不改配置、不落盘、不回声值，每进程至多一条）。**键与磁盘值都保留**，计划 v0.6.0 删除 |
 | `provider_settings` | `audio_provider_id` | string | `""` | 可见 | 音频（多模态对话）provider，模型能力须勾「音频」；空＝回落核心当前对话 provider（不支持音频 ⇒ `AUDIO_UNAVAILABLE`） |
-| `provider_settings` | `video_provider_id` | string | `""` | 可见 | 原生视频模型（需 `openai_chat_completion` 适配器且真的接受视频输入）；空＝不走原生，改走抽帧。显式配置 ⇒ note `video_asserted`，仍由 L1 实测验证 |
-| `provider_settings` | `vision_provider_id` | string | `""` | 可见 | 读图的对话 provider（**仅抽帧回退** + 摘要）；空＝核心当前对话 provider |
+| `provider_settings` | `video_provider_id` | string | `""` | 可见 | 原生视频模型（需 `openai_chat_completion` 适配器且支持视频输入）；空＝不走原生，默认 `auto` 不抽帧；`true` 且配置视觉模型时才可能抽帧。启用探测且预算允许时进行 L1 验证 |
+| `provider_settings` | `vision_provider_id` | string | `""` | 可见 | 读图的对话 provider（抽帧回退 + 摘要）；抽帧需显式配置，留空时 `auto` 不抽帧；`true` 进入回退并检查视觉位时报告视觉模型不可用；摘要可回落当前对话 provider |
 | `provider_settings` | `stt_provider_id` | string | `""` | **隐藏** | **【已弃用】** v0.2 起不生效，只为保留历史设置而留在 schema 里（删了会被核心静默删除并落盘 ⇒ 丢用户值）。值非空时打一条弃用 WARNING（不打值） |
 | `video` | **`max_direct_mb`** | int | **8** | 可见 | **（MB）** 原生直送的体积门槛，**按延迟定**（不是 provider 上限）；超了先压缩。**1–32 MB**，32 MB 同时是**内存硬上限** |
 | `video` | `compress_enabled` | bool | `true` | 可见 | 超门槛时是否先压缩（压缩远比抽帧便宜） |
@@ -501,7 +500,7 @@ grep -a 'media_analysis: route=' /root/AstrBot/data/logs/astrbot.log | tail -3
 | `video.probe_enabled` | L1 探测的总闸，属"翻车后才会去动"的开关 |
 | `video.probe_ttl_seconds` | 同上（默认 7 天够用） |
 | `video.compress_timeout_seconds` | 两趟转码的共享预算，实测 4.5–6.9 s/趟，默认 30 s 余量充足。**生产填过 60 的实例在迁移后仍是 60**（隐藏≠删除） |
-| `background.mode` | **v0.5.2 新增隐藏**。它是已弃用键：删掉会让核心 `check_config_integrity()` 把用户旧值当 stale 删掉并落盘，而线上配置里普遍留着 `core`（那个模式从来没真正生效过）。**隐藏 + 只认 `plugin` + 一条 WARNING** 比"删"更安全，真正的删键留 v0.6.0 |
+| `background.mode` | **v0.5.2 新增隐藏**。它是已弃用键：删掉会让核心 `check_config_integrity()` 把用户旧值当 stale 删掉并落盘。旧配置若为 `core`，在本版内存归一为 `plugin` 并至多告警一次；曾实际使用核心模式的实例会有行为变化 |
 
 ### 本版删除的 2 键（值改为**代码常量**）
 
@@ -551,7 +550,7 @@ grep -a 'media_analysis: route=' /root/AstrBot/data/logs/astrbot.log | tail -3
   audio_provider_id | video_provider_id | vision_provider_id | video_fp | PLUGIN_VERSION`。
   `mode`（`auto/true/false`）与 `video_fp`（直送门槛/压缩开关/压缩预算的指纹）是 v0.3 新增的
   两个分量 —— 同一媒体在三种模式下产物不同、改门槛即失效，**不许互相命中**。
-  旧的 `v2` 条目不写迁移代码：键变了自然不命中，按 TTL 老化淘汰。
+  旧的 `v2` 条目不写迁移代码：键变后不再命中，但不会因此保证自动删除；留存与清理见下文。
 - **只存信封文本**：条目里只有 `{v, key_inputs, created_at, envelope}`，`envelope` 恰好 9 键。
   媒体字节、base64、抽帧 jpg、wav 路径**一律不入缓存**（写盘前有一道硬闸：序列化文本里
   出现 `/tmp/`、`/root/`、`data:` 就拒绝写入并告警）。
@@ -564,10 +563,10 @@ grep -a 'media_analysis: route=' /root/AstrBot/data/logs/astrbot.log | tail -3
   —— 本部署单进程，多进程最坏是双方都算一遍，文件不会坏（同分区 `os.replace` 原子）。
 - **命中语义**：`cached: true` + `elapsed_ms` 是**本次**真实耗时 + `notes` 追加
   `cache_hit`、`cache_age_s:<n>`（原始 notes 保留在前）。
-- **怎么清**：`rm -rf data/plugin_data/astrbot_plugin_media_analysis/cache`（无副作用，之后全 miss）。
-- **会进备份**：核心备份清单包含整个 `data/plugin_data` ⇒ 缓存条目会出现在备份包里
-  （正文就是日志里已有的那类文本，TTL 默认 1 天）。需要更严的留存策略就调小
-  `cache.ttl_seconds` 或直接关掉（`0`）。
+- **怎么清**：确认目标实例及备份后，可由管理员清理该实例插件数据目录下的 `cache`；旧结果将无法再命中，备份内的副本不会自动删除。
+- **留存与备份**：缓存包含分析文本，也可能进入 `data/plugin_data` 的备份。TTL 是读取时的有效期，
+  不是定时删除期限：未再次读取的过期文件可能继续留在磁盘。设为 `0` 只停止缓存读写，不会清除已有文件；
+  需要清除时应单独处理缓存文件及既有备份，并遵循自己的留存策略。
 
 ## 压缩（v0.3；超直送门槛时）
 
@@ -585,22 +584,13 @@ grep -a 'media_analysis: route=' /root/AstrBot/data/logs/astrbot.log | tail -3
 - **产物只落 `/tmp`**（`tempfile.mkdtemp(prefix="media_analysis_")`，`finally` 整目录删）；
   **源文件只读**，绝不覆盖、绝不写回 `data/`；压缩前先 `stat` 判体积（不把大文件读进内存）。
 
-| 预算档（48.901 s / 5,640,723 B 生产样本，只读） | 转码 | 视频码率 | 产物 | 耗时 |
-|---|---|---|---|---|
-| 8 MiB（v0.4.2 及以前的默认；v0.5.1 默认 6 MB） | **0 趟**（源已达标） | — | 5,640,723（原样直送） | 0 ms |
-| **4 MiB** | **1 趟** | **622k**（实现公式按 48.901 s；t8 用 48 s 整数算得 635k） | **3,873,915 B**（t4 复测；t8 首测 3,939,056 B） | **4,207 ms**（t4；t8 4,810 ms） |
-| 2 MiB | 2 趟 | 285k → 269k | 2,098,819 → **2,008,617 B** | 4,455 + 4,870 ms |
-| 1 MiB（t4 三跳信封用的预算） | 2 趟 | — | **1,031,801 B** | 含在 24.4 s 端到端内 |
-
-- 4 MiB 档的实测：**720x1280 → 270x480、时长不变、音轨保留（AAC 64k 单声道）、压缩比 0.687**；
-  产物在 `/tmp` 工作目录内，脚本退出后目录已删，源文件 sha/mtime 前后一致。
-- **为什么压而不直接抽帧**：压缩 **~4.2 s / 0 token**；抽帧是 6 帧 ffmpeg + **6 次视觉调用**。
-  原生一次调用同时拿画面 + 声音，信息不丢 ⇒ 对"就想知道视频里发生了啥"的主诉求，压缩比抽帧便宜。
+- 历史测试覆盖了无需压缩、单趟和双趟压缩等情况；耗时、输出体积和质量均取决于源媒体与运行环境，不能作为保证。
+- **为什么尝试压缩**：压缩在本地执行，不直接调用模型；若压缩后成功走原生视频，可减少逐帧视觉调用。但转码有计算成本和质量损失，实际延迟与费用需按场景验证。
 - **失败都只进下一跳**：ffmpeg rc≠0 / 超时 / 产物空 / 产物 ≥ 源 ⇒ `video_compress_failed` ⇒ ⑤ 回退。
 
 ## 视频能力探测缓存（v0.3 新增）
 
-**只做 L1（"这个模型真的能看见视频吗"），不做体积阶梯**：200 ≠ 看见，体积上限也不存在
+**只做 L1（"这个模型真的能看见视频吗"），不做体积阶梯**：200 ≠ 看见，历史样本成功也不能证明不存在体积上限
 （见「实测风险」）。判据是**双 token**——4 s / 1280x720 / ~150 KB 合成样片，画面正中一个
 4 位白色数字、右下角一个黄色英文单词（8 词固定表，逐字母无歧义）：
 
@@ -618,24 +608,24 @@ grep -a 'media_analysis: route=' /root/AstrBot/data/logs/astrbot.log | tail -3
   1 天**互不影响**）。TTL 按结论类型分流（评审 F3）：真裁决（`mismatch`/`empty`）用配置值；
   **本地环境类**（`no_font`/`ffmpeg_missing`/`build_failed`）最多 **1 小时**；**通道类**
   （4xx/5xx/timeout/dns）**0＝不缓存**。
-- **成本保护**：每个 TTL 窗口**最多自动跑 1 次**（失败也写 `l1.ok=false` 占位，防打爆）；
-  落盘失败静默降级为进程内记忆（仍然只跑 1 次）。
+- **成本保护**：可缓存的探测结论在其有效期内复用；通道类失败不落盘，仅做进程内 60 秒冷却，
+  冷却后可能再次探测。落盘失败时降级为进程内记忆，不能据此保证整个 TTL 窗口只调用一次。
 - **通道失败 ≠ 裁决**（`VERIFY-v0.3.md` F1 的教训）：请求带与核心 HTTP 客户端同形状的
   `User-Agent`（缺 UA 会被 Cloudflare 回 403 `error code: 1010`，那不是"模型看不见"）。
   插件读缓存时遇到"通道类 `reason`"**视同 miss 重新实测**；写入侧通道失败**绝不落盘**，
   只做进程内 60 s 冷却（冷却过期即重测）。
 - **进程内记忆最长 5 分钟**：`_MEMO` 命中要过两道时效（条目 TTL + `MEMO_MAX_AGE_S`）⇒
-  `--clear` / `rm -rf probe/` 对**运行中**的插件最多 5 分钟生效。
-- **怎么清**：`rm -rf data/plugin_data/astrbot_plugin_media_analysis/probe`，或
-  `python3 tools/probe_video_capability.py --provider <id> --clear`（磁盘 + 进程内记忆一起清）。
+  CLI 的 `--clear` 或清理磁盘 probe 缓存后，**运行中**插件的内存记忆最多仍可能保留 5 分钟。
+- **怎么清**：可删除实例的 probe 缓存目录，或使用下方 CLI 的 `--clear` 清除当前 provider、模型及安装版本对应的单个磁盘条目；旧模型或旧版本条目不会因此删除。独立 CLI 不会清除运行中插件的进程内记忆，内存条目最长仍可能保留 5 分钟。
 
 ### 延迟校准工具（`tools/probe_video_capability.py`）
 
 ```bash
-python3 tools/probe_video_capability.py --provider <id>                 # L1 + 1 MiB×3
-python3 tools/probe_video_capability.py --provider <id> --sizes 1,4,8 --repeat 3
-python3 tools/probe_video_capability.py --provider <id> --show           # 只看缓存（不联网）
-python3 tools/probe_video_capability.py --provider <id> --clear          # 清该 provider 的缓存
+# 先设置 ASTRBOT_ROOT 和 PROVIDER_ID，再执行：
+python3 tools/probe_video_capability.py --root "$ASTRBOT_ROOT" --provider "$PROVIDER_ID"                 # L1 + 1 MiB×3
+python3 tools/probe_video_capability.py --root "$ASTRBOT_ROOT" --provider "$PROVIDER_ID" --sizes 1,4,8 --repeat 3
+python3 tools/probe_video_capability.py --root "$ASTRBOT_ROOT" --provider "$PROVIDER_ID" --show          # 只看缓存（不联网）
+python3 tools/probe_video_capability.py --root "$ASTRBOT_ROOT" --provider "$PROVIDER_ID" --clear         # 清该 provider 的磁盘缓存
 ```
 
 - 输出字段 **`suggested_max_direct_bytes`**（**工具侧字段名，单位字节**；100 s 全局预算，取 **p50 ≤ 45 s 的最大档**，
@@ -654,15 +644,11 @@ python3 tools/probe_video_capability.py --provider <id> --clear          # 清�
 下面三条是**真机实测**的口径（`VERIFY-v0.3.md`，2026-10-24），它们不是"待办"，是运维与排障时
 不要踩的坑：
 
-1. **代理存在瞬时 `http 400` 窗口（与尺寸无关）**：同一批探测档第一次跑（02:06–02:13）
-   **五档全 400，连 1 MiB 都 400**；4 分钟后同批重测 **全 200**（13.6 / 36.6 / 49.0 / 93.2 / 208.4 s）。
-   ⇒ **不得把单次 400 当 SLA 或能力结论**；链路遇到 400 会记 `video_native_failed` 并按规定回退，
-   行为正确，重试可能就好了。也**别**把"8 MiB 直送"写成 SLA。
+1. **通道可能出现瞬时 HTTP 400**：历史测试中同一批样本先失败、稍后成功。不能将单次响应直接当成体积上限或 SLA；插件会记录原生调用失败，并按参数、配置和预算决定后续路径。
 2. **mimo 需要 `max_tokens=4096`（v0.5.1 起已是常量，不可配）**：8 MB + 长提示词在 **1024 / 2048** 下会 200 但
-   正文为空（`video_native_empty`，推理把预算吃光）。护栏会判失败并回退（**不会假成功**），
-   但等于白花一次调用钱。默认 2048 只够 Gemini 类通道；**mimo 请设 4096**，
-   或把 `video.max_direct_mb` 压到 **4 MB** 档。
-3. **原生视频没有体积上限，但有延迟上限**：Gemini 到 47.2 MiB、mimo 到 36.5 MiB 都 200
+   正文为空（`video_native_empty`，推理把预算吃光）。护栏会判失败并回退，但仍可能产生调用费用。
+   当前 4096 是代码常量；可根据实际通道表现考虑把 `video.max_direct_mb` 降到 **4 MB**。
+3. **有限样本通过不代表没有体积上限**：历史测试中 Gemini 到 47.2 MiB、mimo 到 36.5 MiB 都 200
    （0 次拒绝）；但 8 MiB ≈ **45.6 / 49.0 / 50.4 s**（±10% 抖动）、16 MiB 93.2 s、32 MiB 208.4 s，
    而全局预算只有 **100 s** ⇒ **>8 MiB 直送不安全**（"能过"不等于"来得及"）。默认门槛
    `video.max_direct_mb = 8 MB`（钳 **1–32 MB**，32 MB 同时是内存硬上限）是**按延迟定的**，
@@ -673,6 +659,8 @@ python3 tools/probe_video_capability.py --provider <id> --clear          # 清�
 > `[无用内容]`）会被当成"原生成功"，见 `CHANGELOG.md` 遗留 F6。
 
 ## 部署与迁移
+
+下方历史命令中的 `ASTRBOT_ROOT` 必须先由操作者设置为目标实例根目录；执行 `--apply` 前先核对实例和版本并备份插件及配置。示例结果并非所有实例的预期值。
 
 ### v0.5.1 → v0.5.2（**没有迁移步骤：21 叶不变**）
 
@@ -688,7 +676,7 @@ python3 tools/probe_video_capability.py --provider <id> --clear          # 清�
 | 1 | `cp -a` 插件目录 + 插件配置；记 `sha256sum` 与 `git rev-parse HEAD` | 两份都在；配置 sha 记下 |
 | 2 | 覆盖代码到 `v0.5.2` | `grep -m1 '^version:' metadata.yaml` ⇒ `v0.5.2`；`grep -c core_mode.py` 类判据不需要 —— **`core_mode.py` 应不存在** |
 | 3 | **重载一次** | 新 `ready:` 行 **19 字段**（多一个 **`background_mode=plugin`**）；`Added llm tool: media_analyze` 恰 1 次 |
-| 4 | **五项复验** | ① `ready` 行 19 字段且 `background_mode=plugin`（**不含** `background_mode=core`）；② 若配置里仍是 `core` ⇒ **恰 1 条** WARNING（`配置 background.mode 非法（已删枚举）`，**不含值**），**且配置文件 sha 不变**；③ `grep -c 'wrapper_no_mirror\|core-mode\|core_mode'` ⇒ **0**（v0.5.1 时代每次加载都有一条 `wrapper_no_mirror` ERROR，现在应该消失）；④ 一条真机媒体 ⇒ 用户收到**恰好一条**结果消息；⑤ **紧接着追问**"刚才那个视频说了什么" ⇒ 模型能复述（日志出现 `result_context inject items=… chars=…`），**再问一次不再注入** |
+| 4 | **五项复验** | ① 核对 `ready` 行 19 字段及 `background_mode=plugin`；② 旧值为 `core` 时核对不含值的告警及配置未被插件改写，告警每进程至多一次；③ 本次加载不应出现旧核心模式探测日志；④ 在可控会话中核对受理及结果投递，失败或取消可能无消息，接口成功不代表用户已读；⑤ 在 TTL 内发起符合条件的同会话请求，核对注入日志和一次性行为；过期、原文重复或钩子失败时不保证注入，模型复述也不是投递或注入的充分证明 |
 
 - **不需要**跑 `tools/migrate_config_v05.py --apply`：21 叶没变、`background.mode` 的动作仍是 `keep`、磁盘值不动。
   想审计可以只跑 `--report`（期望 `changed=0`、`hidden=1` 4→**5** 条）。
@@ -696,7 +684,7 @@ python3 tools/probe_video_capability.py --provider <id> --clear          # 清�
 - **回滚两档**：**R1** 回 v0.5.1（覆盖代码 + 重载；旧版本里 `core` 仍是合法枚举 ⇒ 会**恢复**那条 `wrapper_no_mirror` ERROR，功能不受影响）；
   **R2** 只把 `background.mode` 手工改成 `plugin`（v0.5.2 内止血，秒级）。
 - **双冷启动**：`PLUGIN_VERSION` 变 ⇒ 结果缓存与视频能力探测缓存全部 miss（每个视频位首用多一次探测，3–20 s）。
-  急可 `rm -rf data/plugin_data/astrbot_plugin_media_analysis/{cache,probe}`（归 ops）。
+  需要清理时先核对目标实例及备份，再由管理员处理插件缓存。
 - **缓存目录不用删**：旧条目只是因为键里的版本号变了才不命中，不会报错。
 
 ### v0.4.2 → v0.5.1（**多了「先迁移」这一步，顺序不可反**）
@@ -704,8 +692,8 @@ python3 tools/probe_video_capability.py --provider <id> --clear          # 清�
 ```
 ① 备份两份（插件目录 + 插件配置）
   → ② 覆盖代码（新代码 + 新 schema）
-  → ③ python3 tools/migrate_config_v05.py --root /root/AstrBot --report   # 干跑：changed=1 keys=21
-  → ④ python3 tools/migrate_config_v05.py --root /root/AstrBot --apply    # 0600 备份 + 原子落盘
+  → ③ python3 tools/migrate_config_v05.py --root "$ASTRBOT_ROOT" --report   # 干跑：changed=1 keys=21
+  → ④ python3 tools/migrate_config_v05.py --root "$ASTRBOT_ROOT" --apply    # 0600 备份 + 原子落盘
   → ⑤ 重载插件一次（**且只一次**）
   → ⑥ 五项复验
 ```
@@ -717,7 +705,7 @@ python3 tools/probe_video_capability.py --provider <id> --clear          # 清�
 | 3 | **干跑迁移**（只读） | `summary: changed=1 keys=21`；`rename`3 / `drop`2 / `add`1 / **`keep`17**（其中 `hidden=1` 4 条） |
 | 4 | **落盘迁移** | 打印 `backup=<名>`；文件仍是 **0600 + BOM + 无尾随换行**；`max_direct_mb=32` / `compress_target_mb=29` / `max_media_mb=64` / `audio_timeout_seconds=60` / `compress_timeout_seconds=60`（**隐藏键保号**）/ `mode=core`（**不动**） |
 | 5 | **重载一次** | 新 `media_analysis ready:` 行（18 字段，含 `max_media_mb=` / `native_timeout_cap_s=65` / `audio_timeout_cap_s=95`）；`Added llm tool: media_analyze` 恰 1 次；引擎仍 `effective=core` |
-| 6 | **五项复验** | ① ready 行新字段齐；② `--report` 再跑一次 ⇒ 全 `keep`、`changed=0`；③ **连续两次加载 sha 相同**（再重载一次比对）；④ 一条真机媒体 ⇒ 日志出现 `media_analysis: route=…`；⑤ 冷启动窗口 `Provider .* was not found` 计数 **0** |
+| 6 | **五项复验** | ① ready 行新字段齐；② `--report` 再跑一次 ⇒ 全 `keep`、`changed=0`；③ 记录首次加载后的配置 sha，若需验证重载幂等则在维护窗口另行重载并比较；④ 真机媒体检查 `media_analysis: route=…`；⑤ 检查加载期 provider 告警 |
 
 - **③④ 必须在 ⑤ 之前**：新 schema 不认识旧字节键，一旦"先重载、后迁移"，核心会把
   `video.max_direct_bytes` / `video.compress_target_bytes` / `limits.max_media_bytes` /
@@ -728,11 +716,11 @@ python3 tools/probe_video_capability.py --provider <id> --clear          # 清�
 - **"命中旧 sha / 键序与旧文件一致"不可能成立**：三个键名已变，且核心按**参考配置序**重建 dict。
   正确判据是「迁移器输出 == 新 schema 序」+「**连续两次加载 sha 相同**」。
 - **双冷启动**：`PLUGIN_VERSION` 变 ⇒ 结果缓存与 L1 探测**全部 miss**（每个视频位首用多一次 L1，3–20 s）。
-  急可 `rm -rf data/plugin_data/astrbot_plugin_media_analysis/{cache,probe}`（归 ops）。
+  需要清理时先核对目标实例及备份，再由管理员处理插件缓存。
 - **回滚四档**：**R1 配置回滚**（`--rollback <备份>`）—— **单独执行无效**，必须与 R2/R3 成对；
   **R2 回 v0.4.2**（覆盖代码 → 还原配置 → 重载一次）；**R3 回 v0.3.0**（用 v0.3 的旧备份）；
   **R4 撤核心一行补丁**（必须先 R2 或把 `background.mode` 改 `plugin` + 重载，再撤补丁 + **重启**）。
-  完整派单：`handoff/lanes/dev/20261026-order-fix-deploy-media-analysis-v0.5.1.md`。
+  此为历史迁移与回滚记录，执行前应按目标版本、配置及宿主重新核对。
 
 ### v0.4.1 → v0.4.2（**+1 键：仍然是"覆盖 + 重载一次"**）
 
@@ -741,7 +729,7 @@ python3 tools/probe_video_capability.py --provider <id> --clear          # 清�
 | 1 | 整目录备份（插件目录 + 插件配置两个 `cp -a`）+ 记 `git rev-parse HEAD` | 两份都在；配置 sha256 记下 |
 | 2 | 覆盖代码到 `v0.4.2` | `grep -m1 '^version:' metadata.yaml` ⇒ `v0.4.2` |
 | 3 | **重载一次** | 核心 `check_config_integrity()` 自动补 `background.mode="plugin"` 并落盘；`ready:` 行**与 v0.4.1 逐字同形**（引擎判据走独立一行，默认只打 DEBUG） |
-| 4 | （可选）审计 / 显式落盘 | `python tools/migrate_config_v042.py --root /root/AstrBot --report` ⇒ `keys=22`、`background.mode` 一行 `keep`（或 `add`）；要落盘再 `--apply` |
+| 4 | （可选）审计 / 显式落盘 | `python tools/migrate_config_v042.py --root "$ASTRBOT_ROOT" --report` ⇒ `keys=22`、`background.mode` 一行 `keep`（或 `add`）；要落盘再 `--apply` |
 | 5 | 复验 | 配置 **22 键 / 6 组**；**无** `background mode=core` 的 ERROR 行；`Added llm tool: media_analyze` 恰 1 次；`Failed to import plugin …` 0 |
 
 - **顺序不可反**（超集 ⇒ **代码先行**）：先跑迁移器、再换代码时，**旧 schema** 不认识
@@ -761,7 +749,7 @@ python3 tools/probe_video_capability.py --provider <id> --clear          # 清�
   `background.mode` 当 stale 删掉（成对反向）；**R3** 撤核心补丁 + 重启（**必须先做 R1**，
   否则核心回退后插件仍选 `core`，每次加载刷一条 ERROR）。
 - 缓存：v0.4.2 的条目键含 `0.4.2` ⇒ 升级**双冷启动**（结果缓存 + L1 探测；每个视频位首用
-  多一次 L1 调用 3–20 s）。急可 `rm -rf data/plugin_data/astrbot_plugin_media_analysis/{cache,probe}`（归 ops）。
+  多一次 L1 调用 3–20 s）。需要清理时先核对目标实例及备份，再由管理员处理插件缓存。
 
 ### v0.3 → v0.4（比 v0.3 简单一档：**没有迁移步骤、没有第二次重载**）
 
@@ -783,12 +771,7 @@ python3 tools/probe_video_capability.py --provider <id> --clear          # 清�
 
 1. 目录名必须**逐字**等于 `metadata.yaml` 的 `name`（`astrbot_plugin_media_analysis`）。
 2. `astrbot_version` 是 PEP 440 range：`>=4.29,<5`（当前核心 4.29.3 在内）。
-3. **人格工具白名单**：`persona["tools"]` 是 JSON 文本 —— `null`＝不限制工具集（本插件
-   **自动可见，免改 DB**）、非空数组＝只给列出的名字（**必须把 `media_analyze` 加进去**，
-   否则工具对模型不可见）。**先确认 QQ 群体实际绑定的 persona 再决定要不要改**：
-   本机实测（`VERIFY.md` §5-F3，只读 `personas.tools` 的长度/布尔）23 个 persona 中
-   **7 个是 `null`**、**16 个是固定清单（4–50 项，无一含 `media_analyze`）**。
-   改人格＝写生产 DB，归 fix + 人，且**启动时载入内存、改完要重启**。
+3. **人格工具白名单**：`persona["tools"]` 是 JSON 文本 —— `null` 表示不限制工具集，非空数组只允许列出的工具，空数组不允许任何工具。使用固定清单时需加入 `media_analyze`；先确认当前会话使用的人格，再按宿主的管理方式修改并核验生效。
 4. 需要 `ffmpeg` / `ffprobe` 在 `PATH` 上（本机在 `/usr/bin`）；silk 解码依赖核心自带的
    `pysilk`（核心 `tencent_record_helper` 已带）。
 5. 覆盖安装前**整目录备份**（插件目录 + `data/config/astrbot_plugin_media_analysis_config.json`）。
@@ -804,9 +787,9 @@ python3 tools/probe_video_capability.py --provider <id> --clear          # 清�
 ```
 
 ```bash
-python3 tools/migrate_config_v03.py --root /root/AstrBot            # 干跑（默认；21 键逐条）
-python3 tools/migrate_config_v03.py --root /root/AstrBot --report   # 只读逐键报告
-python3 tools/migrate_config_v03.py --root /root/AstrBot --apply    # 备份(0600) + 原子落盘
+python3 tools/migrate_config_v03.py --root "$ASTRBOT_ROOT"            # 干跑（默认；21 键逐条）
+python3 tools/migrate_config_v03.py --root "$ASTRBOT_ROOT" --report   # 只读逐键报告
+python3 tools/migrate_config_v03.py --root "$ASTRBOT_ROOT" --apply    # 备份(0600) + 原子落盘
 ```
 
 - **必须"代码先行"**：v0.2 的 schema 不认识 `video.*`，先跑新迁移器的值会被旧 schema 当
@@ -818,9 +801,7 @@ python3 tools/migrate_config_v03.py --root /root/AstrBot --apply    # 备份(060
 - **回滚必须成对且反向**：回滚 v0.3 → v0.2 时新 schema 的 10 个新键会被 v0.2 当 stale 删掉，
   所以**同时**恢复①插件目录②配置备份，并再重载一次。只回滚代码 = 静默丢设置。
 - **验证（四件必验 + 三处位置）**：
-  ① ready 行（**v0.5.1 的 18 字段口径**）含 `video.max_direct_mb=` / `video.compress_target_mb=` /
-     `native_timeout_s=60` / `native_timeout_cap_s=65` / `native_max_tokens=4096` /
-     `compress=on` / `probe=on` / `probe_ttl=` / `audio_timeout_s=` / `audio_timeout_cap_s=95`；
+  ① 核对目标版本的 ready 行：v0.3 使用字节字段，如 `video.max_direct_bytes=`；不能用 v0.5.1 的 MB 字段与超时字段验收 v0.3；
   ② **原生被看见**：真群视频 ⇒ `ok:true` / `kind:"video"` / notes 含 `video_native`（首次另有
      `video_probe_l1_ok`，或 `video_probe_disabled`）/ `summary` 非空；`frames=0`、`transcript=[]` 是
      **设计如此**（原生一次调用同时拿画面与声音）；
@@ -833,8 +814,7 @@ python3 tools/migrate_config_v03.py --root /root/AstrBot --apply    # 备份(060
   `…/cache/v1/` 目录本身（懒创建）。
 - **从 v0.1 直跳 v0.3 不在本版支持范围**：`stt_provider_id` 的搬值仍归
   `tools/migrate_config_v02.py`（带能力校验），先 v0.1→v0.2 再 v0.2→v0.3。本机生产已是 v0.2.0。
-- 本版完整派单（备份 / 覆盖 / 重载 / 迁移 / 再重载 / 复验 / 回滚）在 dev lane：
-  `/root/workspace/astrbot/handoff/lanes/dev/20261024-order-fix-deploy-media-analysis-v0.3.0.md`。
+- 此为历史迁移记录；执行前应按目标版本、配置和宿主重新核对。
 
 ### v0.1 → v0.2 的顺序（**不可换**）
 
@@ -844,9 +824,9 @@ python3 tools/migrate_config_v03.py --root /root/AstrBot --apply    # 备份(060
 ```
 
 ```bash
-python3 tools/migrate_config_v02.py --root /root/AstrBot                    # 干跑（默认；逐键 + summary）
-python3 tools/migrate_config_v02.py --root /root/AstrBot --apply            # 备份(0600)+原子落盘
-python3 tools/migrate_config_v02.py --root /root/AstrBot --report-legacy    # 旧键何时可删（只读）
+python3 tools/migrate_config_v02.py --root "$ASTRBOT_ROOT"                    # 干跑（默认；逐键 + summary）
+python3 tools/migrate_config_v02.py --root "$ASTRBOT_ROOT" --apply            # 备份(0600)+原子落盘
+python3 tools/migrate_config_v02.py --root "$ASTRBOT_ROOT" --report-legacy    # 旧键何时可删（只读）
 ```
 
 > 脚本有两个名字：**实现是 `tools/migrate_config_v02.py`**（`v02` 带前导零，SPEC 与测试都指它），
@@ -873,28 +853,22 @@ python3 tools/migrate_config_v02.py --root /root/AstrBot --report-legacy    # �
 - **回滚成对且反向**：先回代码 → 再回配置（`--rollback <备份>` 或直接覆盖） → 重启
   （`v0.1` 的 schema 不认识新键，先回配置会被旧 schema 删；`v0.2` 的 schema 认识旧键，
   所以"先进可退、后缀可回"，两个方向都不丢值）。缓存可顺手清掉
-  （`rm -rf data/plugin_data/astrbot_plugin_media_analysis/cache`，无副作用）。
+  （清理前应核对目标实例和备份；清除后旧缓存无法命中）。
 
-完整派单（含备份/回滚/校验命令）在 dev lane 的交接地
-`/root/workspace/astrbot/handoff/lanes/dev/20261024-order-fix-deploy-media-analysis-v0.3.0.md`
-（v0.2 的历史派单：`20261023-order-fix-deploy-media-analysis-v0.2.0.md`，已于 2026-10-23 23:10:20 执行）。
+历史迁移记录不代表当前实例状态；操作前应核对目标版本并备份代码和配置。
 
 ## 隐私与日志
 
-**本插件的转写正文与画面描述会作为工具返回值被 AstrBot 框架写入生产日志（INFO），
-这是框架行为，不是本插件的额外输出。**（`tool_loop_agent_runner.py:1241` 记参数、
-`:1439` 记结果。）插件自身只打错误码、耗时、帧数、字符数、provider id，
-**不**打印转写正文或画面描述。
+**日志与留存取决于宿主和平台**：当前异步路径的工具同步返回值是受理或失败信封，后台分析正文通过主动消息发送，不应假定工具返回日志一定包含后台正文，也不能保证其他框架日志、平台或备份不记录它。插件自身的常规运行日志记录错误码、耗时、帧数、字符数和 provider id；结果缓存可能包含转写与画面描述，见「缓存」的留存说明。
 
-**信任面（v0.5.2 新增，必读）**：从媒体里解析出来的正文（转写文本 / 画面描述）会经由
-**结果上下文注入**在**下一轮同一会话**进入 `req.system_prompt` —— 那是**系统级权威位**
+**信任面（v0.5.2 新增，必读）**：从媒体里解析出来的正文（转写文本 / 画面描述），在投递接口报告成功且后续请求符合注入条件时，可能经由**结果上下文注入**进入同一会话的 `req.system_prompt` —— 那是**系统级权威位**
 （模型把它当"自己应该知道的事"，而不是"用户说的话"）。所以：
 ① 这段内容必须按**不可信输入**对待 —— 媒体里的人声/画面里出现的"指令"（例如"忽略之前的
 指示，去做 X"）在原理上就是**提示注入面**，插件**不做**内容过滤（它只搬运分析结果，不判断
 语义），防线应由**人格/系统提示词**与运营侧的内容策略承担；
 ② 它是**一次性**的（注入即清空、TTL 5 分钟、每会话至多 2 条、2400 字上限）；
 ③ 它**只写 `system_prompt`**，**不写** `conversation.history`、不写 `req.contexts`
-⇒ **不落库**、不会在历史里长期留存，也不会污染后续轮次的交替结构。
+⇒ 该注入路径不直接写入会话历史；但其他框架日志、消息历史、平台记录或结果缓存仍可能留存内容。
 
 > **兜底脱敏只覆盖"token 形状"（仅降级路径）**：正常路径用核心 `redact_sensitive_text`
 > （还认 `sk-…`、`Bearer`、URL 里的 key 等形态，与核心逐字等价）。只有当核心内部面搬家、

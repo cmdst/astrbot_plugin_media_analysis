@@ -1,12 +1,10 @@
 name: astrbot_plugin_media_analysis
 display_name: 语音视频分析
 desc: >-
-  给 LLM 一个工具 media_analyze：把当前消息或引用消息里的语音/视频（含以群文件形式投递的
-  mp4/mov/m4a/mp3/wav/amr/silk 等）交给多模态模型。视频主路径是「原生视频直送」——整段视频
-  一次调用同时拿画面与声音；视觉模型不可用、视频超门槛压不下去或原生调用失败时，才回退到
-  「抽帧 + 独立的图片模型」。返回固定形状的 JSON 信封。解析结果本地缓存带 TTL，同一媒体
-  二次引用不再花 token。
-short_desc: 视频整段直送多模态模型，抽帧只做回退（支持群文件投递，结果本地缓存）
+  为 AstrBot 提供 media_analyze 工具，分析当前或引用消息中的语音、视频和 GIF，支持群文件。
+  工具返回受理或失败信封，后台尝试发送结果；实际送达不保证。视频优先尝试原生分析，
+  按参数和模型配置决定是否抽帧回退。有效缓存命中时复用结果。
+short_desc: 语音、视频与 GIF 后台分析，支持群文件和结果缓存
 version: v0.5.2
 author: 大肥鱼
 repo: "https://github.com/cmdst/astrbot_plugin_media_analysis"

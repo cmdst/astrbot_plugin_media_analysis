@@ -1,14 +1,18 @@
 # MAPPING-v03 —— v0.2 → v0.3 测试面变更台账（77 条失败逐条交账 + 新增覆盖 + 偏差登记）
 
+> 历史快照，测试数字和接口不代表当前版本。
+
 > 对象：库 `main` @ **`44f9afa`**（v0.3.0 实现；测试面本轮只改 `tests/`）
 > 基线：`d9628a4`（v0.2.0，库内门禁 **442 passed**）
 > 本轮门禁：**658 passed / 0 failed / 0 skipped / 0 xfail**（1 warning 是核心 `tencent_record_helper` 的 `audioop` Deprecation，与本插件无关）
 > 命令（固定，与 AGENTS.md §3 同一条）：
 
 ```bash
-cd /root/workspace/projects/astrbot_plugin_media_analysis && \
-  ASTRBOT_ROOT=/tmp PYTHONDONTWRITEBYTECODE=1 \
-  /root/AstrBot/.venv/bin/python -m pytest tests/ -q -p no:cacheprovider
+# 先设置 PROJECT_ROOT 和 PYTHON；新建临时根避免继承真实实例路径。
+ISOLATED_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/media-test-root.XXXXXXXX")
+cd "$PROJECT_ROOT" && \
+  ASTRBOT_ROOT="$ISOLATED_ROOT" PYTHONDONTWRITEBYTECODE=1 \
+  "$PYTHON" -m pytest tests/ -q -p no:cacheprovider
 ```
 
 ## 0. 一句话结论
@@ -270,6 +274,6 @@ v0.3 把视频主路径换成"原生直送 + 抽帧回退"，因此**旧套件�
 - 未改任何实现（`analyze.py` / `probe.py` / `video_native.py` / `media.py` / `cache.py` /
   `settings.py` / `main.py` / `tools/*` 一字未动）；
 - 未 `git commit` / 未 `git push`（收尾单统一提交）；
-- 未碰生产树（`/root/AstrBot` 只读；测试全程 `ASTRBOT_ROOT=/tmp`）；
+- 历史测试使用隔离的 `ASTRBOT_ROOT`，没有写入生产实例；
 - 未用真实群媒体做夹具（全部 lavfi 合成 / 全零字节桩）；
 - 未跑真 provider（网络一律 mock；t8 的实测数据只作为**阈值依据**引用）。

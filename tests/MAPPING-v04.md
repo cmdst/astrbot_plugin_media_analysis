@@ -1,5 +1,7 @@
 # MAPPING-v04 —— v0.4 测试面台账（SPEC-v0.4 §9 矩阵 → 实际用例 + 偏差登记）
 
+> 历史快照，测试数字和接口不代表当前版本。
+
 > 对象：库 `main` @ **`6b775ab`**（v0.4.0 实现）+ 本轮 `tests/` 改动
 > 基线：`6b775ab` 的门禁 **697 passed**（v0.3 基线 `44aa2c8` 是 695；+2 来自 `background.py`
 > 让两条按文件参数化的守卫各多一例）
@@ -8,8 +10,10 @@
 > 命令（固定，与 `AGENTS.md` §3 同一条）：
 
 ```bash
-cd /root/workspace/projects/astrbot_plugin_media_analysis && \
-  PYTHONDONTWRITEBYTECODE=1 /root/AstrBot/.venv/bin/python -m pytest tests/ -q -p no:cacheprovider
+# 先设置 PROJECT_ROOT 和 PYTHON；新建临时根避免继承真实实例路径。
+ISOLATED_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/media-test-root.XXXXXXXX")
+cd "$PROJECT_ROOT" && \
+  ASTRBOT_ROOT="$ISOLATED_ROOT" PYTHONDONTWRITEBYTECODE=1 "$PYTHON" -m pytest tests/ -q -p no:cacheprovider
 ```
 
 ## 0. 一句话结论
